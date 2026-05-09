@@ -317,14 +317,22 @@ def build_generate_request(
     if v4_negative_prompt is not None:
         parameters["v4_negative_prompt"] = v4_negative_prompt
 
-    # Determine the actual model to use
-    actual_model = model
-    if action is NaiAction.infill and model.is_v3:
-        actual_model = model.inpaint_model
+    # Determine the actual model name for the API request.
+    # All NAI models require "-inpainting" model variant for infill action.
+    # v3: use dedicated inpaint_model enum (already has "-inpainting" suffix)
+    # v4/v4.5: append "-inpainting" suffix (no separate enum variant)
+    # Reference: ComfyUI-NAIDGenerator nodes.py L398
+    if action is NaiAction.infill:
+        if model.is_v3:
+            model_name = model.inpaint_model.value
+        else:
+            model_name = model.value + "-inpainting"
+    else:
+        model_name = model.value
 
     request: dict[str, Any] = {
         "input": prompt,
-        "model": actual_model.value,
+        "model": model_name,
         "action": action.value,
         "parameters": parameters,
     }
