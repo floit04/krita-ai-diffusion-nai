@@ -98,6 +98,7 @@ class Arch(Enum):
     anima = "Anima"
     zimage = "Z-Image"
     ernie = "ERNIE Image"
+    nai = "NAI"
 
     auto = "Automatic"
     all = "All"
@@ -146,6 +147,8 @@ class Arch(Enum):
 
     @staticmethod
     def from_checkpoint_name(checkpoint: str):
+        if checkpoint.startswith("nai-diffusion"):
+            return Arch.nai
         if Arch.sdxl.matches(checkpoint):
             return Arch.sdxl
         return Arch.sd15
@@ -249,7 +252,13 @@ class Arch(Enum):
                 return ["qwen_3_4b"]
             case Arch.ernie:
                 return ["ministral"]
+            case Arch.nai:
+                return []  # NAI handles encoding server-side
         raise ValueError(f"Unsupported architecture: {self}")
+
+    @property
+    def is_nai(self):
+        return self is Arch.nai
 
     @staticmethod
     def list():
@@ -271,6 +280,7 @@ class Arch(Enum):
             Arch.anima,
             Arch.zimage,
             Arch.ernie,
+            Arch.nai,
         ]
 
 

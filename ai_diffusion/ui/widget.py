@@ -758,7 +758,7 @@ class StrengthWidget(QWidget):
         self._slider.setMinimum(slider_range[0])
         self._slider.setMaximum(slider_range[1])
         self._slider.setValue(self._value)
-        self._slider.setSingleStep(5)
+        self._slider.setSingleStep(1)
         self._slider.valueChanged.connect(self.slider_changed)
 
         self._input = StrengthSpinBox(self)

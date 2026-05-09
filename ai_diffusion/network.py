@@ -41,13 +41,14 @@ class NetworkError(Exception):
         url = reply.url().toString()
         status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
         if reply.isReadable():
+            raw_bytes = reply.readAll().data()  # read once, reuse
             try:  # extract detailed information from the payload
-                data = json.loads(reply.readAll().data())
-                error = data.get("error", "Network error")
+                data = json.loads(raw_bytes)
+                error = data.get("error") or data.get("message") or "Network error"
                 return NetworkError(code, f"{error} ({reply.errorString()})", url, status, data)
             except Exception:
                 try:
-                    text = reply.readAll().data().decode("utf-8")
+                    text = raw_bytes.decode("utf-8")
                     if text:
                         return NetworkError(code, f"{text} ({reply.errorString()})", url, status)
                 except Exception:  # noqa

@@ -192,7 +192,7 @@ class Model(QObject, ObservableProperties):
             styles = filter_supported_styles(Styles.list().filtered(), client)
             if self.style not in styles and len(styles) > 0:
                 self.style = styles[0]
-            if self.upscale.upscaler == "":
+            if self.upscale.upscaler == "" and client.models.upscalers:
                 self.upscale.upscaler = client.models.default_upscaler
 
     def _forward_error(self, error: str):
@@ -245,6 +245,7 @@ class Model(QObject, ObservableProperties):
         extent = self._doc.extent
         regions = self.active_regions
         region_layer = None
+        is_nai = arch is Arch.nai
 
         smod = get_selection_modifiers(arch, self.inpaint.mode, strength)
         mask, selection_bounds = self._doc.create_mask_from_selection(smod)
@@ -256,12 +257,19 @@ class Model(QObject, ObservableProperties):
                 bounds = mask.bounds
                 inpaint_mode = InpaintMode.add_object
         else:  # Selection inpaint or refine
-            bounds = compute_bounds(extent, mask.bounds if mask else None, workflow_kind)
-            bounds = self.inpaint.get_context(self, mask) or bounds
+            if is_nai:
+                # NAI inpaint: use full canvas, don't crop to bbox
+                bounds = Bounds(0, 0, *extent)
+            else:
+                bounds = compute_bounds(extent, mask.bounds if mask else None, workflow_kind)
+                bounds = self.inpaint.get_context(self, mask) or bounds
             inpaint_mode = self.resolve_inpaint_mode()
 
         if not dryrun:
+            from .util import client_logger as _log
+            _log.warning(f"NAI WORKFLOW DEBUG: regions.positive={repr(regions.positive)}, regions.negative={repr(regions.negative)}")
             conditioning, job_regions = process_regions(regions, bounds, region_layer)
+            _log.warning(f"NAI WORKFLOW DEBUG: after process_regions: cond.positive={repr(conditioning.positive)}")
             conditioning.language = self.prompt_translation_language
         else:
             conditioning, job_regions = ConditioningInput("", ""), []
@@ -275,7 +283,12 @@ class Model(QObject, ObservableProperties):
         )
 
         if mask is not None or workflow_kind is WorkflowKind.refine:
-            image = self._get_current_image(bounds) if not dryrun else DummyImage(bounds.extent)
+            if is_nai and mask is not None:
+                # NAI: always get the full canvas image for inpaint context
+                full_bounds = Bounds(0, 0, *extent)
+                image = self._get_current_image(full_bounds) if not dryrun else DummyImage(extent)
+            else:
+                image = self._get_current_image(bounds) if not dryrun else DummyImage(bounds.extent)
 
         if mask is not None:
             if workflow_kind is WorkflowKind.generate:
@@ -283,7 +296,8 @@ class Model(QObject, ObservableProperties):
             elif workflow_kind is WorkflowKind.refine:
                 workflow_kind = WorkflowKind.refine_region
 
-            bounds, mask.bounds = compute_relative_bounds(bounds, mask.bounds)
+            if not is_nai:
+                bounds, mask.bounds = compute_relative_bounds(bounds, mask.bounds)
 
             assert inpaint_mode is not None
             if inpaint_mode is InpaintMode.custom:
@@ -369,11 +383,14 @@ class Model(QObject, ObservableProperties):
         extent = self._doc.extent
         image = self._doc.get_image(Bounds(0, 0, *extent)) if not dryrun else DummyImage(extent)
         params = self.upscale.params
-        params.upscale.model = params.upscale.model or client.models.default_upscaler
-        if params.upscale.model not in client.models.upscalers:
-            msg = _("The upscale model used by the document is not available on the server")
-            self.report_error(Error(ErrorKind.warning, msg + f": {params.upscale.model}"))
-            self.upscale.upscaler = params.upscale.model = client.models.default_upscaler
+        if client.models.upscalers:
+            params.upscale.model = params.upscale.model or client.models.default_upscaler
+            if params.upscale.model not in client.models.upscalers:
+                msg = _("The upscale model used by the document is not available on the server")
+                self.report_error(Error(ErrorKind.warning, msg + f": {params.upscale.model}"))
+                self.upscale.upscaler = params.upscale.model = client.models.default_upscaler
+        elif not params.upscale.model:
+            raise ValueError(_("Upscaling is not supported by the current backend"))
         bounds = Bounds(0, 0, *self._doc.extent)
         sys_prompt = "4k uhd"
         if self.arch.is_edit:
@@ -1142,8 +1159,11 @@ class UpscaleWorkspace(QObject, ObservableProperties):
     def _init_model(self):
         model = ensure(self._model())
         if client := model._connection.client_if_connected:
-            if self.upscaler not in client.models.upscalers:
-                self.upscaler = client.models.default_upscaler
+            if client.models.upscalers:
+                if self.upscaler not in client.models.upscalers:
+                    self.upscaler = client.models.default_upscaler
+            else:
+                self.upscaler = ""
 
     def set_in_progress(self, in_progress: bool):
         self._in_progress = in_progress

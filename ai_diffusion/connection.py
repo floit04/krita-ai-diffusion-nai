@@ -12,6 +12,7 @@ from .client import Client, ClientEvent, ClientMessage, DeviceInfo, MissingResou
 from .cloud_client import CloudClient
 from .comfy_client import ComfyClient
 from .localization import translate as _
+from .nai_client import NaiClient
 from .network import NetworkError
 from .properties import ObservableProperties, Property
 from .settings import PerformancePreset, ServerMode, Settings, settings
@@ -95,6 +96,13 @@ class Connection(QObject, ObservableProperties):
                     self.state = ConnectionState.auth_missing
                     return
                 self._client = await CloudClient.connect(CloudClient.default_api_url, access_token)
+            elif mode is ServerMode.novelai:
+                nai_token = settings.get_active_nai_token()
+                if not nai_token:
+                    self.error = _("NovelAI API token is not set. Please enter your token in settings.")
+                    self.state = ConnectionState.error
+                    return
+                self._client = await NaiClient.connect(NaiClient.default_api_url, nai_token)
             else:
                 self._client = await ComfyClient.connect(url, access_token)
                 self.state = ConnectionState.discover_models
@@ -112,7 +120,10 @@ class Connection(QObject, ObservableProperties):
             self.error_kind = "network"
             self.state = ConnectionState.error
             if e.status == 401:  # Unauthorized
-                settings.access_token = ""
+                if mode is ServerMode.novelai:
+                    settings.nai_api_token = ""
+                else:
+                    settings.access_token = ""
                 self._update_state()
         except MissingResources as e:
             self.error = _(
@@ -226,15 +237,32 @@ class Connection(QObject, ObservableProperties):
 
     def _handle_settings_changed(self, key: str, value: object):
         if key == "server_mode":
-            client_is_cloud = isinstance(self._client, CloudClient)
-            mode_is_cloud = settings.server_mode is ServerMode.cloud
-            if client_is_cloud != mode_is_cloud:
+            # Disconnect if client type doesn't match the new mode
+            client_matches_mode = (
+                (isinstance(self._client, CloudClient) and settings.server_mode is ServerMode.cloud)
+                or (isinstance(self._client, NaiClient) and settings.server_mode is ServerMode.novelai)
+                or (isinstance(self._client, ComfyClient) and settings.server_mode in (ServerMode.managed, ServerMode.external))
+            )
+            if not client_matches_mode and self._client is not None:
                 self.error = ""
                 eventloop.run(self.disconnect())
             self._update_state()
 
-        elif key == "access_token":
+        elif key in ("access_token", "nai_api_token"):
             self._update_state()
+
+        elif key == "nai_active_token_index":
+            # Token switched — disconnect and reconnect with new token
+            if (
+                settings.server_mode is ServerMode.novelai
+                and isinstance(self._client, NaiClient)
+            ):
+                eventloop.run(self._reconnect_nai())
+
+    async def _reconnect_nai(self):
+        """Disconnect and reconnect to NAI with the current active token."""
+        await self.disconnect()
+        await self._connect("", ServerMode.novelai)
 
 
 def apply_performance_preset(settings: Settings, device: DeviceInfo):

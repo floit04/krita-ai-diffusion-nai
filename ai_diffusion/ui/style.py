@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
 from ..client import filter_supported_styles, resolve_arch
 from ..files import File, FileFilter, FileFormat, FileSource
 from ..localization import translate as _
+from ..nai_workflow import NaiNoiseSchedule, NaiUCPreset
 from ..resources import Arch, ResourceId, ResourceKind, search_paths
 from ..root import root
 from ..server import Server
@@ -738,6 +739,60 @@ class StylePresets(SettingsTab):
         self._live_sampler.value_changed.connect(self.write)
         self._layout.addWidget(self._live_sampler)
 
+        # -- NAI-specific parameter section (conditionally visible) --
+        self._nai_header_widget = QWidget(self)
+        nai_header_layout = QVBoxLayout()
+        nai_header_layout.setContentsMargins(0, 0, 0, 0)
+        nai_title = QLabel("<b>" + _("NovelAI 参数") + "</b>", self)
+        nai_desc = QLabel(_("仅当选中 NovelAI 模型时显示"), self)
+        nai_desc.setWordWrap(True)
+        nai_header_layout.addWidget(nai_title)
+        nai_header_layout.addWidget(nai_desc)
+        self._nai_header_widget.setLayout(nai_header_layout)
+        self._layout.addWidget(self._nai_header_widget)
+
+        self._nai_uc_preset = add(
+            "nai_uc_preset", ComboBoxSetting(StyleSettings.nai_uc_preset, parent=self)
+        )
+        uc_items = [
+            (p.display_name, p.value) for p in NaiUCPreset
+        ]
+        self._nai_uc_preset.set_items(uc_items)
+
+        self._nai_quality_toggle = add(
+            "nai_quality_toggle", SwitchSetting(StyleSettings.nai_quality_toggle, parent=self)
+        )
+
+        self._nai_variety_boost = add(
+            "nai_variety_boost", SwitchSetting(StyleSettings.nai_variety_boost, parent=self)
+        )
+
+        self._nai_cfg_rescale = add(
+            "nai_cfg_rescale", SliderSetting(StyleSettings.nai_cfg_rescale, self, 0.0, 1.0, "{:.2f}")
+        )
+
+        self._nai_noise_schedule = add(
+            "nai_noise_schedule", ComboBoxSetting(StyleSettings.nai_noise_schedule, parent=self)
+        )
+        schedule_items = [(s.value, s.value) for s in NaiNoiseSchedule]
+        self._nai_noise_schedule.set_items(schedule_items)
+
+        # Collect NAI widgets and local-only widgets for conditional visibility
+        self._nai_widgets: list[SettingWidget] = [
+            self._nai_uc_preset,
+            self._nai_quality_toggle,
+            self._nai_variety_boost,
+            self._nai_cfg_rescale,
+            self._nai_noise_schedule,
+        ]
+        self._local_only_widgets: list[SettingWidget] = [
+            self._vae,
+            self._clip_skip,
+            self._zsnr,
+            self._sag,
+            self._style_widgets["loras"],
+        ]
+
         self._layout.addStretch()
 
         if settings.server_mode is ServerMode.managed:
@@ -825,6 +880,30 @@ class StylePresets(SettingsTab):
             folder.mkdir(parents=True, exist_ok=True)
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
+    @staticmethod
+    def _is_nai_style(style: Style) -> bool:
+        """Return True if the style uses a NovelAI architecture."""
+        from ..resources import Arch
+        from ..client import resolve_arch
+        arch = resolve_arch(style, root.connection.client_if_connected)
+        if arch is Arch.nai:
+            return True
+        # Fallback: check checkpoint name for backwards compatibility
+        return any(cp.startswith("nai-diffusion") for cp in style.checkpoints)
+
+    def _update_nai_visibility(self, style: Style):
+        """Show NAI controls and hide local-only controls when arch is NAI."""
+        is_nai = self._is_nai_style(style)
+
+        # NAI parameter widgets
+        for w in self._nai_widgets:
+            w.visible = is_nai
+        self._nai_header_widget.setVisible(is_nai)
+
+        # Local-only widgets (hide when NAI)
+        for w in self._local_only_widgets:
+            w.visible = not is_nai
+
     def _set_checkpoint_warning(self):
         self._checkpoint_warning.setVisible(False)
         if client := root.connection.client_if_connected:
@@ -890,6 +969,7 @@ class StylePresets(SettingsTab):
             style.checkpoints = [value]
         self._set_checkpoint_warning()
         self._show_edit_style(style)
+        self._update_nai_visibility(style)
 
     def _toggle_preferred_resolution(self, checked: bool):
         if checked and self._resolution_spin.value == 0:
@@ -953,6 +1033,7 @@ class StylePresets(SettingsTab):
         self._read_checkpoint(style)
         self._enable_checkpoint_advanced()
         self._resolution_spin.enabled = style.preferred_resolution > 0
+        self._update_nai_visibility(style)
 
     def _read(self):
         self._show_builtin_checkbox.setChecked(settings.show_builtin_styles)
