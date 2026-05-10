@@ -305,6 +305,16 @@ class NaiClient(Client):
             if len(images) == 0:
                 raise RuntimeError("NAI returned an empty response (no images in ZIP)")
 
+            # --- TEMP DIAGNOSTIC, REMOVE LATER — save raw NAI output before any post-processing ---
+            try:
+                _debug_path = r"C:\Users\Tu\Desktop\nai_debug_output.png"
+                if len(images) > 0:
+                    images[0].save(_debug_path)
+                    log.warning(f"TEMP DIAGNOSTIC: saved NAI raw output to {_debug_path} ({images[0].extent})")
+            except Exception as _save_err:
+                log.warning(f"TEMP DIAGNOSTIC: failed to save NAI raw output: {_save_err}")
+            # --- END TEMP DIAGNOSTIC ---
+
             job.state = NaiJobState.completed
             log.info(f"{job} completed, got {len(images)} images")
             await self._report(
@@ -391,6 +401,48 @@ def _find_style_for_checkpoint(checkpoint: str):
         if checkpoint in s.checkpoints:
             return s
     return None
+
+
+def _nai_feather_mask(mask_img, grow: int, feather: int):
+    """Apply grow (dilation) and feather (blur) to mask for smooth inpaint transitions.
+
+    NAI requires feathered mask, like ComfyUI path (apply_grow_feather).
+    Uses Qt scale operations to approximate Gaussian blur on the mask edges.
+    Without this, the raw binary mask produces visible gray edges at inpaint boundaries.
+    """
+    total_radius = grow + feather
+    if total_radius <= 0:
+        return mask_img
+
+    import math
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QImage
+    from .image import Image
+
+    qimg = QImage(mask_img._qimage)  # copy to avoid modifying original
+    w, h = qimg.width(), qimg.height()
+    if w <= 0 or h <= 0:
+        return mask_img
+
+    # Scale-down then scale-up approximates a box blur.
+    # With 3 passes the effective blur approaches a Gaussian.
+    # Compute the downscale size so the blur radius ≈ total_radius pixels.
+    scale_ratio = w * math.sqrt(3) / (2.0 * total_radius)
+    small_w = max(4, int(round(scale_ratio)))
+    small_h = max(4, int(round(h * small_w / w)))
+
+    mode = Qt.TransformationMode.SmoothTransformation
+    aspect = Qt.AspectRatioMode.IgnoreAspectRatio
+    for _ in range(3):
+        qimg = qimg.scaled(small_w, small_h, aspect, mode)
+        qimg = qimg.scaled(w, h, aspect, mode)
+
+    # Ensure format stays as Grayscale8
+    if qimg.format() != QImage.Format.Format_Grayscale8:
+        qimg = qimg.convertToFormat(QImage.Format.Format_Grayscale8)
+
+    log.info(f"NAI mask feathering applied: grow={grow}, feather={feather}, total_radius={total_radius}")
+    return Image(qimg)
 
 
 def convert_workflow(work: WorkflowInput) -> dict[str, Any]:
@@ -530,11 +582,18 @@ def convert_workflow(work: WorkflowInput) -> dict[str, Any]:
     mask_b64 = None
     strength = 0.7
     noise_val = 0.0
+    # --- TEMP DIAGNOSTIC: STRENGTH PATH (REMOVE LATER) ---
+    if work.sampling:
+        log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [5] convert_workflow: work.kind={work.kind}, action={action}, sampling.total_steps={work.sampling.total_steps}, sampling.start_step={work.sampling.start_step}, sampling.denoise_strength={work.sampling.denoise_strength}")
+    else:
+        log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [5] convert_workflow: work.kind={work.kind}, action={action}, sampling=None")
+    # --- END TEMP DIAGNOSTIC ---
     # Both inpaint and refine_region use mask
     needs_mask = work.kind in (WorkflowKind.inpaint, WorkflowKind.refine_region)
 
     if action is NaiAction.img2img:
         if work.images and work.images.initial_image:
+            work.images.initial_image.make_opaque()  # NAI requires RGB, strip alpha
             image_b64 = image_to_base64(work.images.initial_image)
         if work.sampling:
             strength = work.sampling.denoise_strength
@@ -551,17 +610,100 @@ def convert_workflow(work: WorkflowInput) -> dict[str, Any]:
             center_px = hires_mask.pixel(w // 2, h // 2)
             corner_px = hires_mask.pixel(0, 0)
             log.warning(f"NAI MASK DIAG: center pixel={center_px}, corner pixel={corner_px}")
+            # NAI requires feathered mask, like ComfyUI path (apply_grow_feather)
+            if work.inpaint and (work.inpaint.grow > 0 or work.inpaint.feather > 0):
+                hires_mask = _nai_feather_mask(hires_mask, work.inpaint.grow, work.inpaint.feather)
             mask_b64 = image_to_base64(hires_mask)
 
     if action is NaiAction.infill:
-        # v3 inpaint path
         if work.images and work.images.initial_image:
+            # --- TEMP DIAGNOSTIC, REMOVE LATER — initial_image alpha channel check ---
+            _init_img = work.images.initial_image
+            _iiw, _iih = _init_img.extent
+            _iiqimg = _init_img._qimage
+            _ii_format = _iiqimg.format()
+            log.warning(f"=== TEMP DIAGNOSTIC: INITIAL IMAGE ALPHA CHECK (REMOVE LATER) ===")
+            log.warning(f"initial_image size: {_iiw}x{_iih}, QImage format: {_ii_format}")
+            log.warning(f"initial_image is_mask: {_init_img.is_mask}, is_rgba: {_init_img.is_rgba}")
+            if _init_img.is_rgba:
+                # Sample alpha at corners and center
+                from PyQt5.QtGui import qAlpha as _qAlpha
+                _corners = [(0,0), (_iiw-1,0), (0,_iih-1), (_iiw-1,_iih-1), (_iiw//2,_iih//2)]
+                _alphas = []
+                for _cx, _cy in _corners:
+                    _alphas.append(_qAlpha(_iiqimg.pixel(_cx, _cy)))
+                log.warning(f"alpha samples (corners+center): {_alphas}")
+                # Check a row of alpha in the mask white region (if known)
+                _all_opaque = all(a == 255 for a in _alphas)
+                _all_transparent = all(a == 0 for a in _alphas)
+                log.warning(f"all sampled alpha=255: {_all_opaque}, all=0: {_all_transparent}")
+            # --- END TEMP DIAGNOSTIC ---
+            work.images.initial_image.make_opaque()  # NAI requires RGB, strip alpha
             image_b64 = image_to_base64(work.images.initial_image)
         if work.images and work.images.hires_mask:
-            mask_b64 = image_to_base64(work.images.hires_mask)
+            # --- TEMP DIAGNOSTIC, REMOVE LATER — mask pixel distribution + geometry ---
+            _mask_img = work.images.hires_mask
+            _mw, _mh = _mask_img.extent
+            _mqimg = _mask_img._qimage
+            _pixel_data = bytearray()
+            for _y in range(_mh):
+                _ptr = _mqimg.scanLine(_y)
+                if _ptr is not None:
+                    _pixel_data.extend(_ptr.asstring(_mw))
+            _total = len(_pixel_data)
+            if _total > 0:
+                _c0 = _pixel_data.count(0)
+                _c255 = _pixel_data.count(255)
+                _cmid = _total - _c0 - _c255
+                _minv = min(_pixel_data)
+                _maxv = max(_pixel_data)
+                log.warning(f"=== TEMP DIAGNOSTIC: MASK PIXEL DISTRIBUTION (REMOVE LATER) ===")
+                log.warning(f"mask size: {_mw}x{_mh}, total pixels: {_total}")
+                log.warning(f"pure black (0): {_c0} ({_c0/_total*100:.2f}%)")
+                log.warning(f"pure white (255): {_c255} ({_c255/_total*100:.2f}%)")
+                log.warning(f"gray (1-254): {_cmid} ({_cmid/_total*100:.2f}%)")
+                log.warning(f"min/max value: {_minv}/{_maxv}")
+
+                # Image vs mask size comparison
+                if work.images.initial_image:
+                    _iw, _ih = work.images.initial_image.extent
+                    _match = "MATCH" if (_iw == _mw and _ih == _mh) else "MISMATCH!"
+                    log.warning(f"image size: {_iw}x{_ih}, mask size: {_mw}x{_mh} => {_match}")
+                else:
+                    log.warning(f"image size: N/A (no initial_image), mask size: {_mw}x{_mh}")
+
+                # White pixel bounding box (repaint region geometry)
+                _x1, _y1, _x2, _y2 = _mw, _mh, 0, 0
+                for _y in range(_mh):
+                    for _x in range(_mw):
+                        if _pixel_data[_y * _mw + _x] > 127:
+                            _x1 = min(_x1, _x)
+                            _y1 = min(_y1, _y)
+                            _x2 = max(_x2, _x)
+                            _y2 = max(_y2, _y)
+                if _x2 >= _x1:
+                    _bw = _x2 - _x1 + 1
+                    _bh = _y2 - _y1 + 1
+                    _area_pct = (_bw * _bh) / _total * 100
+                    log.warning(f"white bbox: ({_x1},{_y1})-({_x2},{_y2}), size {_bw}x{_bh}, area {_area_pct:.2f}% of image")
+                else:
+                    log.warning(f"white bbox: NO WHITE PIXELS FOUND")
+
+                # Mask polarity check: NAI expects white=repaint
+                log.warning(f"mask polarity: is_mask={_mask_img.is_mask}, format={_mqimg.format()}")
+                log.warning(f"NAI convention: white(255)=repaint, black(0)=keep. Verify visually.")
+            # --- END TEMP DIAGNOSTIC ---
+            # NAI requires feathered mask, like ComfyUI path (apply_grow_feather)
+            _mask_to_encode = work.images.hires_mask
+            if work.inpaint and (work.inpaint.grow > 0 or work.inpaint.feather > 0):
+                _mask_to_encode = _nai_feather_mask(_mask_to_encode, work.inpaint.grow, work.inpaint.feather)
+            mask_b64 = image_to_base64(_mask_to_encode)
         if work.sampling:
             strength = work.sampling.denoise_strength
 
+    # --- TEMP DIAGNOSTIC: STRENGTH PATH (REMOVE LATER) ---
+    log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [6] convert_workflow: strength after read={strength}, action={action}")
+    # --- END TEMP DIAGNOSTIC ---
     # Clamp strength to 0.99 for img2img to avoid full replacement
     if action is NaiAction.img2img and strength >= 1.0:
         strength = 0.99

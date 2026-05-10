@@ -234,6 +234,10 @@ class Model(QObject, ObservableProperties):
         arch = self.arch
         workflow_kind = WorkflowKind.generate
         strength = self.strength
+        # --- TEMP DIAGNOSTIC: STRENGTH PATH (REMOVE LATER) ---
+        from .util import client_logger as _str_log
+        _str_log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [1] Model.strength={self.strength}, arch={arch}, is_editing={self.is_editing}")
+        # --- END TEMP DIAGNOSTIC ---
         if arch is Arch.qwen_l:
             strength = 1.0
         if strength < 1.0 or self.is_editing:
@@ -308,6 +312,9 @@ class Model(QObject, ObservableProperties):
                 )
             inpaint = calc_selection_pre_process(inpaint, selection_bounds, smod)
 
+        # --- TEMP DIAGNOSTIC: STRENGTH PATH (REMOVE LATER) ---
+        _str_log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [2] workflow.prepare(strength={strength}, workflow_kind={workflow_kind}, mask={'YES' if mask else 'NO'})")
+        # --- END TEMP DIAGNOSTIC ---
         input = workflow.prepare(
             workflow_kind,
             image or extent,
