@@ -57,6 +57,10 @@ def generate_seed():
 
 
 def sampling_from_style(style: Style, strength: float, is_live: bool):
+    # --- TEMP DIAGNOSTIC: STRENGTH PATH (REMOVE LATER) ---
+    from .util import client_logger as _str_log
+    _str_log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [3] sampling_from_style(strength={strength}, is_live={is_live})")
+    # --- END TEMP DIAGNOSTIC ---
     sampler_name = style.live_sampler if is_live else style.sampler
     cfg = style.live_cfg_scale if is_live else style.cfg_scale
     min_steps, max_steps = style.get_steps(is_live=is_live)
@@ -69,6 +73,13 @@ def sampling_from_style(style: Style, strength: float, is_live: bool):
     )
     if strength < 1.0:
         result.total_steps, result.start_step = apply_strength(strength, max_steps, min_steps)
+        # --- TEMP DIAGNOSTIC: STRENGTH PATH (REMOVE LATER) ---
+        _str_log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [4] apply_strength -> total_steps={result.total_steps}, start_step={result.start_step}, denoise_strength={result.denoise_strength}")
+        # --- END TEMP DIAGNOSTIC ---
+    else:
+        # --- TEMP DIAGNOSTIC: STRENGTH PATH (REMOVE LATER) ---
+        _str_log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [4] strength >= 1.0, NO apply_strength. total_steps={result.total_steps}, start_step={result.start_step}, denoise_strength={result.denoise_strength}")
+        # --- END TEMP DIAGNOSTIC ---
     return result
 
 

@@ -109,5 +109,26 @@
         "steps": 20,
         "minimum_steps": 3,
         "cfg": 5.0
+    },
+    "NAI - Euler": {
+        "sampler": "euler",
+        "scheduler": "normal",
+        "steps": 28,
+        "minimum_steps": 10,
+        "cfg": 5.0
+    },
+    "NAI - Euler Ancestral": {
+        "sampler": "euler_ancestral",
+        "scheduler": "normal",
+        "steps": 28,
+        "minimum_steps": 10,
+        "cfg": 5.0
+    },
+    "NAI - DPM++ 2M SDE": {
+        "sampler": "dpmpp_2m_sde",
+        "scheduler": "normal",
+        "steps": 28,
+        "minimum_steps": 10,
+        "cfg": 5.0
     }
 }

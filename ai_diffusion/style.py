@@ -115,6 +115,38 @@ class StyleSettings:
     live_sampler_steps = Setting(_("Sampler Steps"), 6, sampler_steps.desc)
     live_cfg_scale = Setting(_("Guidance Strength (CFG Scale)"), 1.8, cfg_scale.desc)
 
+    # -- NAI-specific parameters (only relevant when checkpoint is a NAI model) --
+
+    nai_uc_preset = Setting(
+        _("UC Preset"),
+        0,
+        _("Undesired Content preset (0=Heavy, 1=Light, 2=None)"),
+    )
+
+    nai_quality_toggle = Setting(
+        _("Quality Tags"),
+        True,
+        _("Automatically prepend quality tags to the prompt"),
+    )
+
+    nai_variety_boost = Setting(
+        _("Variety+"),
+        False,
+        _("Skip CFG above a sigma threshold for more diverse outputs"),
+    )
+
+    nai_cfg_rescale = Setting(
+        _("Prompt Guidance Rescale"),
+        0.0,
+        _("Rescale guidance to reduce artifacts (0.0 – 1.0)"),
+    )
+
+    nai_noise_schedule = Setting(
+        _("Noise Schedule"),
+        "native",
+        _("Noise schedule used during sampling"),
+    )
+
 
 class Style(QObject):
     filepath: Path
@@ -138,6 +170,13 @@ class Style(QObject):
     live_sampler: str = StyleSettings.live_sampler.default
     live_sampler_steps: int = StyleSettings.live_sampler_steps.default
     live_cfg_scale: float = StyleSettings.live_cfg_scale.default
+
+    # NAI-specific fields (only used when checkpoint is a NAI model)
+    nai_uc_preset: int = StyleSettings.nai_uc_preset.default
+    nai_quality_toggle: bool = StyleSettings.nai_quality_toggle.default
+    nai_variety_boost: bool = StyleSettings.nai_variety_boost.default
+    nai_cfg_rescale: float = StyleSettings.nai_cfg_rescale.default
+    nai_noise_schedule: str = StyleSettings.nai_noise_schedule.default
 
     changed = pyqtSignal(str, object)
 

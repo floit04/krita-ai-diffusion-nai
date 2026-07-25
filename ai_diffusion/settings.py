@@ -20,6 +20,7 @@ class ServerMode(Enum):
     managed = 0
     external = 1
     cloud = 2
+    novelai = 3
 
 
 class ServerBackend(Enum):
@@ -183,6 +184,103 @@ class Settings(QObject):
 
     access_token: str
     _access_token = Setting(_("Cloud Access Token"), "")
+
+    nai_api_token: str
+    _nai_api_token = Setting(
+        _("NovelAI API Token"),
+        "",
+        _("Persistent API token (pst-xxx) for NovelAI image generation"),
+    )
+
+    nai_tokens: list
+    _nai_tokens = Setting(
+        _("NovelAI API Tokens"),
+        [],  # [{name: str, token: str, tier: str, anlas: int}, ...]
+        _("List of NovelAI API tokens for multi-account management"),
+    )
+
+    nai_active_token_index: int
+    _nai_active_token_index = Setting(
+        _("Active NovelAI Token Index"),
+        0,
+        _("Index of the currently active NovelAI API token"),
+    )
+
+    # -- NAI basic parameters (matches NAI web main panel) --
+
+    nai_model: str
+    _nai_model = Setting(
+        _("Default Model"),
+        "nai-diffusion-4-5-curated",
+        _("NovelAI model to use for generation"),
+    )
+
+    nai_steps: int
+    _nai_steps = Setting(
+        _("Steps"),
+        28,
+        _("Number of sampling steps"),
+    )
+
+    nai_cfg_scale: float
+    _nai_cfg_scale = Setting(
+        _("Prompt Guidance"),
+        5.0,
+        _("CFG scale — how strongly the image follows the prompt"),
+    )
+
+    nai_variety_boost: bool
+    _nai_variety_boost = Setting(
+        _("Variety+"),
+        False,
+        _("Skip CFG above a sigma threshold for more diverse outputs"),
+    )
+
+    nai_variety_boost_sigma: float
+    _nai_variety_boost_sigma = Setting(
+        _("Variety+ Sigma"),
+        19.0,
+        _("Sigma threshold for Variety+ (default 19.0)"),
+    )
+
+    nai_sampler: str
+    _nai_sampler = Setting(
+        _("Sampler"),
+        "k_euler",
+        _("Sampling method for image generation"),
+    )
+
+    # -- NAI advanced parameters (matches NAI web Advanced Settings) --
+
+    nai_cfg_rescale: float
+    _nai_cfg_rescale = Setting(
+        _("Prompt Guidance Rescale"),
+        0.0,
+        _("Rescale guidance to reduce artifacts (0.0 – 1.0)"),
+    )
+
+    nai_noise_schedule: str
+    _nai_noise_schedule = Setting(
+        _("Noise Schedule"),
+        "native",
+        _("Noise schedule used during sampling"),
+    )
+
+    # -- NAI plugin-specific settings (not on NAI web) --
+
+    nai_uc_preset: int
+    _nai_uc_preset = Setting(
+        _("UC Preset"),
+        0,
+        _("Undesired Content preset (0=Heavy, 1=Light, 2=None)"),
+    )
+
+    nai_quality_toggle: bool
+    _nai_quality_toggle = Setting(
+        _("Quality Tags"),
+        True,
+        _("Automatically prepend quality tags to the prompt (Curated models)"),
+    )
 
     server_path: str
     _server_path = Setting(
@@ -560,6 +658,9 @@ class Settings(QObject):
         except Exception as e:
             log.error(f"Failed to load settings: {e}")
 
+        # Migrate legacy single token to multi-token list
+        self._migrate_nai_tokens()
+
     def apply_performance_preset(self, preset: PerformancePreset):
         if preset not in [PerformancePreset.custom, PerformancePreset.auto]:
             for k, v in self._performance_presets[preset]._asdict().items():
@@ -567,6 +668,39 @@ class Settings(QObject):
 
     def __iter__(self):
         return iter(self._values.items())
+
+    def get_active_nai_token(self) -> str:
+        """Return the currently active NovelAI API token string.
+        
+        If nai_tokens list is populated, use nai_active_token_index to pick.
+        Otherwise fall back to legacy nai_api_token string.
+        """
+        tokens = self._values.get("nai_tokens", [])
+        if tokens:
+            idx = self._values.get("nai_active_token_index", 0)
+            idx = max(0, min(idx, len(tokens) - 1))
+            return tokens[idx].get("token", "")
+        return self._values.get("nai_api_token", "")
+
+    def set_active_nai_token_index(self, index: int):
+        """Switch active token and sync nai_api_token for backward compat."""
+        tokens = self._values.get("nai_tokens", [])
+        if 0 <= index < len(tokens):
+            self._values["nai_active_token_index"] = index
+            self._values["nai_api_token"] = tokens[index].get("token", "")
+            self.changed.emit("nai_active_token_index", index)
+            self.changed.emit("nai_api_token", self._values["nai_api_token"])
+
+    def _migrate_nai_tokens(self):
+        """Migrate legacy single nai_api_token to nai_tokens list if needed."""
+        tokens = self._values.get("nai_tokens", [])
+        old_token = self._values.get("nai_api_token", "")
+        if not tokens and old_token:
+            self._values["nai_tokens"] = [
+                {"name": "Default", "token": old_token, "tier": "", "anlas": 0}
+            ]
+            self._values["nai_active_token_index"] = 0
+            log.info("Migrated legacy nai_api_token to nai_tokens list")
 
     def _migrate_legacy_settings(self, path: Path):
         if path == self.default_path:

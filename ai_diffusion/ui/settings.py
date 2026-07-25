@@ -36,6 +36,7 @@ from .. import __version__, eventloop, resources, util
 from ..client import Client, MissingResources, User
 from ..cloud_client import CloudClient
 from ..connection import ConnectionState, apply_performance_preset
+from ..nai_client import NaiClient
 from ..localization import Localization
 from ..localization import translate as _
 from ..properties import Binding
@@ -328,6 +329,7 @@ _server_mode_text = {
     ServerMode.cloud: _("Online Service"),
     ServerMode.managed: _("Local Managed Server"),
     ServerMode.external: _("Custom Server"),
+    ServerMode.novelai: _("NovelAI"),
 }
 _server_mode_status = {
     "signed_out": (_("Signed out"), grey),
@@ -415,13 +417,15 @@ class ServerModeSelect(QWidget):
         self._cloud_button = ServerModeButton(ServerMode.cloud, "signed_out", self)
         self._managed_button = ServerModeButton(ServerMode.managed, "not_installed", self)
         self._external_button = ServerModeButton(ServerMode.external, "not_connected", self)
+        self._novelai_button = ServerModeButton(ServerMode.novelai, "not_connected", self)
 
-        for button in (self._cloud_button, self._managed_button, self._external_button):
+        for button in (self._cloud_button, self._managed_button, self._external_button, self._novelai_button):
             button.toggled.connect(self._change_mode)
 
         layout.addWidget(self._cloud_button)
         layout.addWidget(self._managed_button)
         layout.addWidget(self._external_button)
+        layout.addWidget(self._novelai_button)
         layout.addStretch()
 
     def _change_mode(self, mode: ServerMode):
@@ -436,6 +440,8 @@ class ServerModeSelect(QWidget):
             return ServerMode.managed
         elif self._external_button.isChecked():
             return ServerMode.external
+        elif self._novelai_button.isChecked():
+            return ServerMode.novelai
         return ServerMode.undefined
 
     @mode.setter
@@ -443,10 +449,12 @@ class ServerModeSelect(QWidget):
         self._cloud_button.setChecked(mode is ServerMode.cloud)
         self._managed_button.setChecked(mode is ServerMode.managed)
         self._external_button.setChecked(mode is ServerMode.external)
+        self._novelai_button.setChecked(mode is ServerMode.novelai)
 
     def update_status(self, state: ConnectionState, server_state: ServerState):
         self._cloud_button.status = "signed_out"
         self._external_button.status = "not_connected"
+        self._novelai_button.status = "not_connected"
         match server_state:
             case ServerState.not_installed:
                 self._managed_button.status = "not_installed"
@@ -480,6 +488,453 @@ class ServerModeSelect(QWidget):
                 self._external_button.status = "connected"
             case ServerMode.external, ConnectionState.error, _:
                 self._external_button.status = "error"
+            case ServerMode.novelai, ConnectionState.connecting, _:
+                self._novelai_button.status = "connecting"
+            case ServerMode.novelai, ConnectionState.connected, _:
+                self._novelai_button.status = "connected"
+            case ServerMode.novelai, ConnectionState.error, _:
+                self._novelai_button.status = "error"
+
+
+class NovelAIConnectionWidget(QWidget):
+    """NovelAI connection panel shown inside the Connection tab when NAI mode is selected."""
+
+    value_changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 12, 4, 4)
+        self.setLayout(layout)
+
+        header = QLabel("<b>NovelAI</b>", self)
+        website_label = QLabel("<a href='https://novelai.net'>Visit NovelAI</a>", self)
+        website_label.setOpenExternalLinks(True)
+        layout.addWidget(header)
+        layout.addWidget(website_label)
+
+        # Token input
+        add_header(layout, Settings._nai_api_token)
+        token_layout = QHBoxLayout()
+        self._token_edit = QLineEdit(self)
+        self._token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._token_edit.setPlaceholderText("pst-...")
+        self._token_edit.textChanged.connect(self._on_token_changed)
+        token_layout.addWidget(self._token_edit)
+        self._connect_button = QPushButton(_("Connect"), self)
+        self._connect_button.clicked.connect(self._connect)
+        token_layout.addWidget(self._connect_button)
+        layout.addLayout(token_layout)
+
+        # Connection status
+        self._connection_status = QLabel(self)
+        self._connection_status.setWordWrap(True)
+        self._connection_status.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self._connection_status)
+
+        # Subscription info area
+        self._subscription_frame = QFrame(self)
+        self._subscription_frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
+        self._subscription_frame.setLineWidth(2)
+        self._subscription_frame.setVisible(False)
+        sub_layout = QVBoxLayout()
+        self._subscription_frame.setLayout(sub_layout)
+
+        self._sub_tier = QLabel("", self)
+        self._sub_tier.setStyleSheet("font-weight:bold")
+        tier_layout = QHBoxLayout()
+        tier_layout.addWidget(QLabel(_("Subscription:"), self), 0)
+        tier_layout.addWidget(self._sub_tier, 1)
+        sub_layout.addLayout(tier_layout)
+
+        self._anlas_label = QLabel("", self)
+        self._anlas_label.setStyleSheet("font-weight:bold")
+        anlas_layout = QHBoxLayout()
+        anlas_layout.addWidget(QLabel(_("Anlas:"), self), 0)
+        anlas_layout.addWidget(self._anlas_label, 1)
+        sub_layout.addLayout(anlas_layout)
+
+        self._refresh_sub_button = QPushButton(_("Refresh"), self)
+        self._refresh_sub_button.clicked.connect(self._refresh_subscription)
+        sub_layout.addWidget(self._refresh_sub_button, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        layout.addWidget(self._subscription_frame)
+        layout.addStretch()
+
+    def _on_token_changed(self, text: str):
+        settings.nai_api_token = text
+        settings.save()
+
+    def _connect(self):
+        settings.nai_api_token = self._token_edit.text()
+        settings.save()
+        root.connection.connect()
+
+    def _refresh_subscription(self):
+        """Fetch subscription info from api.novelai.net (separate from image API)."""
+        eventloop.run(self._fetch_subscription())
+
+    async def _fetch_subscription(self):
+        try:
+            from ..network import RequestManager
+            rm = RequestManager()
+            token = settings.nai_api_token
+            if not token:
+                return
+            data = await rm.http(
+                "GET", "https://api.novelai.net/user/subscription",
+                timeout=15, bearer=token,
+            )
+            if isinstance(data, dict):
+                tier_val = data.get("tier", 0)
+                tier_names = {0: "Free", 1: "Tablet", 2: "Scroll", 3: "Opus"}
+                self._sub_tier.setText(tier_names.get(tier_val, f"Tier {tier_val}"))
+
+                # trainingStepsLeft contains Anlas info
+                anlas = data.get("trainingStepsLeft", {})
+                fixed = anlas.get("fixedTrainingStepsLeft", 0)
+                purchased = anlas.get("purchasedTrainingSteps", 0)
+                self._anlas_label.setText(str(fixed + purchased))
+                self._subscription_frame.setVisible(True)
+        except Exception as e:
+            self._sub_tier.setText(_("Error fetching subscription"))
+            self._anlas_label.setText(str(e))
+            self._subscription_frame.setVisible(True)
+
+    def update_connection_state(self, state: ConnectionState):
+        self._token_edit.setText(settings.nai_api_token)
+        is_connected = state == ConnectionState.connected
+
+        if is_connected:
+            self._connection_status.setText(_("Connected"))
+            self._connection_status.setStyleSheet(f"color: {green}; font-weight:bold")
+            self._connect_button.setEnabled(True)
+            self._connect_button.setText(_("Reconnect"))
+            # Auto-fetch subscription on connect
+            self._refresh_subscription()
+        elif state is ConnectionState.connecting:
+            self._connection_status.setText(_("Connecting..."))
+            self._connection_status.setStyleSheet(f"color: {yellow}; font-weight:bold")
+            self._connect_button.setEnabled(False)
+        elif state is ConnectionState.error:
+            error = root.connection.error or "Unknown error"
+            self._connection_status.setText(f"<b>{_('Error')}</b>: {error.removeprefix('Error: ')}")
+            self._connection_status.setStyleSheet(f"color: {red}; font-weight:bold")
+            self._connect_button.setEnabled(True)
+            self._connect_button.setText(_("Connect"))
+        else:
+            self._connection_status.setText(_("Disconnected"))
+            self._connection_status.setStyleSheet(f"color: {grey}; font-style:italic")
+            self._connect_button.setEnabled(True)
+            self._connect_button.setText(_("Connect"))
+            self._subscription_frame.setVisible(False)
+
+
+class TokenEditDialog(QDialog):
+    """Dialog for adding or editing a NovelAI API token entry."""
+
+    def __init__(self, parent=None, name="", token=""):
+        super().__init__(parent)
+        self.setWindowTitle(_("Edit API Token"))
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+
+        layout.addWidget(QLabel(_("Name") + ":", self))
+        self._name_edit = QLineEdit(self)
+        self._name_edit.setText(name)
+        self._name_edit.setPlaceholderText(_("e.g. Main Account"))
+        layout.addWidget(self._name_edit)
+
+        layout.addWidget(QLabel(_("API Token") + ":", self))
+        self._token_edit = QLineEdit(self)
+        self._token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._token_edit.setText(token)
+        self._token_edit.setPlaceholderText("pst-...")
+        layout.addWidget(self._token_edit)
+
+        button_layout = QHBoxLayout()
+        ok_button = QPushButton(_("OK"), self)
+        ok_button.clicked.connect(self.accept)
+        cancel_button = QPushButton(_("Cancel"), self)
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addStretch()
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+    @property
+    def name(self):
+        return self._name_edit.text().strip()
+
+    @property
+    def token(self):
+        return self._token_edit.text().strip()
+
+
+class NovelAISettings(SettingsTab):
+    """Independent NovelAI settings tab with multi-token management."""
+
+    def __init__(self):
+        super().__init__(_("NovelAI Settings"))
+
+        # --- Visit NovelAI link ---
+        header = QLabel("<b>NovelAI</b>", self)
+        website_label = QLabel("<a href='https://novelai.net'>Visit NovelAI</a>", self)
+        website_label.setOpenExternalLinks(True)
+        self._layout.addWidget(header)
+        self._layout.addWidget(website_label)
+        self._layout.addSpacing(8)
+
+        # --- Connection status ---
+        self._connection_status = QLabel(self)
+        self._connection_status.setWordWrap(True)
+        self._connection_status.setTextFormat(Qt.TextFormat.RichText)
+        self._layout.addWidget(self._connection_status)
+        self._layout.addSpacing(8)
+
+        # --- Subscription info ---
+        self._subscription_frame = QFrame(self)
+        self._subscription_frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
+        self._subscription_frame.setLineWidth(2)
+        self._subscription_frame.setVisible(False)
+        sub_layout = QVBoxLayout()
+        self._subscription_frame.setLayout(sub_layout)
+
+        self._sub_tier = QLabel("", self)
+        self._sub_tier.setStyleSheet("font-weight:bold")
+        tier_layout = QHBoxLayout()
+        tier_layout.addWidget(QLabel(_("Subscription:"), self), 0)
+        tier_layout.addWidget(self._sub_tier, 1)
+        sub_layout.addLayout(tier_layout)
+
+        self._anlas_label = QLabel("", self)
+        self._anlas_label.setStyleSheet("font-weight:bold")
+        anlas_layout = QHBoxLayout()
+        anlas_layout.addWidget(QLabel(_("Anlas:"), self), 0)
+        anlas_layout.addWidget(self._anlas_label, 1)
+        sub_layout.addLayout(anlas_layout)
+
+        self._refresh_sub_button = QPushButton(_("Refresh"), self)
+        self._refresh_sub_button.clicked.connect(self._refresh_subscription)
+        sub_layout.addWidget(self._refresh_sub_button, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self._layout.addWidget(self._subscription_frame)
+        self._layout.addSpacing(12)
+
+        # --- API Token management ---
+        token_header = QLabel("<b>" + _("API Token Management") + "</b>", self)
+        self._layout.addWidget(token_header)
+
+        # Current token selector
+        current_label = QLabel(_("Active Token:"), self)
+        self._token_combo = QComboBox(self)
+        self._token_combo.setMinimumWidth(250)
+        self._token_combo.currentIndexChanged.connect(self._on_active_token_changed)
+        combo_layout = QHBoxLayout()
+        combo_layout.addWidget(current_label)
+        combo_layout.addWidget(self._token_combo, 1)
+        self._layout.addLayout(combo_layout)
+
+        # Token list
+        self._token_list = QListWidget(self)
+        self._token_list.setMaximumHeight(150)
+        self._layout.addWidget(self._token_list)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self._add_btn = QPushButton(_("Add"), self)
+        self._add_btn.clicked.connect(self._add_token)
+        self._edit_btn = QPushButton(_("Edit"), self)
+        self._edit_btn.clicked.connect(self._edit_token)
+        self._delete_btn = QPushButton(_("Delete"), self)
+        self._delete_btn.clicked.connect(self._delete_token)
+        btn_layout.addWidget(self._add_btn)
+        btn_layout.addWidget(self._edit_btn)
+        btn_layout.addWidget(self._delete_btn)
+        btn_layout.addStretch()
+        self._layout.addLayout(btn_layout)
+
+        self._layout.addStretch()
+
+        root.connection.state_changed.connect(self._update_connection_state)
+
+    def _read(self):
+        self._refresh_token_list()
+        self._update_connection_state(root.connection.state)
+
+    def _write(self):
+        pass  # Token management is handled via explicit button actions
+
+    def _refresh_token_list(self):
+        """Rebuild the token list and combo from settings."""
+        tokens = settings.nai_tokens
+        active_idx = settings.nai_active_token_index
+
+        # Block signals to avoid triggering _on_active_token_changed during rebuild
+        self._token_combo.blockSignals(True)
+        self._token_combo.clear()
+        self._token_list.clear()
+
+        if not tokens:
+            self._token_combo.addItem(_("(No tokens configured)"))
+            self._token_combo.blockSignals(False)
+            return
+
+        for i, entry in enumerate(tokens):
+            name = entry.get("name", f"Token {i+1}")
+            tier = entry.get("tier", "")
+            anlas = entry.get("anlas", 0)
+            display = name
+            if tier:
+                display += f"  [{tier}]"
+            if anlas:
+                display += f"  ({anlas} Anlas)"
+
+            self._token_combo.addItem(display)
+            item = QListWidgetItem(display)
+            self._token_list.addItem(item)
+
+        safe_idx = max(0, min(active_idx, len(tokens) - 1))
+        self._token_combo.setCurrentIndex(safe_idx)
+        self._token_list.setCurrentRow(safe_idx)
+        self._token_combo.blockSignals(False)
+
+    def _on_active_token_changed(self, index: int):
+        if index < 0:
+            return
+        tokens = settings.nai_tokens
+        if 0 <= index < len(tokens):
+            settings.set_active_nai_token_index(index)
+            settings.save()
+
+    def _add_token(self):
+        dlg = TokenEditDialog(self)
+        if dlg.exec_() == QDialog.DialogCode.Accepted and dlg.token:
+            tokens = list(settings.nai_tokens)
+            new_entry = {
+                "name": dlg.name or f"Token {len(tokens)+1}",
+                "token": dlg.token,
+                "tier": "",
+                "anlas": 0,
+            }
+            tokens.append(new_entry)
+            settings.nai_tokens = tokens
+            settings.set_active_nai_token_index(len(tokens) - 1)
+            settings.save()
+            self._refresh_token_list()
+
+    def _edit_token(self):
+        tokens = list(settings.nai_tokens)
+        idx = self._token_list.currentRow()
+        if 0 <= idx < len(tokens):
+            entry = tokens[idx]
+            dlg = TokenEditDialog(self, entry.get("name", ""), entry.get("token", ""))
+            if dlg.exec_() == QDialog.DialogCode.Accepted and dlg.token:
+                tokens[idx] = {
+                    "name": dlg.name or entry.get("name", ""),
+                    "token": dlg.token,
+                    "tier": entry.get("tier", ""),
+                    "anlas": entry.get("anlas", 0),
+                }
+                settings.nai_tokens = tokens
+                # If editing the active token, sync nai_api_token
+                if idx == settings.nai_active_token_index:
+                    settings.nai_api_token = dlg.token
+                settings.save()
+                self._refresh_token_list()
+
+    def _delete_token(self):
+        tokens = list(settings.nai_tokens)
+        idx = self._token_list.currentRow()
+        if 0 <= idx < len(tokens):
+            confirm = QMessageBox.question(
+                self,
+                _("Delete Token"),
+                _("Are you sure you want to delete this token?"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
+                tokens.pop(idx)
+                settings.nai_tokens = tokens
+                # Adjust active index
+                if len(tokens) == 0:
+                    settings.nai_active_token_index = 0
+                    settings.nai_api_token = ""
+                elif idx <= settings.nai_active_token_index:
+                    new_idx = max(0, settings.nai_active_token_index - 1)
+                    settings.set_active_nai_token_index(new_idx)
+                settings.save()
+                self._refresh_token_list()
+
+    def _refresh_subscription(self):
+        """Fetch subscription info for the active token."""
+        eventloop.run(self._fetch_subscription())
+
+    async def _fetch_subscription(self):
+        try:
+            from ..network import RequestManager
+            rm = RequestManager()
+            token = settings.get_active_nai_token()
+            if not token:
+                return
+            data = await rm.http(
+                "GET", "https://api.novelai.net/user/subscription",
+                timeout=15, bearer=token,
+            )
+            if isinstance(data, dict):
+                tier_val = data.get("tier", 0)
+                tier_names = {0: "Free", 1: "Tablet", 2: "Scroll", 3: "Opus"}
+                tier_str = tier_names.get(tier_val, f"Tier {tier_val}")
+                self._sub_tier.setText(tier_str)
+
+                anlas = data.get("trainingStepsLeft", {})
+                fixed = anlas.get("fixedTrainingStepsLeft", 0)
+                purchased = anlas.get("purchasedTrainingSteps", 0)
+                anlas_total = fixed + purchased
+                self._anlas_label.setText(str(anlas_total))
+                self._subscription_frame.setVisible(True)
+
+                # Update token entry with tier/anlas info
+                tokens = list(settings.nai_tokens)
+                idx = settings.nai_active_token_index
+                if 0 <= idx < len(tokens):
+                    tokens[idx]["tier"] = tier_str
+                    tokens[idx]["anlas"] = anlas_total
+                    settings.nai_tokens = tokens
+                    settings.save()
+                    self._refresh_token_list()
+        except Exception as e:
+            self._sub_tier.setText(_("Error fetching subscription"))
+            self._anlas_label.setText(str(e))
+            self._subscription_frame.setVisible(True)
+
+    def _update_connection_state(self, state=None):
+        if state is None:
+            state = root.connection.state
+        is_nai = settings.server_mode is ServerMode.novelai
+        if not is_nai:
+            self._connection_status.setText(_("Not using NovelAI backend"))
+            self._connection_status.setStyleSheet(f"color: {grey}; font-style:italic")
+            self._subscription_frame.setVisible(False)
+            return
+
+        if state == ConnectionState.connected:
+            self._connection_status.setText(_("Connected"))
+            self._connection_status.setStyleSheet(f"color: {green}; font-weight:bold")
+            self._refresh_subscription()
+        elif state == ConnectionState.connecting:
+            self._connection_status.setText(_("Connecting..."))
+            self._connection_status.setStyleSheet(f"color: {yellow}; font-weight:bold")
+        elif state == ConnectionState.error:
+            error = root.connection.error or "Unknown error"
+            self._connection_status.setText(f"<b>{_('Error')}</b>: {error.removeprefix('Error: ')}")
+            self._connection_status.setStyleSheet(f"color: {red}; font-weight:bold")
+        else:
+            self._connection_status.setText(_("Disconnected"))
+            self._connection_status.setStyleSheet(f"color: {grey}; font-style:italic")
+            self._subscription_frame.setVisible(False)
 
 
 class ConnectionSettings(SettingsTab):
@@ -494,11 +949,13 @@ class ConnectionSettings(SettingsTab):
         self._cloud_widget = CloudWidget(self)
         self._server_widget = ServerWidget(server, self)
         self._connection_widget = QWidget(self)
+        self._novelai_widget = NovelAIConnectionWidget(self)
         self._server_stack = QStackedWidget(self)
         self._server_stack.addWidget(self._setup_widget)
         self._server_stack.addWidget(self._cloud_widget)
         self._server_stack.addWidget(self._server_widget)
         self._server_stack.addWidget(self._connection_widget)
+        self._server_stack.addWidget(self._novelai_widget)
 
         connection_layout = QVBoxLayout()
         connection_layout.setContentsMargins(0, 0, 0, 0)
@@ -558,6 +1015,7 @@ class ConnectionSettings(SettingsTab):
             ServerMode.cloud: self._cloud_widget,
             ServerMode.managed: self._server_widget,
             ServerMode.external: self._connection_widget,
+            ServerMode.novelai: self._novelai_widget,
             ServerMode.undefined: self._setup_widget,
         }[mode]
         self._server_stack.setCurrentWidget(widget)
@@ -586,6 +1044,8 @@ class ConnectionSettings(SettingsTab):
         connection = root.connection
         self._server_mode.update_status(connection.state, self._server.state)
         self._cloud_widget.update_connection_state(connection.state)
+        if settings.server_mode is ServerMode.novelai:
+            self._novelai_widget.update_connection_state(connection.state)
         self._connect_button.setEnabled(True)
         if connection.state == ConnectionState.connected:
             self._connection_status.setText(_("Connected"))
@@ -1163,6 +1623,7 @@ class SettingsDialog(QDialog):
 
         self.connection = ConnectionSettings(server)
         self.styles = StylePresets(server)
+        self.novelai = NovelAISettings()
         self.diffusion = DiffusionSettings()
         self.interface = InterfaceSettings()
         self.performance = PerformanceSettings()
@@ -1179,6 +1640,7 @@ class SettingsDialog(QDialog):
 
         create_list_item(_("Connection"), self.connection)
         create_list_item(_("Styles"), self.styles)
+        create_list_item(_("NovelAI"), self.novelai)
         create_list_item(_("Diffusion"), self.diffusion)
         create_list_item(_("Interface"), self.interface)
         create_list_item(_("Performance"), self.performance)
@@ -1223,6 +1685,7 @@ class SettingsDialog(QDialog):
     def read(self):
         self.connection.read()
         self.styles.read()
+        self.novelai.read()
         self.diffusion.read()
         self.interface.read()
         self.performance.read()
