@@ -23,13 +23,13 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from ..client import filter_supported_styles, resolve_arch
+from ..backend.client import filter_supported_styles, resolve_arch
+from ..backend.resources import Arch, ResourceId, ResourceKind, search_paths
+from ..backend.server import Server
 from ..files import File, FileFilter, FileFormat, FileSource
+from ..backend.nai_workflow import NaiNoiseSchedule, NaiUCPreset
 from ..localization import translate as _
-from ..nai_workflow import NaiNoiseSchedule, NaiUCPreset
-from ..resources import Arch, ResourceId, ResourceKind, search_paths
-from ..root import root
-from ..server import Server
+from ..model.root import root
 from ..settings import ServerMode, Setting, settings
 from ..style import SamplerPresets, Style, Styles, StyleSettings
 from . import theme
@@ -883,8 +883,8 @@ class StylePresets(SettingsTab):
     @staticmethod
     def _is_nai_style(style: Style) -> bool:
         """Return True if the style uses a NovelAI architecture."""
-        from ..resources import Arch
-        from ..client import resolve_arch
+        from ..backend.resources import Arch
+        from ..backend.client import resolve_arch
         arch = resolve_arch(style, root.connection.client_if_connected)
         if arch is Arch.nai:
             return True

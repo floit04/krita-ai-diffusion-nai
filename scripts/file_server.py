@@ -12,8 +12,8 @@ import anyio
 from aiohttp import web
 
 sys.path.append(str(Path(__file__).parent.parent))
-from ai_diffusion import resources
-from ai_diffusion.resources import Arch, ModelFile, ModelResource, ResourceId, ResourceKind
+from ai_diffusion.backend import resources
+from ai_diffusion.backend.resources import Arch, ModelFile, ModelResource, ResourceId, ResourceKind
 
 dir = Path(__file__).parent / "downloads"
 
@@ -92,7 +92,7 @@ def run(port=51222, verbose=False):
 
     app = web.Application()
     app.add_routes([web.get(url, handle) for url in urls])
-    web.run_app(app, host="localhost", port=port)
+    web.run_app(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":

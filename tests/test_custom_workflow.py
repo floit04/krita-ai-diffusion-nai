@@ -7,9 +7,14 @@ from pathlib import Path
 import pytest
 from PyQt5.QtCore import Qt
 
-from ai_diffusion import workflow
-from ai_diffusion.api import CustomStyleInput, CustomWorkflowInput, ImageInput, WorkflowInput
-from ai_diffusion.client import (
+from ai_diffusion.backend import workflow
+from ai_diffusion.backend.api import (
+    CustomStyleInput,
+    CustomWorkflowInput,
+    ImageInput,
+    WorkflowInput,
+)
+from ai_diffusion.backend.client import (
     CheckpointInfo,
     Client,
     ClientModels,
@@ -17,9 +22,12 @@ from ai_diffusion.client import (
     OutputBatchMode,
     TextOutput,
 )
-from ai_diffusion.comfy_workflow import ComfyNode, ComfyObjectInfo, ComfyWorkflow, Output
-from ai_diffusion.connection import Connection, ConnectionState
-from ai_diffusion.custom_workflow import (
+from ai_diffusion.backend.comfy_workflow import ComfyNode, ComfyObjectInfo, ComfyWorkflow, Output
+from ai_diffusion.backend.resources import Arch
+from ai_diffusion.image import Bounds, Extent, Image, ImageCollection, Mask
+from ai_diffusion.layer import LayerManager
+from ai_diffusion.model.connection import Connection, ConnectionState
+from ai_diffusion.model.custom_workflow import (
     CustomParam,
     CustomWorkspace,
     ParamKind,
@@ -28,10 +36,8 @@ from ai_diffusion.custom_workflow import (
     WorkflowSource,
     workflow_parameters,
 )
-from ai_diffusion.image import Bounds, Extent, Image, ImageCollection, Mask
-from ai_diffusion.jobs import Job, JobKind, JobParams, JobQueue
-from ai_diffusion.resources import Arch
-from ai_diffusion.style import Style
+from ai_diffusion.model.jobs import Job, JobKind, JobParams, JobQueue
+from ai_diffusion.style import Style, Styles
 from ai_diffusion.util import PluginError
 
 from .config import test_dir
@@ -42,9 +48,11 @@ class MockClient(Client):
         self.models = ClientModels()
         self.models.node_inputs = node_defs
 
-    @staticmethod
-    async def connect(url: str, access_token: str = "") -> Client:
-        return MockClient(ComfyObjectInfo({}))
+    async def connect(self):
+        return
+
+    async def discover_models(self, refresh: bool):
+        yield self.DiscoverStatus("models", 1, 1)
 
     async def enqueue(self, work: WorkflowInput, front: bool = False) -> str:
         return ""
@@ -359,6 +367,43 @@ def test_parameters():
         CustomParam(ParamKind.mask_layer, "mask"),
         CustomParam(ParamKind.style, "style", "live"),
     ]
+
+
+def test_collect_parameters_preserves_style_architecture():
+    graph = {
+        "1": {
+            "class_type": "ETN_KritaStyle",
+            "inputs": {"name": "style", "sampler_preset": "auto"},
+        }
+    }
+    connection = create_mock_connection({"connection1": graph})
+    workflows = WorkflowCollection(connection)
+    workspace = CustomWorkspace(workflows, dummy_generate, JobQueue())
+
+    styles = Styles.list()
+    style = styles.create("anima-test.json")
+    try:
+        style.architecture = Arch.anima
+        style.checkpoints = ["checkpoint.safetensors"]
+        workspace.params["style"] = style.filename
+
+        models = ClientModels()
+        models.checkpoints = {
+            "checkpoint.safetensors": CheckpointInfo("checkpoint.safetensors", Arch.anima)
+        }
+
+        params = workspace.collect_parameters(
+            layers=LayerManager(None),
+            bounds=Bounds(0, 0, 1, 1),
+            models=models,
+            is_live=False,
+            is_animation=False,
+        )
+
+        assert isinstance(params["style"], CustomStyleInput)
+        assert params["style"].models.version is Arch.anima
+    finally:
+        styles.delete(style)
 
 
 def test_parameter_order():

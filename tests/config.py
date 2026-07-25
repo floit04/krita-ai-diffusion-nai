@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from ai_diffusion.resources import Arch, default_checkpoints
+from ai_diffusion.backend.resources import Arch, default_checkpoints
 
 _server_dir_env = os.getenv("AI_DIFFUSION_TEST_SERVER_DIR")
 
@@ -22,4 +22,5 @@ default_checkpoint = {
     Arch.flux_k: "svdq-int4_r32-flux.1-kontext-dev.safetensors",
     Arch.flux2_4b: "flux-2-klein-4b.safetensors",
     Arch.zimage: "z_image_turbo_fp8_e4m3fn.safetensors",
+    Arch.anima: "anima-base-v1.0.safetensors",
 }

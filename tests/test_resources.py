@@ -1,8 +1,8 @@
 import json
 from itertools import chain
 
-import ai_diffusion.resources as res
-from ai_diffusion.resources import Arch, ModelResource
+import ai_diffusion.backend.resources as res
+from ai_diffusion.backend.resources import Arch, ModelResource
 
 from .config import result_dir
 
@@ -55,6 +55,7 @@ def test_resource_ids_exist():
             Arch.flux2_9b,
             Arch.anima,
             Arch.ernie,
+            Arch.krea2,
         ):
             continue  # no model downloads yet
         model = res.find_resource(resource_id)
