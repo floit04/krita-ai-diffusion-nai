@@ -334,6 +334,17 @@ class LoraList(QWidget):
     open_folder_button: QToolButton | None = None
     last_filter = "All"
 
+    # Mirror SettingWidget's visible property. Without this, `widget.visible = x`
+    # (used by the style page to hide local-only sections for NAI) silently binds
+    # a plain Python attribute and the LoRA section never hides.
+    @property
+    def visible(self):
+        return self.isVisible()
+
+    @visible.setter
+    def visible(self, v: bool):
+        self.setVisible(v)
+
     def __init__(self, setting: Setting, parent=None):
         super().__init__(parent)
         self._items: list[LoraItem] = []
@@ -845,6 +856,8 @@ class StylePresets(SettingsTab):
             new_style = Styles.list().create(checkpoint="nai-diffusion-4-5-full")
             new_style.architecture = Arch.nai
             new_style.sampler = "NAI - Euler Ancestral"
+            new_style.live_sampler = "NAI - Euler Ancestral"  # not the SD Hyper preset
+            new_style.style_prompt = ""
             new_style.save()
         else:
             cp = self._checkpoint_select.value
