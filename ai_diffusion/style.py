@@ -119,7 +119,7 @@ class StyleSettings:
 
     nai_uc_preset = Setting(
         _("UC Preset"),
-        0,
+        2,
         _("Undesired Content preset (0=Heavy, 1=Light, 2=None)"),
     )
 
@@ -143,7 +143,7 @@ class StyleSettings:
 
     nai_noise_schedule = Setting(
         _("Noise Schedule"),
-        "native",
+        "karras",
         _("Noise schedule used during sampling"),
     )
 

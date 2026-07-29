@@ -795,6 +795,11 @@ class StylePresets(SettingsTab):
             self._sag,
             self._style_widgets["loras"],
         ]
+        if self._nai_only:
+            # NAI doesn't support LoRAs or local model options — remove the whole
+            # section from the NovelAI styles page regardless of selection state.
+            for w in self._local_only_widgets:
+                w.visible = False
 
         self._layout.addStretch()
 
@@ -839,6 +844,7 @@ class StylePresets(SettingsTab):
             # on this page (checkpoint prefix + architecture both mark them NAI).
             new_style = Styles.list().create(checkpoint="nai-diffusion-4-5-full")
             new_style.architecture = Arch.nai
+            new_style.sampler = "NAI - Euler Ancestral"
             new_style.save()
         else:
             cp = self._checkpoint_select.value
@@ -919,9 +925,9 @@ class StylePresets(SettingsTab):
             w.visible = is_nai
         self._nai_header_widget.setVisible(is_nai)
 
-        # Local-only widgets (hide when NAI)
+        # Local-only widgets (hide when NAI; never shown on the NovelAI page)
         for w in self._local_only_widgets:
-            w.visible = not is_nai
+            w.visible = not is_nai and not self._nai_only
 
     def _set_checkpoint_warning(self):
         self._checkpoint_warning.setVisible(False)

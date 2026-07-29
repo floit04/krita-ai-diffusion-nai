@@ -247,7 +247,7 @@ class Settings(QObject):
     nai_sampler: str
     _nai_sampler = Setting(
         _("Sampler"),
-        "k_euler",
+        "k_euler_ancestral",
         _("Sampling method for image generation"),
     )
 
@@ -263,7 +263,7 @@ class Settings(QObject):
     nai_noise_schedule: str
     _nai_noise_schedule = Setting(
         _("Noise Schedule"),
-        "native",
+        "karras",
         _("Noise schedule used during sampling"),
     )
 
@@ -272,7 +272,7 @@ class Settings(QObject):
     nai_uc_preset: int
     _nai_uc_preset = Setting(
         _("UC Preset"),
-        0,
+        2,
         _("Undesired Content preset (0=Heavy, 1=Light, 2=None)"),
     )
 

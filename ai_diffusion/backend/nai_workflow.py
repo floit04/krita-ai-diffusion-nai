@@ -143,7 +143,7 @@ class NaiSampler(Enum):
 
     @staticmethod
     def default():
-        return NaiSampler.k_euler
+        return NaiSampler.k_euler_ancestral
 
 
 # Map from ComfyUI sampler names to NAI sampler names
@@ -176,7 +176,7 @@ class NaiNoiseSchedule(Enum):
 
     @staticmethod
     def default():
-        return NaiNoiseSchedule.native
+        return NaiNoiseSchedule.karras
 
 
 # Map from ComfyUI scheduler names to NAI noise schedule
