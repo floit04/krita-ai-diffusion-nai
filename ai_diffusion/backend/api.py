@@ -92,6 +92,9 @@ class ControlInput:
     image: Image | None = None
     strength: float = 1.0
     range: tuple[float, float] = (0.0, 1.0)
+    # Secondary parameter for NAI modes: vibe "information extracted" (default 0.7)
+    # or precise-reference "fidelity" (default 1.0). Unused by other backends.
+    param2: float = 1.0
 
 
 @dataclass
@@ -199,6 +202,7 @@ class WorkflowInput:
     color_match: float = 0.0
     nsfw_filter: float = 0.0
     custom_workflow: CustomWorkflowInput | None = None
+    nai_style: str = ""  # filename of the originating Style (NAI: exact-match params)
 
     @property
     def extent(self):

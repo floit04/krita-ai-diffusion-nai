@@ -337,6 +337,39 @@ class ControlMode(Enum):
     blur = 10
     stencil = 11
     hands = 12
+    # NAI-only modes (NovelAI backend, hidden for other backends)
+    nai_base = 20  # img2img base image (垫图)
+    nai_vibe = 21  # Vibe Transfer reference
+    nai_precise_character = 22  # Precise (director) reference: character
+    nai_precise_style = 23  # Precise (director) reference: style
+    nai_precise_character_style = 24  # Precise (director) reference: character & style
+
+    @property
+    def is_nai(self):
+        return self in [
+            ControlMode.nai_base,
+            ControlMode.nai_vibe,
+            ControlMode.nai_precise_character,
+            ControlMode.nai_precise_style,
+            ControlMode.nai_precise_character_style,
+        ]
+
+    @property
+    def is_nai_precise(self):
+        return self in [
+            ControlMode.nai_precise_character,
+            ControlMode.nai_precise_style,
+            ControlMode.nai_precise_character_style,
+        ]
+
+    @property
+    def nai_precise_caption(self):
+        """base_caption string for director_reference_descriptions."""
+        return {
+            ControlMode.nai_precise_character: "character",
+            ControlMode.nai_precise_style: "style",
+            ControlMode.nai_precise_character_style: "character&style",
+        }[self]
 
     @property
     def is_lines(self):
@@ -358,7 +391,7 @@ class ControlMode(Enum):
 
     @property
     def is_control_net(self):
-        return not self.is_ip_adapter
+        return not self.is_ip_adapter and not self.is_nai
 
     @property
     def is_ip_adapter(self):
@@ -379,7 +412,7 @@ class ControlMode(Enum):
 
     @property
     def is_structural(self):  # strong impact on image composition/structure
-        return not (self.is_ip_adapter or self is ControlMode.inpaint)
+        return not (self.is_ip_adapter or self.is_nai or self is ControlMode.inpaint)
 
     @property
     def text(self):

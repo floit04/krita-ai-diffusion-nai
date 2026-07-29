@@ -31,7 +31,7 @@ from ..backend.nai_workflow import NaiNoiseSchedule, NaiUCPreset
 from ..localization import translate as _
 from ..model.root import root
 from ..settings import ServerMode, Setting, settings
-from ..style import SamplerPresets, Style, Styles, StyleSettings
+from ..style import SamplerPresets, Style, Styles, StyleSettings, is_nai_style
 from . import theme
 from .settings_widgets import (
     ComboBoxSetting,
@@ -583,8 +583,11 @@ class StylePresets(SettingsTab):
     _default_sampler_widgets: list[SettingWidget]
     _live_sampler_widgets: list[SettingWidget]
 
-    def __init__(self, server: Server):
-        super().__init__(_("Style Presets"))
+    def __init__(self, server: Server, nai_only: bool = False):
+        # nai_only splits the settings UI: the ComfyUI "Styles" page lists
+        # non-NAI styles, the "NovelAI Styles" page lists only NAI styles.
+        self._nai_only = nai_only
+        super().__init__(_("NovelAI 风格预设") if nai_only else _("Style Presets"))
         self.server = server
 
         self._style_list = QComboBox(self)
@@ -810,7 +813,14 @@ class StylePresets(SettingsTab):
     @property
     def current_style(self) -> Style:
         styles = Styles.list()
-        return styles.find(self._style_list.currentData()) or styles.default
+        found = styles.find(self._style_list.currentData())
+        if found is not None:
+            return found
+        # Fall back to the first style matching this page's kind (NAI vs ComfyUI)
+        for s in styles:
+            if is_nai_style(s) == self._nai_only:
+                return s
+        return styles.default
 
     @current_style.setter
     def current_style(self, style: Style):
@@ -824,8 +834,15 @@ class StylePresets(SettingsTab):
             self._read()
 
     def _create_style(self):
-        cp = self._checkpoint_select.value
-        new_style = Styles.list().create(checkpoint=str(cp))
+        if self._nai_only:
+            # New styles on the NovelAI page default to a NAI model so they land
+            # on this page (checkpoint prefix + architecture both mark them NAI).
+            new_style = Styles.list().create(checkpoint="nai-diffusion-4-5-full")
+            new_style.architecture = Arch.nai
+            new_style.save()
+        else:
+            cp = self._checkpoint_select.value
+            new_style = Styles.list().create(checkpoint=str(cp))
         self.current_style = new_style
 
     def _duplicate_style(self):
@@ -841,6 +858,8 @@ class StylePresets(SettingsTab):
 
     def _populate_style_list(self):
         for style in Styles.list().filtered():
+            if is_nai_style(style) != self._nai_only:
+                continue  # keep NAI and ComfyUI styles on separate pages
             self._style_list.addItem(f"{style.name} ({style.filename})", style.filename)
 
     def _update_style_list(self):

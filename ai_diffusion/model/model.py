@@ -58,7 +58,7 @@ from ..settings import (
     settings,
 )
 from ..style import Arch, Style, Styles
-from ..text import create_img_metadata, extract_layers
+from ..text import create_img_metadata, extract_layers, merge_prompt
 from ..util import PluginError, clamp, ensure, trim_text, unique
 from ..util import client_logger as log
 from .connection import Connection, ConnectionState
@@ -233,10 +233,6 @@ class DocumentModel(QObject, ObservableProperties):
         arch = self.arch
         workflow_kind = WorkflowKind.generate
         strength = self.strength
-        # --- TEMP DIAGNOSTIC: STRENGTH PATH (REMOVE LATER) ---
-        from ..util import client_logger as _str_log
-        _str_log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [1] Model.strength={self.strength}, arch={arch}, is_editing={self.is_editing}")
-        # --- END TEMP DIAGNOSTIC ---
         if arch is Arch.qwen_l:
             strength = 1.0
         if strength < 1.0 or self.is_editing:
@@ -269,10 +265,7 @@ class DocumentModel(QObject, ObservableProperties):
             inpaint_mode = self.resolve_inpaint_mode()
 
         if not dryrun:
-            from ..util import client_logger as _log
-            _log.warning(f"NAI WORKFLOW DEBUG: regions.positive={repr(regions.positive)}, regions.negative={repr(regions.negative)}")
             conditioning, job_regions = process_regions(regions, bounds, region_layer)
-            _log.warning(f"NAI WORKFLOW DEBUG: after process_regions: cond.positive={repr(conditioning.positive)}")
             conditioning.language = self.prompt_translation_language
         else:
             conditioning, job_regions = ConditioningInput("", ""), []
@@ -314,9 +307,6 @@ class DocumentModel(QObject, ObservableProperties):
                 )
             inpaint = calc_selection_pre_process(inpaint, selection_bounds, smod)
 
-        # --- TEMP DIAGNOSTIC: STRENGTH PATH (REMOVE LATER) ---
-        _str_log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [2] workflow.prepare(strength={strength}, workflow_kind={workflow_kind}, mask={'YES' if mask else 'NO'})")
-        # --- END TEMP DIAGNOSTIC ---
         input = workflow.prepare(
             workflow_kind,
             image or extent,
@@ -332,6 +322,12 @@ class DocumentModel(QObject, ObservableProperties):
             inpaint=inpaint,
             layer_count=self.layer_count,
         )
+        if is_nai:
+            # Thread the exact selected style's filename to the NAI backend so it
+            # reads the right params. Checkpoint IDs are not unique across styles
+            # (e.g. built-in "NAI V4.5" and a user style share the same checkpoint),
+            # so the backend must not guess the style from the checkpoint alone.
+            input.nai_style = self.active_style.filename
         loras = input.models.loras if input.models else []
         job_name = prompt_meta.get("prompt_eval", prompt_meta["prompt"])
         job_params = JobParams(bounds, job_name, regions=job_regions)
@@ -341,6 +337,28 @@ class DocumentModel(QObject, ObservableProperties):
         job_params.ref_layers = ref_layers
         job_params.is_layered = arch is Arch.qwen_l
         job_params.metadata.update(prompt_meta)
+        if is_nai:
+            # Mirror exactly what the NAI backend (convert_workflow) sends so the
+            # tooltip matches: the positive with the style prompt merged in
+            # (merge_prompt post-positions the style, and returns it alone when the
+            # per-gen positive is empty — the case where prompt_final stays blank),
+            # then the model-specific quality tags when "Add Quality Tags" is on.
+            # The raw per-gen negative box is usually empty because NAI users put the
+            # negative in the Style, so show the merged negative_prompt_final.
+            from ..backend.nai_workflow import NaiModel, apply_quality_tags
+
+            nai_cond = input.conditioning
+            final_prompt = merge_prompt(nai_cond.positive, nai_cond.style) if nai_cond else ""
+            nai_model = next(
+                (m for m in NaiModel if m.value == ensure(input.models).checkpoint),
+                NaiModel.default(),
+            )
+            if self.active_style.nai_quality_toggle:
+                final_prompt = apply_quality_tags(final_prompt, nai_model)
+            job_params.metadata["prompt"] = final_prompt
+            job_params.metadata["negative_prompt"] = prompt_meta.get(
+                "negative_prompt_final", prompt_meta.get("negative_prompt", "")
+            )
         job_params.metadata["loras"] = [{"name": l.name, "weight": l.strength} for l in loras]
         job_params.metadata["strength"] = strength
         return input, job_params, original_conditioning
@@ -621,8 +639,10 @@ class DocumentModel(QObject, ObservableProperties):
     def _get_current_image(self, bounds: Bounds, exclude_internal=True):
         exclude = []
         if exclude_internal:
-            exclude = [  # exclude control layers from projection
-                c.layer for c in self.regions.control if not c.mode.is_part_of_image
+            exclude = [  # exclude control layers from projection (layer may be None
+                c.layer  # for NAI whole-canvas control entries)
+                for c in self.regions.control
+                if not c.mode.is_part_of_image and c.layer is not None
             ]
             if self._layer:  # exclude preview layer
                 exclude.append(self._layer)

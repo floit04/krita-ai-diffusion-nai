@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from PyQt5.QtNetwork import QNetworkReply
+
 from .api import WorkflowInput
 from .client import (
     Client,
@@ -37,11 +39,15 @@ from .nai_workflow import (
     NaiNoiseSchedule,
     NaiSampler,
     NaiUCPreset,
+    apply_quality_tags,
     build_generate_request,
     clamp_resolution,
+    composite_nai_patch,
     image_to_base64,
     map_sampler,
     map_noise_schedule,
+    prepare_nai_precise_reference_image,
+    prepare_nai_request_mask,
 )
 from ..settings import PerformanceSettings, settings
 from ..util import client_logger as log
@@ -71,6 +77,37 @@ class NaiJobInfo:
 
     def __str__(self):
         return f"NaiJob[{self.work.kind.name}, id={self.local_id}]"
+
+
+# ---------------------------------------------------------------------------
+# Vibe encoding disk cache (ai/encode-vibe costs 2 Anlas per image — never pay
+# twice for the same image, even across Krita restarts)
+# ---------------------------------------------------------------------------
+
+
+def _vibe_cache_path():
+    from ..util import user_data_dir
+
+    return user_data_dir / "nai_vibe_cache.json"
+
+
+def _load_vibe_cache() -> dict[str, str]:
+    try:
+        path = _vibe_cache_path()
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+    except Exception as e:
+        log.warning(f"NAI: failed to load vibe cache: {e}")
+    return {}
+
+
+def _save_vibe_cache(cache: dict[str, str]):
+    try:
+        _vibe_cache_path().write_text(json.dumps(cache), encoding="utf-8")
+    except Exception as e:
+        log.warning(f"NAI: failed to save vibe cache: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -116,26 +153,60 @@ class NaiClient(Client):
             translation=False,
             languages=[],
             max_upload_size=0,
-            max_control_layers=0,
+            # NAI control layers: img2img base / vibe transfer / precise reference.
+            max_control_layers=16,
         )
+        # Vibe encodings cost 2 Anlas each (ai/encode-vibe) — cache per image/model,
+        # persisted to disk so an image is never paid for twice across restarts.
+        self._vibe_cache: dict[str, str] = _load_vibe_cache()
+
+    def _current_token(self) -> str:
+        """Always use the CURRENT token from settings.
+
+        The token stored at connect time goes stale when the user switches the
+        active token in settings — requests would then hit the wrong account
+        (symptom: "Not enough Anlas" despite a topped-up account).
+        """
+        return (settings.nai_api_token or self._token).strip()
 
     # -- HTTP helpers -------------------------------------------------------
 
     async def _get(self, path: str, timeout: float | None = 30):
         return await self._requests.get(
-            f"{self.url}/{path}", timeout=timeout, bearer=self._token
+            f"{self.url}/{path}", timeout=timeout, bearer=self._current_token()
         )
 
     async def _post(self, path: str, data: dict, timeout: float | None = None):
         return await self._requests.post(
-            f"{self.url}/{path}", data, bearer=self._token
+            f"{self.url}/{path}", data, bearer=self._current_token()
         )
 
     async def _post_binary(self, path: str, data: dict, timeout: float | None = 300):
-        """POST that expects a binary (ZIP) response."""
-        return await self._requests.http(
-            "POST", f"{self.url}/{path}", data, timeout=timeout, bearer=self._token
-        )
+        """POST that expects a binary (ZIP) response.
+
+        NAI occasionally drops the connection mid-download (RemoteHostClosedError,
+        code=2) or times out. Retry a few times like network.download() does before
+        surfacing the error, so a transient hiccup doesn't fail the whole job.
+        """
+        for retry in range(3, 0, -1):
+            try:
+                return await self._requests.http(
+                    "POST",
+                    f"{self.url}/{path}",
+                    data,
+                    timeout=timeout,
+                    bearer=self._current_token(),
+                )
+            except NetworkError as e:
+                transient = e.code in (
+                    QNetworkReply.NetworkError.RemoteHostClosedError,
+                    QNetworkReply.NetworkError.TemporaryNetworkFailureError,
+                    QNetworkReply.NetworkError.TimeoutError,
+                )
+                if not transient or retry == 1:
+                    raise
+                log.warning(f"NAI request interrupted ({e}); retrying, {retry - 1} left")
+                await asyncio.sleep(1)
 
     async def _validate_token(self):
         """Lightweight request to verify that the API token is valid."""
@@ -145,6 +216,14 @@ class NaiClient(Client):
         )
 
     # -- Client ABC implementation ------------------------------------------
+
+    async def discover_models(self, refresh: bool):
+        # NAI models are a fixed, built-in set (see _build_nai_models); there is
+        # nothing to scan on the server. Yield a single completed status so the
+        # connection flow's `async for` progresses.
+        self.models = _build_nai_models()
+        n = len(self.models.checkpoints)
+        yield self.DiscoverStatus(folder="models", current=n, total=n)
 
     async def enqueue(self, work: WorkflowInput, front: bool = False) -> str:
         job = NaiJobInfo(str(uuid.uuid4()), work)
@@ -216,18 +295,64 @@ class NaiClient(Client):
         except asyncio.CancelledError:
             pass
 
+    async def _ensure_vibe_encodings(self, work: WorkflowInput) -> dict[int, str]:
+        """Fetch (or reuse cached) vibe encodings for nai_vibe control layers.
+
+        V4/V4.5 vibe transfer requires encodings from ai/encode-vibe; raw images
+        in reference_image_multiple are not accepted. Each encode costs 2 Anlas,
+        so results are cached by (image hash, model, information_extracted).
+        """
+        import base64
+        import hashlib
+
+        from .api import WorkflowKind
+        from .resources import ControlMode
+
+        result: dict[int, str] = {}
+        cond = work.conditioning
+        if cond is None or not cond.control:
+            return result
+        if work.kind in (WorkflowKind.inpaint, WorkflowKind.refine_region):
+            return result  # infill drops vibes (server 500) — don't waste Anlas
+        model, _cp = resolve_nai_model(work)
+        for i, ctrl in enumerate(cond.control):
+            if ctrl.mode is not ControlMode.nai_vibe or ctrl.image is None:
+                continue
+            image_b64 = image_to_base64(ctrl.image)
+            info = round(ctrl.param2, 3)
+            digest = hashlib.sha1(image_b64.encode("ascii")).hexdigest()
+            key = f"{digest}|{model.value}|{info}"
+            encoding = self._vibe_cache.get(key)
+            if encoding is None:
+                log.info(f"NAI encode-vibe: encoding reference {i} (model={model.value}, ie={info})")
+                data = await self._post_binary(
+                    "ai/encode-vibe",
+                    {"image": image_b64, "model": model.value, "information_extracted": info},
+                    timeout=60,
+                )
+                encoding = base64.b64encode(bytes(data)).decode("ascii")
+                self._vibe_cache[key] = encoding
+                _save_vibe_cache(self._vibe_cache)
+            else:
+                log.info(f"NAI encode-vibe: cache hit for reference {i}")
+            result[i] = encoding
+        return result
+
     async def _process_job(self, job: NaiJobInfo):
         try:
             job.state = NaiJobState.generating
 
+            # Pre-encode vibe references (needs await, so done outside convert_workflow)
+            vibe_encodings = await self._ensure_vibe_encodings(job.work)
+
             # Build the NAI request from WorkflowInput
-            nai_request = convert_workflow(job.work)
+            nai_request = convert_workflow(job.work, vibe_encodings)
             job.nai_request = nai_request
 
             # Report progress start (NAI doesn't provide intermediate progress)
             await self._report(ClientEvent.progress, job.local_id, 0.05)
 
-            # Log the FULL request body (truncate base64 data for readability)
+            # Log the request body, truncating base64 image/mask data for readability.
             def _truncate_for_log(obj):
                 if isinstance(obj, dict):
                     return {k: _truncate_for_log(v) for k, v in obj.items()}
@@ -237,58 +362,15 @@ class NaiClient(Client):
                     return obj[:80] + f"...({len(obj)} chars)"
                 return obj
 
-            log.warning(f"NAI FULL REQUEST:\n{json.dumps(_truncate_for_log(nai_request), indent=2, ensure_ascii=False)}")
-
-            # Detailed inpaint/mask diagnostic
-            params = nai_request.get("parameters", {})
-            log.warning(f"=== NAI INPAINT DIAGNOSTIC ===")
-            log.warning(f"action: {nai_request.get('action')}")
-            log.warning(f"width: {params.get('width')}, height: {params.get('height')}")
-            log.warning(f"strength: {params.get('strength')}")
-            log.warning(f"add_original_image: {params.get('add_original_image')}")
-            log.warning(f"work.kind: {job.work.kind}")
-
-            # Decode and inspect image
-            img_b64 = params.get("image", "")
-            log.warning(f"image base64 length: {len(img_b64)}")
-            if img_b64:
-                try:
-                    import base64 as b64mod
-                    from PIL import Image as PILImage
-                    import numpy as np
-                    _img = PILImage.open(io.BytesIO(b64mod.b64decode(img_b64)))
-                    log.warning(f"image decoded size: {_img.size}, mode: {_img.mode}")
-                except Exception as _e:
-                    log.warning(f"image decode failed: {_e}")
-
-            # Decode and inspect mask
-            mask_b64 = params.get("mask", "")
-            log.warning(f"mask base64 length: {len(mask_b64)}")
-            if mask_b64:
-                try:
-                    import base64 as b64mod
-                    from PIL import Image as PILImage
-                    import numpy as np
-                    _mask = PILImage.open(io.BytesIO(b64mod.b64decode(mask_b64)))
-                    log.warning(f"mask decoded size: {_mask.size}, mode: {_mask.mode}")
-                    _arr = np.array(_mask)
-                    log.warning(f"mask shape: {_arr.shape}")
-                    log.warning(f"mask mean: {_arr.mean():.2f}")
-                    log.warning(f"mask min/max: {_arr.min()}/{_arr.max()}")
-                    _white = (_arr > 200).sum() / _arr.size
-                    log.warning(f"mask white ratio: {_white:.4f}")
-                except Exception as _e:
-                    log.warning(f"mask decode failed: {_e}")
-            else:
-                log.warning("!!! NO MASK in request !!!")
-
-            if job.work.images:
-                log.warning(f"initial_image present: {job.work.images.initial_image is not None}")
-                log.warning(f"hires_mask present: {job.work.images.hires_mask is not None}")
-                if job.work.images.initial_image:
-                    log.warning(f"initial_image size: {job.work.images.initial_image.extent}")
-                if job.work.images.hires_mask:
-                    log.warning(f"hires_mask size: {job.work.images.hires_mask.extent}")
+            # NOTE: infill must use the regular (non-stream) endpoint. The stream
+            # endpoint (ai/generate-image-stream) IGNORES the mask for action=infill
+            # and behaves like whole-image img2img (pixel-proven 2026-07-29 13:09:
+            # unmasked regions were repainted too). The launcher also never streams
+            # infill (its bridge and UI both fall back to non-stream for inpaint).
+            log.info(
+                "NAI request:\n"
+                + json.dumps(_truncate_for_log(nai_request), indent=2, ensure_ascii=False)
+            )
 
             # Send the request
             response_data = await self._post_binary("ai/generate-image", nai_request)
@@ -303,15 +385,15 @@ class NaiClient(Client):
             if len(images) == 0:
                 raise RuntimeError("NAI returned an empty response (no images in ZIP)")
 
-            # --- TEMP DIAGNOSTIC, REMOVE LATER — save raw NAI output before any post-processing ---
-            try:
-                _debug_path = r"C:\Users\Tu\Desktop\nai_debug_output.png"
-                if len(images) > 0:
-                    images[0].save(_debug_path)
-                    log.warning(f"TEMP DIAGNOSTIC: saved NAI raw output to {_debug_path} ({images[0].extent})")
-            except Exception as _save_err:
-                log.warning(f"TEMP DIAGNOSTIC: failed to save NAI raw output: {_save_err}")
-            # --- END TEMP DIAGNOSTIC ---
+            # Inpaint/refine_region: NAI regenerates the whole canvas, so composite
+            # each result into a transparent patch whose alpha is the selection mask.
+            # Written back, the original shows through outside the selection (no
+            # colour drift, no black border); only the masked area changes.
+            if job.work.images and job.work.images.hires_mask is not None:
+                mask_img = job.work.images.hires_mask
+                images = ImageCollection(
+                    composite_nai_patch(im, mask_img, mask_img.extent) for im in images
+                )
 
             job.state = NaiJobState.completed
             log.info(f"{job} completed, got {len(images)} images")
@@ -401,54 +483,35 @@ def _find_style_for_checkpoint(checkpoint: str):
     return None
 
 
-def _nai_feather_mask(mask_img, grow: int, feather: int):
-    """Apply grow (dilation) and feather (blur) to mask for smooth inpaint transitions.
-
-    NAI requires feathered mask, like ComfyUI path (apply_grow_feather).
-    Uses Qt scale operations to approximate Gaussian blur on the mask edges.
-    Without this, the raw binary mask produces visible gray edges at inpaint boundaries.
-    """
-    total_radius = grow + feather
-    if total_radius <= 0:
-        return mask_img
-
-    import math
-    from PyQt5.QtCore import Qt
-    from PyQt5.QtGui import QImage
-    from ..image import Image
-
-    qimg = QImage(mask_img._qimage)  # copy to avoid modifying original
-    w, h = qimg.width(), qimg.height()
-    if w <= 0 or h <= 0:
-        return mask_img
-
-    # Scale-down then scale-up approximates a box blur.
-    # With 3 passes the effective blur approaches a Gaussian.
-    # Compute the downscale size so the blur radius ≈ total_radius pixels.
-    scale_ratio = w * math.sqrt(3) / (2.0 * total_radius)
-    small_w = max(4, int(round(scale_ratio)))
-    small_h = max(4, int(round(h * small_w / w)))
-
-    mode = Qt.TransformationMode.SmoothTransformation
-    aspect = Qt.AspectRatioMode.IgnoreAspectRatio
-    for _ in range(3):
-        qimg = qimg.scaled(small_w, small_h, aspect, mode)
-        qimg = qimg.scaled(w, h, aspect, mode)
-
-    # Ensure format stays as Grayscale8
-    if qimg.format() != QImage.Format.Format_Grayscale8:
-        qimg = qimg.convertToFormat(QImage.Format.Format_Grayscale8)
-
-    log.info(f"NAI mask feathering applied: grow={grow}, feather={feather}, total_radius={total_radius}")
-    return Image(qimg)
+def resolve_nai_model(work: WorkflowInput) -> tuple[NaiModel, str]:
+    """Resolve the NAI model for a workflow (checkpoint id or settings fallback)."""
+    model = NaiModel.default()
+    checkpoint_id = ""
+    if work.models and work.models.checkpoint:
+        checkpoint_id = work.models.checkpoint
+        for nai_m in NaiModel:
+            if nai_m.value == checkpoint_id:
+                model = nai_m
+                break
+    if checkpoint_id == "":
+        try:
+            model = NaiModel(settings.nai_model)
+        except ValueError:
+            pass
+    return model, checkpoint_id
 
 
-def convert_workflow(work: WorkflowInput) -> dict[str, Any]:
+def convert_workflow(
+    work: WorkflowInput, vibe_encodings: dict[int, str] | None = None
+) -> dict[str, Any]:
     """Convert a ``WorkflowInput`` into a NAI API request body.
 
     Reads NAI-specific generation parameters from the matching Style preset.
     Falls back to global settings defaults when no style is found.
     Image/mask/extent/seed/strength come from the WorkflowInput.
+
+    ``vibe_encodings`` maps indices into ``work.conditioning.control`` to
+    pre-fetched vibe encodings (from ai/encode-vibe, see NaiClient).
     """
     from .api import WorkflowKind
     from ..text import merge_prompt
@@ -459,17 +522,8 @@ def convert_workflow(work: WorkflowInput) -> dict[str, Any]:
     negative = cond.negative if cond else ""
     style_prompt = cond.style if cond else ""
 
-    # Debug: show all conditioning fields including regions
-    if cond:
-        regions_info = [(r.positive, r.negative if hasattr(r, 'negative') else '?') for r in cond.regions] if cond.regions else []
-        log.warning(f"NAI PROMPT DEBUG: cond.positive={repr(prompt)}, cond.style={repr(style_prompt)}, regions={regions_info}, language={repr(cond.language)}")
-    else:
-        log.warning("NAI PROMPT DEBUG: cond is None!")
-
     # Use merge_prompt to correctly substitute {prompt} placeholder in style template
     prompt = merge_prompt(prompt, style_prompt)
-
-    log.warning(f"NAI PROMPT AFTER MERGE: prompt={repr(prompt)}")
 
     # --- Resolution (from WorkflowInput) ---
     # For img2img/inpaint, the image has already been cropped to bbox by model.py.
@@ -487,19 +541,24 @@ def convert_workflow(work: WorkflowInput) -> dict[str, Any]:
     extent = clamp_resolution(extent)
 
     # --- Model (resolve before action so we know v3 vs v4) ---
-    model = NaiModel.default()
-    checkpoint_id = ""
-    if work.models and work.models.checkpoint:
-        checkpoint_id = work.models.checkpoint
-        for nai_m in NaiModel:
-            if nai_m.value == checkpoint_id:
-                model = nai_m
-                break
-    if checkpoint_id == "":
-        try:
-            model = NaiModel(settings.nai_model)
-        except ValueError:
-            pass
+    model, checkpoint_id = resolve_nai_model(work)
+
+    # --- NAI control layers (img2img base / vibe transfer / precise reference) ---
+    from .resources import ControlMode
+
+    base_ctrl = None
+    vibe_ctrls: list[tuple[int, Any]] = []  # (index into cond.control, ControlInput)
+    precise_ctrls: list[Any] = []
+    if cond:
+        for i, ctrl in enumerate(cond.control):
+            if ctrl.image is None:
+                continue
+            if ctrl.mode is ControlMode.nai_base and base_ctrl is None:
+                base_ctrl = ctrl
+            elif ctrl.mode is ControlMode.nai_vibe:
+                vibe_ctrls.append((i, ctrl))
+            elif ctrl.mode.is_nai_precise:
+                precise_ctrls.append(ctrl)
 
     # --- Action ---
     if work.kind is WorkflowKind.inpaint:
@@ -515,8 +574,35 @@ def convert_workflow(work: WorkflowInput) -> dict[str, Any]:
     else:
         action = NaiAction.generate
 
-    # --- Look up the Style preset matching this checkpoint ---
-    style = _find_style_for_checkpoint(checkpoint_id) if checkpoint_id else None
+    # An img2img base layer (垫图) turns plain generation into img2img with that
+    # image as source. A selection (mask) takes priority: infill stays untouched.
+    if action is NaiAction.generate and base_ctrl is not None:
+        action = NaiAction.img2img
+    if action is NaiAction.infill and base_ctrl is not None:
+        log.info("NAI: selection redraw active, ignoring img2img base layer")
+        base_ctrl = None
+
+    # Server-side compatibility rules (mirrors the launcher):
+    if precise_ctrls and not model.is_v4_5:
+        log.warning("NAI Precise Reference requires a V4.5 model, dropping references")
+        precise_ctrls = []
+    if precise_ctrls and vibe_ctrls:
+        log.warning("NAI Precise Reference and Vibe Transfer are incompatible, dropping vibes")
+        vibe_ctrls = []
+    if action is NaiAction.infill and vibe_ctrls:
+        log.warning("NAI infill does not support Vibe Transfer (server error 500), dropping vibes")
+        vibe_ctrls = []
+
+    # --- Look up the Style preset ---
+    # Prefer the exact style threaded from the UI (work.nai_style is the unique
+    # filename of the selected style). Fall back to guessing by checkpoint only
+    # for legacy inputs that predate the threaded field.
+    from ..style import Styles
+    style = None
+    if getattr(work, "nai_style", ""):
+        style = Styles.list().find(work.nai_style)
+    if style is None and checkpoint_id:
+        style = _find_style_for_checkpoint(checkpoint_id)
 
     # --- Sampling (from style preset → sampler preset → fallback settings) ---
     # Steps & CFG come from the style's sampler preset
@@ -556,7 +642,7 @@ def convert_workflow(work: WorkflowInput) -> dict[str, Any]:
         except ValueError:
             uc_preset = NaiUCPreset.heavy
         quality_toggle = style.nai_quality_toggle
-        skip_sigma: float | None = settings.nai_variety_boost_sigma if style.nai_variety_boost else None
+        variety_plus: bool = bool(style.nai_variety_boost)
         # Override noise_schedule from style if explicitly set
         try:
             ns = NaiNoiseSchedule(style.nai_noise_schedule)
@@ -570,7 +656,7 @@ def convert_workflow(work: WorkflowInput) -> dict[str, Any]:
         except ValueError:
             uc_preset = NaiUCPreset.heavy
         quality_toggle = settings.nai_quality_toggle
-        skip_sigma = settings.nai_variety_boost_sigma if settings.nai_variety_boost else None
+        variety_plus = bool(settings.nai_variety_boost)
 
     # Seed comes from WorkflowInput (per-generation from UI)
     seed = work.sampling.seed if work.sampling else 0
@@ -580,144 +666,107 @@ def convert_workflow(work: WorkflowInput) -> dict[str, Any]:
     mask_b64 = None
     strength = 0.7
     noise_val = 0.0
-    # --- TEMP DIAGNOSTIC: STRENGTH PATH (REMOVE LATER) ---
-    if work.sampling:
-        log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [5] convert_workflow: work.kind={work.kind}, action={action}, sampling.total_steps={work.sampling.total_steps}, sampling.start_step={work.sampling.start_step}, sampling.denoise_strength={work.sampling.denoise_strength}")
-    else:
-        log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [5] convert_workflow: work.kind={work.kind}, action={action}, sampling=None")
-    # --- END TEMP DIAGNOSTIC ---
-    # Both inpaint and refine_region use mask
+    # 重绘幅度 drives `strength` for both img2img and infill (see below).
+    # inpaintImg2ImgStrength is inert in our NAI requests, so it stays None and is
+    # omitted from the request entirely.
+    inpaint_strength: float | None = None
+    # Both inpaint and refine_region carry a mask.
     needs_mask = work.kind in (WorkflowKind.inpaint, WorkflowKind.refine_region)
 
-    if action is NaiAction.img2img:
-        if work.images and work.images.initial_image:
-            work.images.initial_image.make_opaque()  # NAI requires RGB, strip alpha
-            image_b64 = image_to_base64(work.images.initial_image)
-        if work.sampling:
-            strength = work.sampling.denoise_strength
-        noise_val = 0.0
-        # Include mask for inpaint and refine_region
+    if action in (NaiAction.img2img, NaiAction.infill):
+        # Source image: NAI's img2img/infill requires the image to match the
+        # requested width/height, so scale (stretch) it to the request extent first
+        # — same as the launcher's normalizeImageForRequest. An img2img base layer
+        # replaces the canvas as the source.
+        src = None
+        if base_ctrl is not None:
+            src = base_ctrl.image
+        elif work.images and work.images.initial_image:
+            src = work.images.initial_image
+        if src is not None:
+            if src.extent != extent:
+                src = Image.scale(src, extent)
+            src.make_opaque()  # NAI requires RGB, strip alpha
+            image_b64 = image_to_base64(src)
+        # Mask: a clean binary mask aligned to NAI's 8px latent grid. No
+        # feather/grow/blend — Krita's ComfyUI-oriented preprocessing corrupts NAI
+        # inpaint (redraws a wrong-shaped region with black borders). See
+        # prepare_nai_request_mask; the result is composited client-side in
+        # _process_job so unmasked pixels keep the exact original.
         if needs_mask and work.images and work.images.hires_mask:
-            hires_mask = work.images.hires_mask
-            # Diagnostic: check mask pixel values using Qt Image API
-            log.warning(f"NAI MASK DIAG: hires_mask extent={hires_mask.extent}, is_mask={hires_mask.is_mask}")
-            avg = hires_mask.average()
-            log.warning(f"NAI MASK DIAG: mask average={avg:.4f} (0=all black, 1=all white)")
-            # Sample some pixels
-            w, h = hires_mask.extent
-            center_px = hires_mask.pixel(w // 2, h // 2)
-            corner_px = hires_mask.pixel(0, 0)
-            log.warning(f"NAI MASK DIAG: center pixel={center_px}, corner pixel={corner_px}")
-            # NAI requires feathered mask, like ComfyUI path (apply_grow_feather)
-            if work.inpaint and (work.inpaint.grow > 0 or work.inpaint.feather > 0):
-                hires_mask = _nai_feather_mask(hires_mask, work.inpaint.grow, work.inpaint.feather)
-            mask_b64 = image_to_base64(hires_mask)
+            req_mask = prepare_nai_request_mask(work.images.hires_mask, extent)
+            mask_b64 = image_to_base64(req_mask)
+
+    if action is NaiAction.img2img:
+        if base_ctrl is not None:
+            # img2img via a base-image control layer: strength/noise come from the
+            # layer's OWN knobs (launcher defaults 0.7 / 0.0). The main strength
+            # slider only applies to redraw workflows, matching NAI web's separate
+            # img2img UI.
+            strength = base_ctrl.strength
+            noise_val = base_ctrl.param2
+        else:
+            # Whole-canvas refine: main slider -> `strength`. Verified working
+            # end-to-end via client.log + user tests on the non-stream endpoint.
+            if work.sampling:
+                strength = work.sampling.denoise_strength
+            noise_val = 0.0
+        if strength >= 1.0:  # avoid degenerate full replacement at the slider max
+            strength = 0.99
+        if strength < 0.01:
+            strength = 0.01
 
     if action is NaiAction.infill:
-        if work.images and work.images.initial_image:
-            # --- TEMP DIAGNOSTIC, REMOVE LATER — initial_image alpha channel check ---
-            _init_img = work.images.initial_image
-            _iiw, _iih = _init_img.extent
-            _iiqimg = _init_img._qimage
-            _ii_format = _iiqimg.format()
-            log.warning(f"=== TEMP DIAGNOSTIC: INITIAL IMAGE ALPHA CHECK (REMOVE LATER) ===")
-            log.warning(f"initial_image size: {_iiw}x{_iih}, QImage format: {_ii_format}")
-            log.warning(f"initial_image is_mask: {_init_img.is_mask}, is_rgba: {_init_img.is_rgba}")
-            if _init_img.is_rgba:
-                # Sample alpha at corners and center
-                from PyQt5.QtGui import qAlpha as _qAlpha
-                _corners = [(0,0), (_iiw-1,0), (0,_iih-1), (_iiw-1,_iih-1), (_iiw//2,_iih//2)]
-                _alphas = []
-                for _cx, _cy in _corners:
-                    _alphas.append(_qAlpha(_iiqimg.pixel(_cx, _cy)))
-                log.warning(f"alpha samples (corners+center): {_alphas}")
-                # Check a row of alpha in the mask white region (if known)
-                _all_opaque = all(a == 255 for a in _alphas)
-                _all_transparent = all(a == 0 for a in _alphas)
-                log.warning(f"all sampled alpha=255: {_all_opaque}, all=0: {_all_transparent}")
-            # --- END TEMP DIAGNOSTIC ---
-            work.images.initial_image.make_opaque()  # NAI requires RGB, strip alpha
-            image_b64 = image_to_base64(work.images.initial_image)
-        if work.images and work.images.hires_mask:
-            # --- TEMP DIAGNOSTIC, REMOVE LATER — mask pixel distribution + geometry ---
-            _mask_img = work.images.hires_mask
-            _mw, _mh = _mask_img.extent
-            _mqimg = _mask_img._qimage
-            _pixel_data = bytearray()
-            for _y in range(_mh):
-                _ptr = _mqimg.scanLine(_y)
-                if _ptr is not None:
-                    _pixel_data.extend(_ptr.asstring(_mw))
-            _total = len(_pixel_data)
-            if _total > 0:
-                _c0 = _pixel_data.count(0)
-                _c255 = _pixel_data.count(255)
-                _cmid = _total - _c0 - _c255
-                _minv = min(_pixel_data)
-                _maxv = max(_pixel_data)
-                log.warning(f"=== TEMP DIAGNOSTIC: MASK PIXEL DISTRIBUTION (REMOVE LATER) ===")
-                log.warning(f"mask size: {_mw}x{_mh}, total pixels: {_total}")
-                log.warning(f"pure black (0): {_c0} ({_c0/_total*100:.2f}%)")
-                log.warning(f"pure white (255): {_c255} ({_c255/_total*100:.2f}%)")
-                log.warning(f"gray (1-254): {_cmid} ({_cmid/_total*100:.2f}%)")
-                log.warning(f"min/max value: {_minv}/{_maxv}")
-
-                # Image vs mask size comparison
-                if work.images.initial_image:
-                    _iw, _ih = work.images.initial_image.extent
-                    _match = "MATCH" if (_iw == _mw and _ih == _mh) else "MISMATCH!"
-                    log.warning(f"image size: {_iw}x{_ih}, mask size: {_mw}x{_mh} => {_match}")
-                else:
-                    log.warning(f"image size: N/A (no initial_image), mask size: {_mw}x{_mh}")
-
-                # White pixel bounding box (repaint region geometry)
-                _x1, _y1, _x2, _y2 = _mw, _mh, 0, 0
-                for _y in range(_mh):
-                    for _x in range(_mw):
-                        if _pixel_data[_y * _mw + _x] > 127:
-                            _x1 = min(_x1, _x)
-                            _y1 = min(_y1, _y)
-                            _x2 = max(_x2, _x)
-                            _y2 = max(_y2, _y)
-                if _x2 >= _x1:
-                    _bw = _x2 - _x1 + 1
-                    _bh = _y2 - _y1 + 1
-                    _area_pct = (_bw * _bh) / _total * 100
-                    log.warning(f"white bbox: ({_x1},{_y1})-({_x2},{_y2}), size {_bw}x{_bh}, area {_area_pct:.2f}% of image")
-                else:
-                    log.warning(f"white bbox: NO WHITE PIXELS FOUND")
-
-                # Mask polarity check: NAI expects white=repaint
-                log.warning(f"mask polarity: is_mask={_mask_img.is_mask}, format={_mqimg.format()}")
-                log.warning(f"NAI convention: white(255)=repaint, black(0)=keep. Verify visually.")
-            # --- END TEMP DIAGNOSTIC ---
-            # NAI requires feathered mask, like ComfyUI path (apply_grow_feather)
-            _mask_to_encode = work.images.hires_mask
-            if work.inpaint and (work.inpaint.grow > 0 or work.inpaint.feather > 0):
-                _mask_to_encode = _nai_feather_mask(_mask_to_encode, work.inpaint.grow, work.inpaint.feather)
-            mask_b64 = image_to_base64(_mask_to_encode)
+        # Masked redraw follows the working reference implementation
+        # (ComfyUI_RS_NAI_API_Request NAIInpaintNode) exactly:
+        #   inpaintImg2ImgStrength = 重绘幅度 slider
+        #   add_original_image     = true  (set in build_generate_request)
+        #   noise                  = 0.0
+        #   `strength`             = NOT SENT (build_generate_request omits it for
+        #                            infill; it belongs to action=img2img only)
+        # The launcher's wiring (strength=0.7 + add_original_image=false) is NOT
+        # honored by the server (pixel-proven full repaint at any value).
         if work.sampling:
-            strength = work.sampling.denoise_strength
+            inpaint_strength = work.sampling.denoise_strength
+        noise_val = 0.0
 
-    # --- TEMP DIAGNOSTIC: STRENGTH PATH (REMOVE LATER) ---
-    log.warning(f"TEMP DIAGNOSTIC: STRENGTH PATH [6] convert_workflow: strength after read={strength}, action={action}")
-    # --- END TEMP DIAGNOSTIC ---
-    # Clamp strength to 0.99 for img2img to avoid full replacement
-    if action is NaiAction.img2img and strength >= 1.0:
-        strength = 0.99
-
-    # --- Vibe Transfer (from WorkflowInput control layers) ---
+    # --- Vibe Transfer ---
+    # V4/V4.5 requires PRE-ENCODED vibes (ai/encode-vibe) in reference_image_multiple,
+    # never raw images. Encodings are fetched (and cached) in NaiClient._process_job
+    # and passed in via vibe_encodings, keyed by control index.
     ref_images: list[str] = []
     ref_strengths: list[float] = []
     ref_info_extracted: list[float] = []
+    for i, ctrl in vibe_ctrls:
+        encoding = (vibe_encodings or {}).get(i)
+        if encoding is None:
+            log.warning("NAI: missing vibe encoding for control layer %d, skipping", i)
+            continue
+        ref_images.append(encoding)
+        ref_strengths.append(ctrl.strength)
+        ref_info_extracted.append(ctrl.param2)
 
-    if cond:
-        from .resources import ControlMode
-        for ctrl in cond.control:
-            if ctrl.mode in (ControlMode.reference, ControlMode.style) and ctrl.image is not None:
-                ref_images.append(image_to_base64(ctrl.image))
-                ref_strengths.append(ctrl.strength)
-                ref_info_extracted.append(1.0)
+    # --- Precise (director) reference — V4.5 only ---
+    precise_refs: list[dict[str, Any]] = []
+    for ctrl in precise_ctrls:
+        ref_img = prepare_nai_precise_reference_image(ctrl.image)
+        precise_refs.append({
+            "image": image_to_base64(ref_img),
+            "caption": ctrl.mode.nai_precise_caption,
+            "strength": ctrl.strength,
+            # Launcher: secondary strength = 1.0 - fidelity (note the inversion).
+            "secondary": 1.0 - ctrl.param2,
+        })
+
+    # --- Quality tags ---
+    # When "Add Quality Tags" is on, append the model-specific quality tags to the
+    # (already style-merged, post-positioned) prompt. NAI reads the toggle state
+    # from the tags' presence in the prompt, so appending them is what actually
+    # turns "Add Quality Tags" on for the generated image. Must run BEFORE the
+    # prompt is consumed by v4_prompt_obj and build_generate_request below.
+    if quality_toggle:
+        prompt = apply_quality_tags(prompt, model)
+        log.info(f"NAI quality tags appended for {model.value}")
 
     # --- V4/V4.5 structured prompt ---
     v4_prompt_obj = None
@@ -756,14 +805,16 @@ def convert_workflow(work: WorkflowInput) -> dict[str, Any]:
         n_samples=work.batch_count,
         quality_toggle=quality_toggle,
         uc_preset=uc_preset,
-        skip_cfg_above_sigma=skip_sigma,
+        variety_plus=variety_plus,
         image=image_b64,
         strength=strength,
         noise=noise_val,
         mask=mask_b64,
+        inpaint_img2img_strength=inpaint_strength,
         reference_image_multiple=ref_images if ref_images else None,
         reference_strength_multiple=ref_strengths if ref_strengths else None,
         reference_information_extracted_multiple=ref_info_extracted if ref_info_extracted else None,
+        precise_references=precise_refs if precise_refs else None,
         v4_prompt=v4_prompt_obj,
         v4_negative_prompt=v4_negative_obj,
     )

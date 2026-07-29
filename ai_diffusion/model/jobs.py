@@ -97,7 +97,8 @@ class JobParams:
             {
                 "mode": c.mode.text,
                 "strength": c.strength / c.strength_multiplier,
-                "image": c.layer.name,
+                # NAI whole-canvas control entries have no layer (layer is None)
+                "image": c.layer.name if c.layer is not None else "整张画布",
                 "start": c.start,
                 "end": c.end,
             }

@@ -135,6 +135,13 @@ class Layer(QObject):
         return Bounds.restrict(bounds, Bounds(0, 0, *self._manager.image_extent))
 
     @property
+    def full_bounds(self):
+        # The layer's own pixel bounds, NOT clamped to the canvas. Use for reference
+        # images (NAI vibe / precise reference) which must be the exact original,
+        # even when the layer extends beyond or lies outside the canvas.
+        return Bounds.from_qrect(self._node.bounds())
+
+    @property
     def parent_layer(self):
         return maybe(self._manager.find, self._parent)
 

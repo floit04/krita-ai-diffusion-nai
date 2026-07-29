@@ -30,6 +30,9 @@ class ControlLayer(QObject, ObservableProperties):
     strength = Property(50, persist=True)
     start = Property(0.0, persist=True)
     end = Property(1.0, persist=True)
+    # Secondary parameter for NAI modes, in percent (0-100): vibe "information
+    # extracted" (default 70) or precise-reference "fidelity" (default 100).
+    param2 = Property(100, persist=True)
     use_custom_strength = Property(False, persist=True, setter="set_use_custom_strength")
     is_supported = Property(True)
     is_pose_vector = Property(False)
@@ -44,6 +47,7 @@ class ControlLayer(QObject, ObservableProperties):
     strength_changed = pyqtSignal(int)
     start_changed = pyqtSignal(float)
     end_changed = pyqtSignal(float)
+    param2_changed = pyqtSignal(int)
     use_custom_strength_changed = pyqtSignal(bool)
     is_supported_changed = pyqtSignal(bool)
     is_pose_vector_changed = pyqtSignal(bool)
@@ -72,7 +76,14 @@ class ControlLayer(QObject, ObservableProperties):
         model.jobs.job_finished.connect(self._update_active_job)
 
     @property
+    def is_whole_canvas(self):
+        """NAI modes may target the whole canvas instead of a single layer."""
+        return self.layer_id.isNull()
+
+    @property
     def layer(self):
+        if self.layer_id.isNull():
+            return None
         layer = self._model.layers.updated().find(self.layer_id)
         assert layer is not None, "Control layer has been deleted"
         return layer
@@ -82,6 +93,15 @@ class ControlLayer(QObject, ObservableProperties):
             self._mode = mode
             self.mode_changed.emit(mode)
             self._update_is_pose_vector()
+            if mode.is_nai:
+                # nai_base: param2 = noise (default 0); nai_vibe: information
+                # extracted (default 0.7); precise: fidelity (default 1.0).
+                if mode is ControlMode.nai_base:
+                    self.param2 = 0
+                elif mode is ControlMode.nai_vibe:
+                    self.param2 = 70
+                else:
+                    self.param2 = 100
             if not self.use_custom_strength:
                 self._set_values_from_preset()
 
@@ -92,6 +112,18 @@ class ControlLayer(QObject, ObservableProperties):
             self._set_values_from_preset()
 
     def _set_values_from_preset(self):
+        if self.mode.is_nai:
+            # No entries in presets/control.json for NAI modes. Launcher defaults:
+            # img2img strength 0.7, vibe strength 0.6, precise-reference 1.0.
+            if self.mode is ControlMode.nai_base:
+                default = 0.7
+            elif self.mode is ControlMode.nai_vibe:
+                default = 0.6
+            else:
+                default = 1.0
+            self.strength = int(default * self.strength_multiplier)
+            self.start, self.end = 0.0, 1.0
+            return
         params = ControlPresets.instance().interpolate(
             self.mode, self._model.arch, self.preset_value / self.max_preset_value
         )
@@ -116,9 +148,40 @@ class ControlLayer(QObject, ObservableProperties):
 
     def to_api(self, bounds: Bounds | None = None, time: int | None = None):
         layer = self.layer
+        layer_name = layer.name if layer else _("Whole canvas")
         if not self.is_supported:
-            raise PluginError(f"Can't use '{layer.name}' as control layer: {self.error_text}")
+            raise PluginError(f"Can't use '{layer_name}' as control layer: {self.error_text}")
 
+        if self.mode.is_nai:
+            # NAI reference/base images: full-resolution, no CLIP-Vision downscale,
+            # no line/stencil preprocessing. Whole-canvas (null layer_id) uses the
+            # flattened document projection minus control/preview layers.
+            doc_bounds = Bounds(0, 0, *self._model.document.extent)
+            if layer is None:
+                image = self._model._get_current_image(doc_bounds)
+            elif self.mode is ControlMode.nai_base:
+                # A specific layer as img2img base = the FULL original image (not
+                # clamped to the canvas), stretched to the request resolution later
+                # — same as importing an image in the launcher. "Whole canvas"
+                # (layer is None above) captures the canvas window instead.
+                base_bounds = layer.full_bounds
+                if base_bounds.is_zero:
+                    base_bounds = doc_bounds
+                image = layer.get_pixels(base_bounds, time)
+            else:
+                # Vibe / precise reference: STRICTLY the layer's original pixels at
+                # full resolution — full_bounds is NOT clamped to the canvas, so
+                # content outside the canvas is preserved, nothing is cropped or
+                # rescaled here.
+                ref_bounds = layer.full_bounds
+                if ref_bounds.is_zero:
+                    ref_bounds = doc_bounds
+                image = layer.get_pixels(ref_bounds, time)
+            strength = min(self.strength / self.strength_multiplier, 1.0)
+            param2 = min(max(self.param2 / 100.0, 0.0), 1.0)
+            return ControlInput(self.mode, image, strength, (0.0, 1.0), param2)
+
+        assert layer is not None, "Control layer has been deleted"
         extent = bounds.extent if bounds else self._model.document.extent
         if self.mode.is_ip_adapter and not layer.bounds.is_zero:
             bounds = None  # ignore mask bounds, use layer bounds
@@ -149,6 +212,21 @@ class ControlLayer(QObject, ObservableProperties):
         is_supported = True
         if client := root.connection.client_if_connected:
             models = client.models.for_arch(self._model.arch)
+
+            is_nai_arch = self._model.arch is Arch.nai
+            if self.mode.is_nai or is_nai_arch:
+                if self.mode.is_nai and not is_nai_arch:
+                    self.error_text = _("Only available with the NovelAI backend")
+                    is_supported = False
+                elif is_nai_arch and not self.mode.is_nai:
+                    self.error_text = _("Not supported for") + " NovelAI"
+                    is_supported = False
+                elif self._index >= client.features.max_control_layers:
+                    self.error_text = _("Too many control layers")
+                    is_supported = False
+                self.is_supported = is_supported
+                self.can_generate = False
+                return
 
             if self.mode.is_ip_adapter and models.arch in [Arch.illu, Arch.illu_v]:
                 resid = resource_id(ResourceKind.clip_vision, Arch.illu, "ip_adapter")
@@ -203,7 +281,12 @@ class ControlLayer(QObject, ObservableProperties):
         self.can_generate = is_supported and self.mode.has_preprocessor
 
     def _update_is_pose_vector(self):
-        self.is_pose_vector = self.mode is ControlMode.pose and self.layer.type is LayerType.vector
+        layer = self.layer
+        self.is_pose_vector = (
+            self.mode is ControlMode.pose
+            and layer is not None
+            and layer.type is LayerType.vector
+        )
 
     def _update_active_job(self):
         from .jobs import JobState
@@ -239,7 +322,14 @@ class ControlLayerList(QObject):
         if layer is None:  # shouldn't be possible, Krita doesn't allow removing all non-mask layers
             log.warning("Trying to add control layer, but document has no suitable layer")
             return
-        mode = ControlMode.reference if self._model.arch.is_edit else self._last_mode
+        if self._model.arch is Arch.nai:
+            mode = self._last_mode if self._last_mode.is_nai else ControlMode.nai_vibe
+        elif self._model.arch.is_edit:
+            mode = ControlMode.reference
+        elif self._last_mode.is_nai:
+            mode = ControlMode.scribble
+        else:
+            mode = self._last_mode
         control = ControlLayer(self._model, mode, layer.id, len(self._layers))
         control.mode_changed.connect(self._update_last_mode)
         self._layers.append(control)
@@ -405,6 +495,11 @@ control_mode_text = {
     ControlMode.blur: _("Unblur"),
     ControlMode.stencil: _("Stencil"),
     ControlMode.hands: _("Hands"),
+    ControlMode.nai_base: "图生图",
+    ControlMode.nai_vibe: "Vibe Transfer",
+    ControlMode.nai_precise_character: "精准参考-角色",
+    ControlMode.nai_precise_style: "精准参考-风格",
+    ControlMode.nai_precise_character_style: "精准参考-角色&风格",
 }
 
 

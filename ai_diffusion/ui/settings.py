@@ -46,7 +46,7 @@ from ..model.properties import Binding
 from ..model.root import collect_diagnostics, root
 from ..model.updates import UpdateState
 from ..settings import ImageFileFormat, PerformancePreset, ServerMode, Settings, settings
-from ..style import Style
+from ..style import Style, is_nai_style
 from .server import ServerWidget
 from .settings_widgets import (
     ComboBoxSetting,
@@ -570,10 +570,11 @@ class NovelAIConnectionWidget(QWidget):
     def _connect(self):
         settings.nai_api_token = self._token_edit.text()
         settings.save()
-        root.connection.connect()
+        if client := root.connection.create_client(settings):
+            root.connection.connect(client)
 
     def _refresh_subscription(self):
-        """Fetch subscription info from api.novelai.net (separate from image API)."""
+        """Fetch subscription info from the NAI image API host."""
         eventloop.run(self._fetch_subscription())
 
     async def _fetch_subscription(self):
@@ -583,8 +584,11 @@ class NovelAIConnectionWidget(QWidget):
             token = settings.nai_api_token
             if not token:
                 return
+            # Official NAI serves user endpoints (/user/subscription etc.) on the
+            # IMAGE API host. api.novelai.net answers 400 "update to the image URL"
+            # for third-party tools. (Launcher: nai_api_endpoint.dart userUrl().)
             data = await rm.http(
-                "GET", "https://api.novelai.net/user/subscription",
+                "GET", "https://image.novelai.net/user/subscription",
                 timeout=15, bearer=token,
             )
             if isinstance(data, dict):
@@ -881,8 +885,9 @@ class NovelAISettings(SettingsTab):
             token = settings.get_active_nai_token()
             if not token:
                 return
+            # User endpoints live on the image API host (see note above).
             data = await rm.http(
-                "GET", "https://api.novelai.net/user/subscription",
+                "GET", "https://image.novelai.net/user/subscription",
                 timeout=15, bearer=token,
             )
             if isinstance(data, dict):
@@ -1629,6 +1634,7 @@ class SettingsDialog(QDialog):
 
         self.connection = ConnectionSettings(server)
         self.styles = StylePresets(server)
+        self.novelai_styles = StylePresets(server, nai_only=True)
         self.novelai = NovelAISettings()
         self.diffusion = DiffusionSettings()
         self.interface = InterfaceSettings()
@@ -1646,6 +1652,7 @@ class SettingsDialog(QDialog):
 
         create_list_item(_("Connection"), self.connection)
         create_list_item(_("Styles"), self.styles)
+        create_list_item(_("NovelAI 风格"), self.novelai_styles)
         create_list_item(_("NovelAI"), self.novelai)
         create_list_item(_("Diffusion"), self.diffusion)
         create_list_item(_("Interface"), self.interface)
@@ -1687,10 +1694,12 @@ class SettingsDialog(QDialog):
 
         root.connection.state_changed.connect(self._update_connection)
         root.connection.models_changed.connect(self.styles.update_model_lists)
+        root.connection.models_changed.connect(self.novelai_styles.update_model_lists)
 
     def read(self):
         self.connection.read()
         self.styles.read()
+        self.novelai_styles.read()
         self.novelai.read()
         self.diffusion.read()
         self.interface.read()
@@ -1708,8 +1717,12 @@ class SettingsDialog(QDialog):
         super().show()
 
         if style:
-            self._list.setCurrentRow(1)
-            self.styles.current_style = style
+            if is_nai_style(style):
+                self._list.setCurrentRow(2)  # NovelAI 风格 page
+                self.novelai_styles.current_style = style
+            else:
+                self._list.setCurrentRow(1)  # Styles page
+                self.styles.current_style = style
         self._close_button.setFocus()
 
     def _change_page(self, index):

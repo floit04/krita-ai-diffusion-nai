@@ -377,6 +377,14 @@ class Styles(QObject):
         return iter(self._list)
 
 
+def is_nai_style(style: Style) -> bool:
+    """True if the style targets NovelAI. Works without a connected client
+    (used to separate NAI styles from ComfyUI styles in the settings UI)."""
+    if style.architecture is Arch.nai:
+        return True
+    return any(str(cp).startswith("nai-diffusion") for cp in style.checkpoints)
+
+
 def sort_recent_styles(styles: list[Style], recent_filenames: list[str], count: int):
     if count == 0 or not recent_filenames:
         return [], list(styles)
