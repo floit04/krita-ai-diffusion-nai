@@ -763,9 +763,23 @@ class GenerationWidget(QWidget):
         self.add_control_button = create_wide_tool_button(
             "control-add", _("Add Control Layer"), self
         )
+        self.paint_selection_button = QToolButton(self)
+        self.paint_selection_button.setCheckable(True)
+        try:
+            from krita import Krita as _Krita
+
+            self.paint_selection_button.setIcon(_Krita.instance().icon("krita_tool_freehand"))
+        except Exception:
+            self.paint_selection_button.setIcon(theme.icon("region-add"))
+        self.paint_selection_button.setToolTip(
+            "绘制重绘选区:开启后直接用 Krita 画笔在画布上涂抹要重绘的区域"
+            "(压感/笔刷预设/橡皮擦都是原生逻辑),再次点击返回原图层。涂好后点生成即可重绘。"
+        )
+        self.paint_selection_button.toggled.connect(self._toggle_selection_paint)
         strength_layout = QHBoxLayout()
         strength_layout.addWidget(self.strength_slider)
         strength_layout.addWidget(self.layer_count_widget)
+        strength_layout.addWidget(self.paint_selection_button)
         strength_layout.addWidget(self.add_control_button)
         strength_layout.addWidget(self.add_region_button)
         layout.addLayout(strength_layout)
@@ -774,6 +788,11 @@ class GenerationWidget(QWidget):
         layout.addWidget(self.custom_inpaint)
 
         self.generate_button = GenerateButton(JobKind.diffusion, self)
+        # Painting the redraw selection must be finalized (overlay layer converted
+        # to a real selection and removed) BEFORE the canvas is captured.
+        self.generate_button.pressed.connect(
+            lambda: self.paint_selection_button.setChecked(False)
+        )
 
         self.inpaint_mode_button = QToolButton(self)
         self.inpaint_mode_button.setArrowType(Qt.ArrowType.DownArrow)
@@ -825,10 +844,19 @@ class GenerationWidget(QWidget):
     def model(self):
         return self._model
 
+    def _toggle_selection_paint(self, checked: bool):
+        doc = self._model.document
+        if checked:
+            doc.start_selection_painting()
+        else:
+            doc.stop_selection_painting()
+
     @model.setter
     def model(self, model: DocumentModel):
         if self._model != model:
             Binding.disconnect_all(self._model_bindings)
+            with theme.SignalBlocker(self.paint_selection_button):
+                self.paint_selection_button.setChecked(False)
             self._model = model
             self._model_bindings = [
                 bind(model, "workspace", self.workspace_select, "value", Bind.one_way),

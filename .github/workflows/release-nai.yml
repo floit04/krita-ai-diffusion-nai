@@ -1,0 +1,40 @@
+name: Release NAI plugin package
+
+# Push a tag like v1.52.1-nai4 and this workflow builds the importable
+# Krita plugin zip and publishes it as a GitHub Release automatically.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build plugin package
+        id: build
+        run: |
+          SUFFIX="${GITHUB_REF_NAME##*-}"   # v1.52.1-nai4 -> nai4
+          ZIP=$(python scripts/package_nai.py "$SUFFIX")
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          ls -la "$ZIP"
+
+      - name: Create release with package
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.build.outputs.zip }}
+          generate_release_notes: true
+          body: |
+            NovelAI 版 Krita AI Diffusion 插件。
+
+            **安装:** 下载下方的 zip,在 Krita 里选 工具 → 脚本 → 从文件导入 Python 插件,
+            选择该 zip 并重启 Krita。配置方法见仓库 README_NAI.md。

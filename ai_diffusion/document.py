@@ -16,6 +16,10 @@ from .pose import Pose
 from .util import acquire_elements
 
 
+# Name of the reusable overlay layer for painting the inpaint selection.
+_SEL_PAINT_LAYER_NAME = "AI 重绘选区 (涂抹)"
+
+
 class SelectionModifiers(NamedTuple):
     feather_rel: float = 0.0
     feather_min_px: int = 0
@@ -80,6 +84,12 @@ class Document(QObject):
 
     def import_animation(self, files: list[Path], offset: int = 0):
         raise NotImplementedError
+
+    def start_selection_painting(self):
+        """Enter paint-selection mode (see KritaDocument). No-op by default."""
+
+    def stop_selection_painting(self):
+        """Leave paint-selection mode (see KritaDocument). No-op by default."""
 
     @property
     def layers(self) -> LayerManager:
@@ -201,8 +211,139 @@ class KritaDocument(Document):
             return False, msg_fmt.format("depth", "8-bit integer", depth)
         return True, None
 
+    def start_selection_painting(self):
+        """Enter paint-selection mode, mimicking NAI web's "Draw Mask".
+
+        Creates a dedicated paint layer on top: strokes are painted fully opaque
+        (in NAI-mask blue) while the LAYER is set to ~40% opacity — overlapping
+        strokes therefore never accumulate. The brush switches to Krita's
+        freehand tool with the "d) Ink-3 Gpen" preset. On stop, the layer's
+        alpha is converted into the document selection and the layer is removed.
+        """
+        from .util import client_logger as log
+
+        doc = self._doc
+        if getattr(self, "_sel_paint_layer_id", None) is not None:
+            return  # already painting
+        root = doc.rootNode()
+        self._sel_paint_prev_node = doc.activeNode()
+        self._sel_paint_prev_preset = None
+        self._sel_paint_prev_color = None
+
+        # Clear any leftover selection (e.g. from the previous paint-mask run) —
+        # Krita brushes are constrained to the active selection, which would
+        # otherwise trap all new strokes inside the previous mask.
+        if doc.selection() is not None:
+            doc.setSelection(None)
+
+        # Reuse the hidden overlay from a previous run (kept for later adjustment);
+        # create a fresh one only if none exists.
+        layer = None
+        prev_id = getattr(self, "_sel_paint_hidden_id", None)
+        if prev_id is not None:
+            if found := self._layers.updated().find(prev_id):
+                layer = found.node
+        if layer is None:
+            layer = next(
+                (
+                    n
+                    for n in acquire_elements(root.childNodes())
+                    if n.type() == "paintlayer" and n.name() == _SEL_PAINT_LAYER_NAME
+                ),
+                None,
+            )
+        if layer is None:
+            layer = doc.createNode(_SEL_PAINT_LAYER_NAME, "paintlayer")
+            root.addChildNode(layer, None)  # None = top-most
+        layer.setOpacity(128)  # 50%: translucent overlay, strokes never accumulate
+        layer.setVisible(True)
+        # Pin above everything, including the plugin's live preview layer.
+        if wrapper := self._layers.updated().find(layer.uniqueId()):
+            wrapper.move_to_top()
+        doc.setActiveNode(layer)
+        doc.refreshProjection()
+        self._sel_paint_layer_id = layer.uniqueId()
+
+        window = Krita.instance().activeWindow()
+        view = window.activeView() if window else None
+        if view is not None:
+            try:  # brush preset: hard-edged ink pen, as requested
+                self._sel_paint_prev_preset = view.currentBrushPreset()
+                presets = Krita.instance().resources("preset")
+                if gpen := presets.get("d) Ink-3 Gpen"):
+                    view.setCurrentBrushPreset(gpen)
+            except Exception as e:
+                log.warning(f"selection paint: could not switch brush preset: {e}")
+            try:  # NAI web mask blue (#8286D9). ManagedColor RGBA/U8 is BGRA order.
+                from krita import ManagedColor
+
+                self._sel_paint_prev_color = view.foregroundColor()
+                color = ManagedColor("RGBA", "U8", "")
+                color.setComponents([0.851, 0.525, 0.510, 1.0])
+                view.setForeGroundColor(color)
+            except Exception as e:
+                log.warning(f"selection paint: could not set foreground color: {e}")
+        if brush_tool := Krita.instance().action("KritaShape/KisToolBrush"):
+            brush_tool.trigger()
+
+    def stop_selection_painting(self):
+        """Convert the painted overlay into the document selection and clean up."""
+        from krita import Selection
+
+        from .util import client_logger as log
+
+        doc = self._doc
+        layer_id = getattr(self, "_sel_paint_layer_id", None)
+        self._sel_paint_layer_id = None
+        if layer_id is not None:
+            layer = self._layers.updated().find(layer_id)
+            if layer is not None:
+                try:
+                    w, h = doc.width(), doc.height()
+                    data = bytes(layer.node.projectionPixelData(0, 0, w, h))  # BGRA
+                    alpha = data[3::4]
+                    if any(alpha):
+                        selection = Selection()
+                        selection.setPixelData(QByteArray(alpha), 0, 0, w, h)
+                        doc.setSelection(selection)
+                    else:  # mask fully erased -> no selection
+                        doc.setSelection(None)
+                except Exception as e:
+                    log.warning(f"selection paint: failed to convert to selection: {e}")
+                # Hide (don't delete) so the mask can be adjusted next time; the
+                # hidden layer doesn't contribute to the canvas projection.
+                layer.hide()
+                self._sel_paint_hidden_id = layer_id
+
+        try:  # restore previous layer / brush / color
+            prev = getattr(self, "_sel_paint_prev_node", None)
+            if prev is not None:
+                doc.setActiveNode(prev)
+        except Exception:
+            pass  # previous layer may have been deleted meanwhile
+        self._sel_paint_prev_node = None
+        window = Krita.instance().activeWindow()
+        view = window.activeView() if window else None
+        if view is not None:
+            try:
+                if preset := getattr(self, "_sel_paint_prev_preset", None):
+                    view.setCurrentBrushPreset(preset)
+                if color := getattr(self, "_sel_paint_prev_color", None):
+                    view.setForeGroundColor(color)
+            except Exception:
+                pass
+        self._sel_paint_prev_preset = None
+        self._sel_paint_prev_color = None
+        doc.refreshProjection()
+
     def create_mask_from_selection(self, mod: SelectionModifiers):
         user_selection = self._doc.selection()
+        if not user_selection:
+            # Fallback: an ACTIVE selection mask counts as the selection, so masks
+            # converted from paint layers work without a marching-ants selection.
+            active = self._doc.activeNode()
+            if active is not None and active.type() == "selectionmask":
+                user_selection = active.selection()
         if not user_selection:
             return None, None
 

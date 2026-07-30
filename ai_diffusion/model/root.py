@@ -124,6 +124,12 @@ class Root(QObject):
             elif settings.server_mode is ServerMode.cloud:
                 if client := connection.create_client(settings):
                     await connection._connect(client)
+            elif settings.server_mode is ServerMode.novelai:
+                # NAI was connected when Krita last closed (server_mode persists):
+                # reconnect automatically. A single attempt — on failure the
+                # connection shows the error state, no automatic retries.
+                if client := connection.create_client(settings):
+                    await connection._connect(client)
             elif settings.server_mode in [ServerMode.undefined, ServerMode.external]:
                 urls = [settings.server_url]
                 if settings.server_mode is ServerMode.undefined:
