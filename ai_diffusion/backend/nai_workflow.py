@@ -228,8 +228,13 @@ class NaiAction(Enum):
 # NAI requires width/height to be multiples of 64
 _NAI_RESOLUTION_MULTIPLE = 64
 
-# Maximum total pixel count for NAI (roughly)
-_NAI_MAX_PIXELS = 1048576  # 1024*1024
+# Maximum total pixel count NAI accepts for a generation request.
+# 3145728 is the official cap (novelai.net web build, cross-checked against the
+# launcher's NaiResolutionAdapter.officialMaxPixels).
+# NOTE: 1024*1024 = 1048576 is NOT the API limit — it is only the threshold below
+# which Opus subscribers generate for free. Clamping to it silently shrank valid
+# canvases (e.g. 1600x896 came back as 1344x768).
+_NAI_MAX_PIXELS = 3145728
 
 
 def nai_resolution(extent: Extent) -> Extent:

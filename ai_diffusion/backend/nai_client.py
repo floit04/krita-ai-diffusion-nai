@@ -187,6 +187,14 @@ class NaiClient(Client):
         NAI occasionally drops the connection mid-download (RemoteHostClosedError,
         code=2) or times out. Retry a few times like network.download() does before
         surfacing the error, so a transient hiccup doesn't fail the whole job.
+
+        Requests that never got an HTTP response at all (``status is None``) are
+        also retried: the body upload failed before the server answered, so no
+        image was generated and no Anlas was spent — retrying cannot double-charge.
+        This covers restrictive networks that kill multi-MB inpaint uploads
+        (socket "Unable to write", connection reset by a corporate gateway, ...).
+        An HTTP error such as 500 is NOT retried — the server may already have
+        generated (and charged for) the image.
         """
         for retry in range(3, 0, -1):
             try:
@@ -198,7 +206,7 @@ class NaiClient(Client):
                     bearer=self._current_token(),
                 )
             except NetworkError as e:
-                transient = e.code in (
+                transient = e.status is None or e.code in (
                     QNetworkReply.NetworkError.RemoteHostClosedError,
                     QNetworkReply.NetworkError.TemporaryNetworkFailureError,
                     QNetworkReply.NetworkError.TimeoutError,
