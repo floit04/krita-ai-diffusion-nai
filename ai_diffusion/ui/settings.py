@@ -515,7 +515,40 @@ class NovelAIConnectionWidget(QWidget):
         layout.addWidget(header)
         layout.addWidget(website_label)
 
+        # E-mail + password login. Derives the access key locally (Argon2id) and
+        # exchanges it for a token, exactly like the NAI launcher does. Neither the
+        # password nor the e-mail is ever written to disk.
+        login_header = QLabel(f"<b>{_('Sign in with e-mail')}</b>", self)
+        layout.addSpacing(6)
+        layout.addWidget(login_header)
+        login_hint = QLabel(
+            _("The password is not sent or stored — only a key derived from it."), self
+        )
+        login_hint.setWordWrap(True)
+        login_hint.setStyleSheet(f"font-size: {int(self.font().pointSize() * 0.9)}pt")
+        layout.addWidget(login_hint)
+
+        login_layout = QHBoxLayout()
+        self._email_edit = QLineEdit(self)
+        self._email_edit.setPlaceholderText(_("E-mail"))
+        self._password_edit = QLineEdit(self)
+        self._password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._password_edit.setPlaceholderText(_("Password"))
+        self._password_edit.returnPressed.connect(self._login)
+        self._email_edit.returnPressed.connect(self._login)
+        self._login_button = QPushButton(_("Sign in"), self)
+        self._login_button.clicked.connect(self._login)
+        login_layout.addWidget(self._email_edit, 1)
+        login_layout.addWidget(self._password_edit, 1)
+        login_layout.addWidget(self._login_button)
+        layout.addLayout(login_layout)
+
+        self._login_status = QLabel(self)
+        self._login_status.setWordWrap(True)
+        layout.addWidget(self._login_status)
+
         # Token input
+        layout.addSpacing(6)
         add_header(layout, Settings._nai_api_token)
         token_layout = QHBoxLayout()
         self._token_edit = QLineEdit(self)
@@ -572,6 +605,37 @@ class NovelAIConnectionWidget(QWidget):
         settings.save()
         if client := root.connection.create_client(settings):
             root.connection.connect(client)
+
+    def _login(self):
+        email = self._email_edit.text().strip()
+        password = self._password_edit.text()
+        if not email or not password:
+            self._login_status.setText(_("Enter both e-mail and password."))
+            self._login_status.setStyleSheet(f"color: {yellow}")
+            return
+        eventloop.run(self._sign_in(email, password))
+
+    async def _sign_in(self, email: str, password: str):
+        from ..backend.nai_client import login_with_password
+
+        self._login_button.setEnabled(False)
+        # Key derivation is ~1s of pure-Python Argon2id, so say what is happening.
+        self._login_status.setText(_("Deriving key and signing in..."))
+        self._login_status.setStyleSheet(f"color: {yellow}")
+        try:
+            token = await login_with_password(email, password)
+        except Exception as e:
+            self._login_status.setText(_("Sign-in failed: ") + str(e))
+            self._login_status.setStyleSheet(f"color: {red}")
+            return
+        finally:
+            self._login_button.setEnabled(True)
+            self._password_edit.clear()  # never keep the password around
+
+        self._token_edit.setText(token)  # also writes it to settings
+        self._login_status.setText(_("Signed in. Token stored, connecting..."))
+        self._login_status.setStyleSheet(f"color: {green}")
+        self._connect()
 
     def _refresh_subscription(self):
         """Fetch subscription info from the NAI image API host."""
@@ -660,6 +724,27 @@ class TokenEditDialog(QDialog):
         self._token_edit.setPlaceholderText("pst-...")
         layout.addWidget(self._token_edit)
 
+        # Alternative to pasting a token: sign in and let the plugin fetch one.
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("<b>" + _("...or sign in with e-mail") + "</b>", self))
+        credentials_layout = QHBoxLayout()
+        self._email_edit = QLineEdit(self)
+        self._email_edit.setPlaceholderText(_("E-mail"))
+        self._password_edit = QLineEdit(self)
+        self._password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._password_edit.setPlaceholderText(_("Password"))
+        self._password_edit.returnPressed.connect(self._sign_in)
+        self._login_button = QPushButton(_("Sign in"), self)
+        self._login_button.clicked.connect(self._sign_in)
+        credentials_layout.addWidget(self._email_edit, 1)
+        credentials_layout.addWidget(self._password_edit, 1)
+        credentials_layout.addWidget(self._login_button)
+        layout.addLayout(credentials_layout)
+
+        self._login_status = QLabel(self)
+        self._login_status.setWordWrap(True)
+        layout.addWidget(self._login_status)
+
         button_layout = QHBoxLayout()
         ok_button = QPushButton(_("OK"), self)
         ok_button.clicked.connect(self.accept)
@@ -669,6 +754,37 @@ class TokenEditDialog(QDialog):
         button_layout.addWidget(ok_button)
         button_layout.addWidget(cancel_button)
         layout.addLayout(button_layout)
+
+    def _sign_in(self):
+        email = self._email_edit.text().strip()
+        password = self._password_edit.text()
+        if not email or not password:
+            self._login_status.setText(_("Enter both e-mail and password."))
+            self._login_status.setStyleSheet(f"color: {yellow}")
+            return
+        eventloop.run(self._do_sign_in(email, password))
+
+    async def _do_sign_in(self, email: str, password: str):
+        from ..backend.nai_client import login_with_password
+
+        self._login_button.setEnabled(False)
+        self._login_status.setText(_("Deriving key and signing in..."))
+        self._login_status.setStyleSheet(f"color: {yellow}")
+        try:
+            token = await login_with_password(email, password)
+        except Exception as e:
+            self._login_status.setText(_("Sign-in failed: ") + str(e))
+            self._login_status.setStyleSheet(f"color: {red}")
+            return
+        finally:
+            self._login_button.setEnabled(True)
+            self._password_edit.clear()  # never keep the password around
+
+        self._token_edit.setText(token)
+        if not self._name_edit.text().strip():
+            self._name_edit.setText(email)
+        self._login_status.setText(_("Signed in — token filled in below. Press OK to save."))
+        self._login_status.setStyleSheet(f"color: {green}")
 
     @property
     def name(self):

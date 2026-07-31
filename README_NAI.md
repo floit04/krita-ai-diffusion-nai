@@ -29,11 +29,17 @@
 
 ## 配置
 
-1. 在 [novelai.net](https://novelai.net) 登录后到 **Account → Get Persistent API Token** 复制 `pst-` 开头的令牌
-2. Krita 的 AI 面板 → 右上角齿轮 → **连接** 页 → 选 **NovelAI** 标签 → 粘贴令牌 → 连接
-3. 在 **NovelAI 风格** 页选择模型(推荐 `nai-diffusion-4-5-full`)并调整采样参数
+Krita 的 AI 面板 → 右上角齿轮 → **连接** 页 → 选 **NovelAI** 标签,两种登录方式任选:
 
-> 令牌只保存在本机 Krita 配置目录(`%APPDATA%\krita\ai_diffusion\settings.json`),不会进入本仓库。
+**方式一:账号密码登录(推荐)**
+填邮箱和密码 → **登录**。插件在本地用 Argon2id 算出访问密钥,只把密钥发给 NovelAI 换取令牌 —— **密码本身不会离开你的电脑,也不会被保存**。密钥推导是纯 Python 实现的(Krita 自带的 Python 没有 argon2 库,也无法 pip 安装),约 1 秒。拿到的令牌有效期约 30 天,过期后重新登录即可。
+
+**方式二:粘贴 Persistent Token**
+在 [novelai.net](https://novelai.net) 登录后到 **Account → Get Persistent API Token** 复制 `pst-` 开头的令牌,粘贴后点连接。
+
+登录成功后到 **NovelAI 风格** 页选择模型(推荐 `nai-diffusion-4-5-full`)并调整采样参数。
+
+> 令牌只保存在本机 Krita 配置目录(`%APPDATA%\krita\ai_diffusion\settings.json`),不会进入本仓库。**密码和邮箱一律不落盘**,登录框关掉就没了。
 
 ## 使用要点
 

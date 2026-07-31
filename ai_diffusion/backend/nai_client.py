@@ -111,6 +111,44 @@ def _save_vibe_cache(cache: dict[str, str]):
 
 
 # ---------------------------------------------------------------------------
+# E-mail + password login
+# ---------------------------------------------------------------------------
+
+# User endpoints live on the IMAGE host for third-party clients — api.novelai.net
+# answers 400 "update to the image URL". (Launcher: nai_api_endpoint.dart userUrl)
+nai_user_api_url = "https://image.novelai.net"
+
+
+async def login_with_password(email: str, password: str) -> str:
+    """Log in with NovelAI credentials and return the bearer token.
+
+    The password never leaves this machine: an access key is derived from it with
+    Argon2id and only that key is sent to ``/user/login``. Key derivation takes
+    about a second of pure-Python number crunching, so it runs in a worker thread
+    to keep Krita responsive.
+
+    Returns the JWT access token (valid ~30 days), which is used exactly like a
+    persistent ``pst-`` token.
+    """
+    from . import nai_auth
+
+    loop = asyncio.get_event_loop()
+    access_key = await loop.run_in_executor(None, nai_auth.derive_access_key, email, password)
+
+    requests = RequestManager()
+    try:
+        data = await requests.post(f"{nai_user_api_url}/user/login", {"key": access_key})
+    except NetworkError as e:
+        if e.status == 401:  # server answers "Invalid access key"
+            raise RuntimeError(_("Wrong e-mail or password.")) from e
+        raise
+    token = data.get("accessToken") if isinstance(data, dict) else None
+    if not token:
+        raise RuntimeError(_("NovelAI login did not return an access token"))
+    return str(token)
+
+
+# ---------------------------------------------------------------------------
 # NAI Client
 # ---------------------------------------------------------------------------
 
