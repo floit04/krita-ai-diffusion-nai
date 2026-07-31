@@ -16,6 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The bundled websockets library is a git submodule. Without it the zip
+      # imports fine as source but Krita refuses to load the plugin with
+      # "Could not find websockets module". debugpy is intentionally left out.
+      - name: Fetch websockets submodule
+        run: git submodule update --init --depth 1 ai_diffusion/websockets
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

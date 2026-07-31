@@ -25,7 +25,23 @@ def plugin_version() -> str:
     return match.group(1)
 
 
+def check_bundled_dependencies():
+    """The websockets library is a git submodule and MUST be inside the zip.
+
+    Krita's Python has no pip, so the plugin refuses to load without it
+    ("Could not find websockets module"). A plain `git clone` leaves the
+    submodule empty, which used to produce a silently broken package.
+    """
+    ws = root / "ai_diffusion" / "websockets" / "src" / "websockets" / "__init__.py"
+    if not ws.exists():
+        raise SystemExit(
+            f"missing bundled dependency: {ws}\n"
+            "run: git submodule update --init --depth 1 ai_diffusion/websockets"
+        )
+
+
 def build(suffix: str = "nai") -> Path:
+    check_bundled_dependencies()
     name = f"krita_ai_diffusion-{plugin_version()}-{suffix}"
     package_dir = root / "scripts" / ".package"
     rmtree(package_dir, ignore_errors=True)
