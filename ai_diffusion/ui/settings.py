@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from .. import __version__, eventloop, util
+from .. import __display_version__, eventloop, util
 from ..backend import resources
 from ..backend.client import Client, MissingResources, User
 from ..backend.cloud_client import CloudClient
@@ -1559,7 +1559,7 @@ class AboutSettings(SettingsTab):
         header_layout.addWidget(header_text)
 
         current_version_name = QLabel(_("Current version") + ":", self)
-        current_version_value = QLabel(__version__, self)
+        current_version_value = QLabel(__display_version__, self)
 
         latest_version_name = QLabel(_("Latest version") + ":", self)
         self._latest_version_value = QLabel(self)
@@ -1787,7 +1787,7 @@ class SettingsDialog(QDialog):
         self._restore_button = QPushButton(_("Restore Defaults"), self)
         self._restore_button.clicked.connect(self.restore_defaults)
 
-        version_label = QLabel(_("Plugin version") + f": {__version__}", self)
+        version_label = QLabel(_("Plugin version") + f": {__display_version__}", self)
         version_label.setStyleSheet(f"font-style:italic; color: {grey};")
 
         anchor = _("Open Settings folder")

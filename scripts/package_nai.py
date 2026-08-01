@@ -25,6 +25,21 @@ def plugin_version() -> str:
     return match.group(1)
 
 
+def stamp_nai_version(init_file: Path, version: str):
+    """Write the release version into the packaged copy of __init__.py.
+
+    The auto-updater compares this against the latest GitHub release tag, so it must
+    match the tag exactly (minus the leading "v"). Source checkouts keep the "dev"
+    placeholder, which disables the update check.
+    """
+    text = init_file.read_text(encoding="utf-8")
+    text, count = re.subn(
+        r'__nai_version__ = "[^"]*"', f'__nai_version__ = "{version}"', text, count=1
+    )
+    assert count == 1, "could not find __nai_version__ in ai_diffusion/__init__.py"
+    init_file.write_text(text, encoding="utf-8")
+
+
 def check_bundled_dependencies():
     """The websockets library is a git submodule and MUST be inside the zip.
 
@@ -42,7 +57,8 @@ def check_bundled_dependencies():
 
 def build(suffix: str = "nai") -> Path:
     check_bundled_dependencies()
-    name = f"krita_ai_diffusion-{plugin_version()}-{suffix}"
+    version = f"{plugin_version()}-{suffix}"
+    name = f"krita_ai_diffusion-{version}"
     package_dir = root / "scripts" / ".package"
     rmtree(package_dir, ignore_errors=True)
     package_dir.mkdir()
@@ -54,6 +70,7 @@ def build(suffix: str = "nai") -> Path:
     copytree(root / "ai_diffusion", package_dir / "ai_diffusion", ignore=ignore)
     copy(root / "LICENSE", package_dir / "ai_diffusion")
     copy(root / "README_NAI.md", package_dir / "ai_diffusion")
+    stamp_nai_version(package_dir / "ai_diffusion" / "__init__.py", version)
 
     archive = Path(make_archive(str(root / name), "zip", package_dir))
     rmtree(package_dir)

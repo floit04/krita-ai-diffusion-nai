@@ -31,13 +31,17 @@ jobs:
         run: |
           SUFFIX="${GITHUB_REF_NAME##*-}"   # v1.52.1-nai4 -> nai4
           ZIP=$(python scripts/package_nai.py "$SUFFIX")
+          # The in-app updater fetches this sidecar to check the download is intact.
+          (cd "$(dirname "$ZIP")" && sha256sum "$(basename "$ZIP")" > "$(basename "$ZIP").sha256")
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-          ls -la "$ZIP"
+          ls -la "$ZIP" "$ZIP.sha256"
 
       - name: Create release with package
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.build.outputs.zip }}
+          files: |
+            ${{ steps.build.outputs.zip }}
+            ${{ steps.build.outputs.zip }}.sha256
           generate_release_notes: true
           body: |
             NovelAI 版 Krita AI Diffusion 插件。

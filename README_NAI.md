@@ -20,12 +20,28 @@
 
 ## 安装
 
+推荐从 [Releases](https://github.com/floit04/krita-ai-diffusion-nai/releases) 下载最新的
+`krita_ai_diffusion-*-nai*.zip`,在 Krita 里选 **工具 → 脚本 → 从文件导入 Python 插件**,
+选中该 zip,然后重启 Krita。
+
+也可以手动安装(从源码运行时不会收到自动更新提示):
+
 1. 下载本仓库(Code → Download ZIP 或 `git clone`)
 2. 把 `ai_diffusion` 文件夹和 `ai_diffusion.desktop` 复制到 Krita 的 pykrita 目录:
    - Windows:`%APPDATA%\krita\pykrita\`
    - Linux:`~/.local/share/krita/pykrita/`
 3. 启动 Krita → 设置 → 配置 Krita → Python 插件管理器 → 勾选 **AI Image Diffusion** → 重启 Krita
 4. 设置 → 面板 → 勾选 **AI Image Generation** 打开面板
+
+## 更新
+
+插件的自动更新指向**本仓库的 Releases**,而不是上游 Acly 的官方服务 —— 装了 NAI 版就只收
+NAI 版的更新,与上游同步由本仓库手动合并后再发版。
+
+启动时会检查一次(可在 齿轮 → **关于** 页关闭),有新版会提示;也可以在该页点
+**Check for Updates** 手动检查,再点 **Download and Install** 就地升级,重启 Krita 生效。
+下载完会用发布包附带的 `.sha256` 校验完整性。从源码目录运行时版本号显示为 `x.y.z-dev`,
+自动更新不生效(以免覆盖你的工作副本)。
 
 ## 配置
 

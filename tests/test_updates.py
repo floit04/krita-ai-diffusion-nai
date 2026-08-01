@@ -1,14 +1,13 @@
-import os
+import hashlib
 from pathlib import Path
 
 import pytest
-from aiohttp import ClientSession
 from PyQt5.QtCore import pyqtBoundSignal
 
-from ai_diffusion.model.updates import AutoUpdate, UpdateState
+from ai_diffusion.model.updates import AutoUpdate, UpdateState, parse_release
 from ai_diffusion.platform_tools import ZipFile
 
-from .conftest import CloudService, qtapp
+from .conftest import qtapp
 
 
 class SignalObserver:
@@ -23,98 +22,156 @@ class SignalObserver:
         self.events = []
 
 
-def http_session(service_url: str):
-    service_token = os.environ["INTERSTICE_INFRA_TOKEN"]
-    headers = {"Authorization": f"Bearer {service_token}"}
-    return ClientSession(service_url, headers=headers)
+class FakeNetwork:
+    """Stands in for RequestManager, serving a canned GitHub release."""
+
+    def __init__(self, responses: dict):
+        self.responses = responses
+        self.requests: list[str] = []
+
+    async def get(self, url: str, timeout: float | None = None):
+        self.requests.append(url)
+        return self.responses[url]
+
+    async def download(self, url: str):
+        self.requests.append(url)
+        return self.responses[url]
+
+
+def release_json(tag: str, assets: list[str], base_url="https://example.com"):
+    return {
+        "tag_name": tag,
+        "assets": [{"name": n, "browser_download_url": f"{base_url}/{n}"} for n in assets],
+    }
+
+
+def test_parse_release():
+    zip_name = "krita_ai_diffusion-1.52.1-nai9.zip"
+    package = parse_release(release_json("v1.52.1-nai9", [zip_name, f"{zip_name}.sha256"]))
+    assert package is not None
+    assert package.version == "1.52.1-nai9"  # leading "v" of the tag is stripped
+    assert package.url == f"https://example.com/{zip_name}"
+    assert package.checksum_url == f"https://example.com/{zip_name}.sha256"
+
+
+def test_parse_release_without_checksum():
+    zip_name = "krita_ai_diffusion-1.52.1-nai7.zip"
+    package = parse_release(release_json("v1.52.1-nai7", [zip_name]))
+    assert package is not None and package.checksum_url is None
+
+
+@pytest.mark.parametrize(
+    "release",
+    [
+        {},
+        release_json("v1.52.1-nai9", []),  # release without any package attached
+        release_json("v1.52.1-nai9", ["notes.txt"]),
+        release_json("", ["krita_ai_diffusion-1.52.1-nai9.zip"]),
+    ],
+)
+def test_parse_release_invalid(release):
+    assert parse_release(release) is None
+
+
+def build_package(build_dir: Path, name: str, content: str):
+    """A minimal stand-in for what scripts/package_nai.py produces."""
+    source = build_dir / "source" / "ai_diffusion"
+    source.mkdir(parents=True)
+    (source / "__init__.py").write_text(content)
+    archive = build_dir / name
+    with ZipFile(archive, "w") as zip_file:
+        zip_file.write(source / "__init__.py", "ai_diffusion/__init__.py")
+    return archive.read_bytes()
 
 
 @qtapp
-async def test_auto_update(cloud_service: CloudService, tmp_path: Path):
-    if not cloud_service.enabled:
-        pytest.skip("Cloud service not running")
-    await run_auto_update_test(cloud_service, tmp_path)
+async def test_auto_update(tmp_path: Path):
+    zip_name = "krita_ai_diffusion-1.52.1-nai9.zip"
+    url = "https://example.com/" + zip_name
+    archive = build_package(tmp_path / "build", zip_name, '__nai_version__ = "1.52.1-nai9"')
+    net = FakeNetwork(
+        {
+            "https://api.github.com/repos/test/test/releases/latest": release_json(
+                "v1.52.1-nai9", [zip_name, f"{zip_name}.sha256"]
+            ),
+            url: archive,
+            f"{url}.sha256": f"{hashlib.sha256(archive).hexdigest()}  {zip_name}\n".encode(),
+        }
+    )
+
+    install_dir = tmp_path / "install"
+    installed = install_dir / "ai_diffusion" / "__init__.py"
+    installed.parent.mkdir(parents=True)
+    installed.write_text('__nai_version__ = "1.52.1-nai8"')
+
+    updater = AutoUpdate(
+        plugin_dir=install_dir,
+        current_version="1.52.1-nai8",
+        repository="test/test",
+        net=net,  # type: ignore[arg-type]
+    )
+    assert updater.state is UpdateState.unknown
+
+    state_changes = SignalObserver(updater.state_changed)
+    await updater.check()
+    assert state_changes.events == [UpdateState.checking, UpdateState.available]
+    assert updater.latest_version == "1.52.1-nai9"
+    assert updater.is_available
+
+    state_changes.reset()
+    await updater.run()
+    assert state_changes.events == [
+        UpdateState.downloading,
+        UpdateState.installing,
+        UpdateState.restart_required,
+    ]
+    assert installed.read_text() == '__nai_version__ = "1.52.1-nai9"'
 
 
-async def run_auto_update_test(service: CloudService, tmp_path: Path):
-    async with http_session(service.url) as session:
-        last_version = new_version = "666.6.6"
-
-        # Get the latest plugin version (set from previous test)
-        async with session.get(f"/plugin/latest?version={new_version}") as response:
-            assert response.status == 200
-            result = await response.json()
-            last_version = result["version"]
-            a, b, c = last_version.split(".")
-            new_version = f"{a}.{b}.{int(c) + 1}"
-
-        # Create an existing installation
-        install_dir = tmp_path / "install"
-        install_plugin_dir = install_dir / "test_plugin"
-        install_plugin_dir.mkdir(parents=True)
-        install_test_file = install_plugin_dir / "test_file.txt"
-        install_test_file.write_text("local produce is the best")
-
-        updater = AutoUpdate(
-            current_version=last_version,
-            plugin_dir=install_dir,
-            api_url=service.url,
-        )
-        assert updater.state is UpdateState.unknown
-
-        state_changes = SignalObserver(updater.state_changed)
-        await updater.check()
-        assert state_changes.events == [UpdateState.checking, UpdateState.latest]
-        assert updater.state is UpdateState.latest
-
-        # Create a new plugin version
-        build_dir = tmp_path / "build"
-        build_plugin_dir = build_dir / "test_plugin"
-        build_plugin_dir.mkdir(parents=True)
-        build_test_file = build_plugin_dir / "test_file.txt"
-        build_test_file.write_text("if you're feeling orange, try flying a kite")
-        build_archive = build_dir / f"test_plugin-{new_version}.zip"
-
-        # Build the plugin archive
-        with ZipFile(build_archive, "w") as zip_file:
-            for file in build_plugin_dir.iterdir():
-                zip_file.write(file, f"test_plugin/{file.name}")
-
-        # Upload the plugin as new version
-        archive_data = build_archive.read_bytes()
-        async with session.put(f"/plugin/upload/{new_version}", data=archive_data) as response:
-            assert response.status == 200
-            uploaded = await response.json()
-            assert uploaded["status"] == "uploaded" and uploaded["version"] == new_version
-
-        # Check for new version
-        state_changes.reset()
-        await updater.check()
-        assert state_changes.events == [UpdateState.checking, UpdateState.available]
-        assert updater.state is UpdateState.available
-        assert updater.latest_version == new_version
-
-        # Run the update
-        state_changes.reset()
-        await updater.run()
-        assert state_changes.events == [
-            UpdateState.downloading,
-            UpdateState.installing,
-            UpdateState.restart_required,
-        ]
-        assert updater.state is UpdateState.restart_required
-        assert updater.latest_version == new_version
-        assert install_test_file.read_text() == "if you're feeling orange, try flying a kite"
+@qtapp
+async def test_auto_update_latest(tmp_path: Path):
+    zip_name = "krita_ai_diffusion-1.52.1-nai9.zip"
+    net = FakeNetwork(
+        {
+            "https://api.github.com/repos/test/test/releases/latest": release_json(
+                "v1.52.1-nai9", [zip_name]
+            )
+        }
+    )
+    updater = AutoUpdate(tmp_path, "1.52.1-nai9", "test/test", net)  # type: ignore[arg-type]
+    await updater.check()
+    assert updater.state is UpdateState.latest
+    assert not updater.is_available
 
 
-async def test_authorization(cloud_service: CloudService):
-    if not cloud_service.enabled:
-        pytest.skip("Cloud service not running")
-    async with ClientSession(cloud_service.url) as session:
-        # Version check is public
-        async with session.get("/plugin/latest?version=1.2.3") as response:
-            assert response.status == 200
+@qtapp
+async def test_auto_update_from_source(tmp_path: Path):
+    """A source checkout has no release version and must not phone home."""
+    net = FakeNetwork({})
+    updater = AutoUpdate(tmp_path, "dev", "test/test", net)  # type: ignore[arg-type]
+    await updater.check()
+    assert updater.state is UpdateState.latest
+    assert net.requests == []
 
-        # Upload requires authorization
-        async with session.put("/plugin/upload/1.2.3") as response:
-            assert response.status == 401
+
+@qtapp
+async def test_auto_update_corrupt_package(tmp_path: Path):
+    zip_name = "krita_ai_diffusion-1.52.1-nai9.zip"
+    url = "https://example.com/" + zip_name
+    archive = build_package(tmp_path / "build", zip_name, "corrupted")
+    net = FakeNetwork(
+        {
+            "https://api.github.com/repos/test/test/releases/latest": release_json(
+                "v1.52.1-nai9", [zip_name, f"{zip_name}.sha256"]
+            ),
+            url: archive,
+            f"{url}.sha256": b"0" * 64 + b"  " + zip_name.encode(),
+        }
+    )
+    install_dir = tmp_path / "install"
+    install_dir.mkdir()
+    updater = AutoUpdate(install_dir, "1.52.1-nai8", "test/test", net)  # type: ignore[arg-type]
+    await updater.check()
+    await updater.run()
+    assert updater.state is UpdateState.failed_update
+    assert not (install_dir / "ai_diffusion").exists()  # nothing was installed
