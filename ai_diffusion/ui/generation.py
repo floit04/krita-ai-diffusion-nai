@@ -45,6 +45,7 @@ from PyQt5.QtWidgets import (
 from ..backend.api import InpaintContext
 from ..backend.resources import Arch
 from ..backend.workflow import FillMode, InpaintMode
+from ..document import SELECTION_PAINT_LAYER_NAME
 from ..image import Bounds, Extent, Image
 from ..localization import translate as _
 from ..model.jobs import Job, JobKind, JobParams, JobQueue, JobState
@@ -772,8 +773,11 @@ class GenerationWidget(QWidget):
         except Exception:
             self.paint_selection_button.setIcon(theme.icon("region-add"))
         self.paint_selection_button.setToolTip(
-            "绘制重绘选区:开启后直接用 Krita 画笔在画布上涂抹要重绘的区域"
-            "(压感/笔刷预设/橡皮擦都是原生逻辑),再次点击返回原图层。涂好后点生成即可重绘。"
+            "绘制重绘区域:开启后用 Krita 画笔直接在画布上涂抹要重绘的区域"
+            "(压感/笔刷预设/橡皮擦都是原生逻辑)。此按钮只控制涂抹图层的显示和隐藏,不会删除它。\n"
+            f"只要「{SELECTION_PAINT_LAYER_NAME}」图层还在,不论显示还是隐藏,点生成都按涂抹区域重绘"
+            "(此时强度最高 99%);要取消重绘,在图层面板里删掉该图层。\n"
+            "画布上已有选区时以选区为准,涂抹图层不参与。"
         )
         self.paint_selection_button.toggled.connect(self._toggle_selection_paint)
         strength_layout = QHBoxLayout()
@@ -788,11 +792,6 @@ class GenerationWidget(QWidget):
         layout.addWidget(self.custom_inpaint)
 
         self.generate_button = GenerateButton(JobKind.diffusion, self)
-        # Painting the redraw selection must be finalized (overlay layer converted
-        # to a real selection and removed) BEFORE the canvas is captured.
-        self.generate_button.pressed.connect(
-            lambda: self.paint_selection_button.setChecked(False)
-        )
 
         self.inpaint_mode_button = QToolButton(self)
         self.inpaint_mode_button.setArrowType(Qt.ArrowType.DownArrow)
@@ -851,12 +850,21 @@ class GenerationWidget(QWidget):
         else:
             doc.stop_selection_painting()
 
+    def _update_selection_paint_button(self):
+        self._sync_selection_paint_button(self._model)
+
+    def _sync_selection_paint_button(self, model: DocumentModel):
+        """Reflect the overlay's actual state — it may have been deleted or hidden
+        in the layer docker, or belong to a document we just switched to."""
+        layer = model.document.selection_paint_layer
+        with theme.SignalBlocker(self.paint_selection_button):
+            self.paint_selection_button.setChecked(layer is not None and layer.is_visible)
+
     @model.setter
     def model(self, model: DocumentModel):
         if self._model != model:
             Binding.disconnect_all(self._model_bindings)
-            with theme.SignalBlocker(self.paint_selection_button):
-                self.paint_selection_button.setChecked(False)
+            self._sync_selection_paint_button(model)
             self._model = model
             self._model_bindings = [
                 bind(model, "workspace", self.workspace_select, "value", Bind.one_way),
@@ -869,6 +877,8 @@ class GenerationWidget(QWidget):
                 model.strength_changed.connect(self.update_generate_options),
                 model.document.selection_bounds_changed.connect(self.update_generate_options),
                 model.document.layers.active_changed.connect(self.update_generate_options),
+                # Deleting the overlay in the layer docker cancels redraw mode.
+                model.document.layers.changed.connect(self._update_selection_paint_button),
                 model.regions.active_changed.connect(self.update_generate_options),
                 model.region_only_changed.connect(self.update_generate_options),
                 model.style_changed.connect(self.update_generate_options),

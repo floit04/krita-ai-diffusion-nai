@@ -235,6 +235,11 @@ class DocumentModel(QObject, ObservableProperties):
         strength = self.strength
         if arch is Arch.qwen_l:
             strength = 1.0
+        if self._doc.has_selection_paint_mask:
+            # A painted mask always means "redraw this area", never "generate from
+            # scratch": at full strength the existing pixels are discarded and the
+            # strokes lose their meaning, so cap it just below.
+            strength = min(strength, 0.99)
         if strength < 1.0 or self.is_editing:
             workflow_kind = WorkflowKind.refine
         client = self._connection.client
@@ -646,6 +651,10 @@ class DocumentModel(QObject, ObservableProperties):
             ]
             if self._layer:  # exclude preview layer
                 exclude.append(self._layer)
+            # The mask overlay is a UI element, not part of the image — it must be
+            # excluded even when visible, since generating no longer hides it.
+            if paint_mask := self._doc.selection_paint_layer:
+                exclude.append(paint_mask)
 
         if not any(l.is_visible and l not in exclude for l in self.layers.images):
             warning = _(
@@ -804,6 +813,10 @@ class DocumentModel(QObject, ObservableProperties):
             self.document.resize_canvas(*image.extent)
 
         bounds = Bounds(*params.bounds.offset, *image.extent)
+        if self.layers.active is self._doc.selection_paint_layer:
+            # The mask overlay is active while painting; writing the result into it
+            # would destroy the mask. Insert a new layer instead.
+            behavior = ApplyBehavior.layer
         if len(params.regions) == 0 or region_behavior is ApplyRegionBehavior.none:
             if behavior is ApplyBehavior.replace:
                 self.layers.update_layer_image(self.layers.active, image, bounds)

@@ -16,8 +16,9 @@ from .pose import Pose
 from .util import acquire_elements
 
 
-# Name of the reusable overlay layer for painting the inpaint selection.
-_SEL_PAINT_LAYER_NAME = "AI 重绘选区 (涂抹)"
+# Name of the reusable overlay layer for painting the inpaint selection. Also used
+# to find the layer again after a plugin reload, so it must not change.
+SELECTION_PAINT_LAYER_NAME = "AI 重绘选区 (涂抹)"
 
 
 class SelectionModifiers(NamedTuple):
@@ -90,6 +91,16 @@ class Document(QObject):
 
     def stop_selection_painting(self):
         """Leave paint-selection mode (see KritaDocument). No-op by default."""
+
+    @property
+    def selection_paint_layer(self) -> Layer | None:
+        """The overlay layer holding the painted inpaint mask (see KritaDocument)."""
+        return None
+
+    @property
+    def has_selection_paint_mask(self) -> bool:
+        """True while a painted inpaint mask exists (see KritaDocument)."""
+        return False
 
     @property
     def layers(self) -> LayerManager:
@@ -211,19 +222,86 @@ class KritaDocument(Document):
             return False, msg_fmt.format("depth", "8-bit integer", depth)
         return True, None
 
-    def start_selection_painting(self):
-        """Enter paint-selection mode, mimicking NAI web's "Draw Mask".
+    @property
+    def selection_paint_layer(self) -> Layer | None:
+        """The overlay layer holding the painted inpaint mask, if it still exists.
 
-        Creates a dedicated paint layer on top: strokes are painted fully opaque
-        (in NAI-mask blue) while the LAYER is set to ~40% opacity — overlapping
-        strokes therefore never accumulate. The brush switches to Krita's
-        freehand tool with the "d) Ink-3 Gpen" preset. On stop, the layer's
-        alpha is converted into the document selection and the layer is removed.
+        The layer — not the toggle button and not the document selection — is the
+        single source of truth for the mask. Deleting it in the layer docker is
+        therefore how the user cancels inpainting.
+        """
+        layers = self._layers.updated()
+        layer_id = getattr(self, "_sel_paint_layer_id", None)
+        if layer_id is not None:
+            if layer := layers.find(layer_id):
+                return layer
+            self._sel_paint_layer_id = None  # deleted in the layer docker
+        # Fall back to the name so the mask survives a plugin reload or reopening
+        # the .kra file, where the remembered id is gone.
+        layer = next(
+            (
+                l
+                for l in layers.all
+                if l.type is LayerType.paint and l.name == SELECTION_PAINT_LAYER_NAME
+            ),
+            None,
+        )
+        if layer is not None:
+            self._sel_paint_layer_id = layer.id
+        return layer
+
+    @property
+    def has_selection_paint_mask(self) -> bool:
+        """True when the painted overlay is the *effective* inpaint mask.
+
+        A real selection takes priority, and the overlay is then ignored entirely.
+        """
+        if self._doc.selection() is not None:
+            return False
+        return self._paint_layer_alpha() is not None
+
+    def _paint_layer_alpha(self) -> bytes | None:
+        """Alpha channel of the overlay layer, or None if nothing is painted."""
+        from .util import client_logger as log
+
+        layer = self.selection_paint_layer
+        if layer is None or layer.bounds.is_zero:
+            return None
+        try:
+            # pixelData, not projectionPixelData: the overlay counts even while it
+            # is hidden, and layer opacity must not dilute the mask.
+            data = bytes(layer.node.pixelData(0, 0, self._doc.width(), self._doc.height()))
+        except Exception as e:
+            log.warning(f"selection paint: failed to read mask layer: {e}")
+            return None
+        alpha = data[3::4]  # BGRA
+        return alpha if any(alpha) else None  # painted, then fully erased -> no mask
+
+    def _selection_from_paint_layer(self):
+        """Build a Krita selection from the overlay layer's alpha channel."""
+        from krita import Selection
+
+        alpha = self._paint_layer_alpha()
+        if alpha is None:
+            return None
+        selection = Selection()
+        selection.setPixelData(QByteArray(alpha), 0, 0, self._doc.width(), self._doc.height())
+        return selection
+
+    def start_selection_painting(self):
+        """Show the paint-selection overlay, mimicking NAI web's "Draw Mask".
+
+        Strokes are painted fully opaque (in NAI-mask blue) while the LAYER is set
+        to 50% opacity — overlapping strokes therefore never accumulate. The brush
+        switches to Krita's freehand tool with the "d) Ink-3 Gpen" preset.
+
+        The overlay is only ever created or shown here; it is never deleted, and
+        its content is the inpaint mask regardless of whether it is visible.
         """
         from .util import client_logger as log
 
         doc = self._doc
-        if getattr(self, "_sel_paint_layer_id", None) is not None:
+        if getattr(self, "_sel_paint_active", False):
             return  # already painting
         root = doc.rootNode()
         self._sel_paint_prev_node = doc.activeNode()
@@ -236,33 +314,27 @@ class KritaDocument(Document):
         if doc.selection() is not None:
             doc.setSelection(None)
 
-        # Reuse the hidden overlay from a previous run (kept for later adjustment);
-        # create a fresh one only if none exists.
-        layer = None
-        prev_id = getattr(self, "_sel_paint_hidden_id", None)
-        if prev_id is not None:
-            if found := self._layers.updated().find(prev_id):
-                layer = found.node
+        # Reuse the existing overlay (hidden or not) so a mask painted earlier can
+        # be adjusted; create a fresh one only after the user deleted it.
+        wrapper = self.selection_paint_layer
+        layer = wrapper.node if wrapper is not None else None
         if layer is None:
-            layer = next(
-                (
-                    n
-                    for n in acquire_elements(root.childNodes())
-                    if n.type() == "paintlayer" and n.name() == _SEL_PAINT_LAYER_NAME
-                ),
-                None,
-            )
-        if layer is None:
-            layer = doc.createNode(_SEL_PAINT_LAYER_NAME, "paintlayer")
+            layer = doc.createNode(SELECTION_PAINT_LAYER_NAME, "paintlayer")
             root.addChildNode(layer, None)  # None = top-most
         layer.setOpacity(128)  # 50%: translucent overlay, strokes never accumulate
         layer.setVisible(True)
+        # A plain, independent paint layer: it must never act as a mask on the
+        # layers below, only mark the area to redraw. It is also excluded from the
+        # captured image, so it never reaches the model.
+        layer.setBlendingMode("normal")
+        layer.setInheritAlpha(False)
         # Pin above everything, including the plugin's live preview layer.
         if wrapper := self._layers.updated().find(layer.uniqueId()):
             wrapper.move_to_top()
         doc.setActiveNode(layer)
         doc.refreshProjection()
         self._sel_paint_layer_id = layer.uniqueId()
+        self._sel_paint_active = True
 
         window = Krita.instance().activeWindow()
         view = window.activeView() if window else None
@@ -287,33 +359,15 @@ class KritaDocument(Document):
             brush_tool.trigger()
 
     def stop_selection_painting(self):
-        """Convert the painted overlay into the document selection and clean up."""
-        from krita import Selection
+        """Hide the overlay and restore the brush — the mask itself is kept.
 
-        from .util import client_logger as log
-
+        The button only shows and hides the overlay. The painted mask stays in
+        effect while hidden and is only cancelled by deleting the layer.
+        """
         doc = self._doc
-        layer_id = getattr(self, "_sel_paint_layer_id", None)
-        self._sel_paint_layer_id = None
-        if layer_id is not None:
-            layer = self._layers.updated().find(layer_id)
-            if layer is not None:
-                try:
-                    w, h = doc.width(), doc.height()
-                    data = bytes(layer.node.projectionPixelData(0, 0, w, h))  # BGRA
-                    alpha = data[3::4]
-                    if any(alpha):
-                        selection = Selection()
-                        selection.setPixelData(QByteArray(alpha), 0, 0, w, h)
-                        doc.setSelection(selection)
-                    else:  # mask fully erased -> no selection
-                        doc.setSelection(None)
-                except Exception as e:
-                    log.warning(f"selection paint: failed to convert to selection: {e}")
-                # Hide (don't delete) so the mask can be adjusted next time; the
-                # hidden layer doesn't contribute to the canvas projection.
-                layer.hide()
-                self._sel_paint_hidden_id = layer_id
+        self._sel_paint_active = False
+        if layer := self.selection_paint_layer:
+            layer.hide()
 
         try:  # restore previous layer / brush / color
             prev = getattr(self, "_sel_paint_prev_node", None)
@@ -337,7 +391,12 @@ class KritaDocument(Document):
         doc.refreshProjection()
 
     def create_mask_from_selection(self, mod: SelectionModifiers):
+        # A real selection wins; the painted overlay is then ignored entirely.
+        # Otherwise the overlay is the mask — whether it is shown or hidden — and
+        # stops applying the moment the user deletes it.
         user_selection = self._doc.selection()
+        if not user_selection:
+            user_selection = self._selection_from_paint_layer()
         if not user_selection:
             # Fallback: an ACTIVE selection mask counts as the selection, so masks
             # converted from paint layers work without a marching-ants selection.
