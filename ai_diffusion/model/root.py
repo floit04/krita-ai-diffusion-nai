@@ -210,7 +210,7 @@ def _read_log(log_path: Path, last_n: int = 1000):
 def collect_diagnostics(redact_user=True):
     import platform
 
-    from .. import __version__
+    from .. import __display_version__
 
     try:
         from krita import Krita
@@ -221,7 +221,7 @@ def collect_diagnostics(redact_user=True):
 
     out = "Krita AI Diffusion Plugin Diagnostics\n"
     out += "-------------------------------------\n"
-    out += f"Plugin Version: {__version__}\n"
+    out += f"Plugin Version: {__display_version__}\n"
     out += f"Krita Version: {krita_version}\n"
     out += f"Python Version: {sys.version}\n"
     out += "-------------------------------------\n"
