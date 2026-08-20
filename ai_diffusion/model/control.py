@@ -4,12 +4,12 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from PyQt5.QtCore import QMetaObject, QObject, Qt, QUuid, pyqtSignal
+from PyQt5.QtCore import QMetaObject, QObject, Qt, QTimer, QUuid, pyqtSignal
 
 from .. import util
 from ..backend import resources
 from ..backend.api import ControlInput
-from ..backend.nai_workflow import nai_auto_resolution, nai_edit_resolution
+from ..backend.nai_workflow import NaiModel, nai_auto_resolution, nai_edit_resolution
 from ..backend.resources import Arch, ControlMode, ResourceKind, resource_id
 from ..document import Document, SelectionModifiers
 from ..image import Bounds, Extent, Image
@@ -74,6 +74,11 @@ class ControlLayer(QObject, ObservableProperties):
         self._model = model
         self._index = index
         self._generate_job: jobs.Job | None = None
+        self._selection_bounds_connection: QMetaObject.Connection | None = None
+        self._selection_target_timer = QTimer(self)
+        self._selection_target_timer.setInterval(100)
+        self._selection_target_timer.setSingleShot(True)
+        self._selection_target_timer.timeout.connect(self._update_selection_target)
         self.layer_id = layer_id
         self.mode = mode
         self._update_is_supported()
@@ -83,11 +88,13 @@ class ControlLayer(QObject, ObservableProperties):
         model.edit_mode_changed.connect(self._update_is_supported)
         root.connection.state_changed.connect(self._update_is_supported)
         self.layer_id_changed.connect(self._update_is_pose_vector)
-        self._selection_bounds_connection: QMetaObject.Connection = (
-            model.document.selection_bounds_changed.connect(self._update_selection_target)
-        )
+        self._sync_selection_bounds_connection()
         model.document_changed.connect(self._update_document)
         model.jobs.job_finished.connect(self._update_active_job)
+
+    @property
+    def model(self):
+        return self._model
 
     @property
     def is_whole_canvas(self):
@@ -102,7 +109,7 @@ class ControlLayer(QObject, ObservableProperties):
     def layer(self):
         if self.layer_id.isNull() or self.is_selection:
             return None
-        layer = self._model.layers.updated().find(self.layer_id)
+        layer = self._model.layers.find(self.layer_id)
         assert layer is not None, "Control layer has been deleted"
         return layer
 
@@ -111,6 +118,7 @@ class ControlLayer(QObject, ObservableProperties):
             if mode is not ControlMode.nai_base and self.is_selection:
                 self.layer_id = QUuid()
             self._mode = mode
+            self._sync_selection_bounds_connection()
             self.mode_changed.emit(mode)
             self._update_is_pose_vector()
             if mode.is_nai:
@@ -129,6 +137,7 @@ class ControlLayer(QObject, ObservableProperties):
     def set_layer_id(self, layer_id: QUuid):
         if layer_id != self.layer_id:
             self._layer_id = layer_id
+            self._sync_selection_bounds_connection()
             self.layer_id_changed.emit(layer_id)
             self.modified.emit(self, "layer_id")
             if self.mode is ControlMode.nai_base:
@@ -174,11 +183,24 @@ class ControlLayer(QObject, ObservableProperties):
         if self.mode is ControlMode.nai_base and self.is_selection and bounds:
             self.set_target_extent(nai_auto_resolution(bounds.extent))
 
+    def _schedule_selection_target_update(self):
+        self._selection_target_timer.start()
+
+    def _sync_selection_bounds_connection(self):
+        if self._selection_bounds_connection is not None:
+            QObject.disconnect(self._selection_bounds_connection)
+            self._selection_bounds_connection = None
+        if self.mode is ControlMode.nai_base and self.is_selection:
+            self._selection_bounds_connection = (
+                self._model.document.selection_bounds_changed.connect(
+                    self._schedule_selection_target_update
+                )
+            )
+        else:
+            self._selection_target_timer.stop()
+
     def _update_document(self, document: Document):
-        QObject.disconnect(self._selection_bounds_connection)
-        self._selection_bounds_connection = document.selection_bounds_changed.connect(
-            self._update_selection_target
-        )
+        self._sync_selection_bounds_connection()
         self._update_selection_target()
 
     @property
@@ -324,7 +346,21 @@ class ControlLayer(QObject, ObservableProperties):
                 elif is_nai_arch and not self.mode.is_nai:
                     self.error_text = _("Not supported for") + " NovelAI"
                     is_supported = False
-                elif self._index >= client.features.max_control_layers:
+                elif is_nai_arch and self.mode.is_nai:
+                    checkpoints = self._model.style.checkpoints
+                    checkpoint = checkpoints[0] if checkpoints else ""
+                    try:
+                        nai_model = NaiModel(checkpoint)
+                    except ValueError:
+                        nai_model = None
+                    if nai_model is not None and nai_model.is_v5:
+                        if self.mode is ControlMode.nai_vibe:
+                            self.error_text = _("Vibe Transfer is not available for NAI V5 yet")
+                            is_supported = False
+                        elif self.mode.is_nai_precise:
+                            self.error_text = _("Precise Reference is not available for NAI V5 yet")
+                            is_supported = False
+                if is_supported and self._index >= client.features.max_control_layers:
                     self.error_text = _("Too many control layers")
                     is_supported = False
                 self.is_supported = is_supported

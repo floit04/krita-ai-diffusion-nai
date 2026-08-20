@@ -364,6 +364,8 @@ class NaiClient(Client):
         ):
             return result  # infill drops vibes (server 500) — don't waste Anlas
         model, _cp = resolve_nai_model(work)
+        if not model.supports_vibe:
+            return result  # V5 launch has no Vibe Transfer; don't spend encoding Anlas
         for i, ctrl in enumerate(cond.control):
             if ctrl.mode is not ControlMode.nai_vibe or ctrl.image is None:
                 continue
@@ -684,9 +686,12 @@ def convert_workflow(
                 precise_ctrls.append(ctrl)
 
     # Server-side compatibility rules (mirrors the launcher):
-    if precise_ctrls and not model.is_v4_5:
+    if precise_ctrls and not model.supports_precise_reference:
         log.warning("NAI Precise Reference requires a V4.5 model, dropping references")
         precise_ctrls = []
+    if vibe_ctrls and not model.supports_vibe:
+        log.warning("NAI V5 does not support Vibe Transfer yet, dropping vibes")
+        vibe_ctrls = []
     if precise_ctrls and vibe_ctrls:
         log.warning("NAI Precise Reference and Vibe Transfer are incompatible, dropping vibes")
         vibe_ctrls = []

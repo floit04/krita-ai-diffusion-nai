@@ -1,0 +1,69 @@
+{
+  "state": "automated_verified",
+  "issue": "Control layer selectors rebuild and load thumbnails on unrelated layer and selection events",
+  "before": {
+    "timestamp": "2026-08-20T23:37:40+08:00",
+    "reproduction": "Add several img2img, Vibe, Precise Reference, or other control layers, then modify a layer or draw/change a selection in Krita.",
+    "expected": "Only controls affected by the event update. Stable layer selectors keep their current item without rebuilding, selection target calculation is coalesced, and thumbnails are loaded only when requested.",
+    "actual": "Every ControlWidget connected to LayerManager.changed clears and rebuilds its combo, synchronously generates whole-canvas and per-layer thumbnails, and restores the selected item. Every ControlLayer also receives every selection-bounds event, while mode changes invoke the layer refresh twice."
+  },
+  "adjacent_working_case": "Adding, removing, moving, or renaming an actual image layer must still update selector contents; changing control mode must add/remove NAI special sources; selection img2img must still auto-calculate its target; concrete-layer controls must retain their selected layer.",
+  "hypothesis": "Unconditional combo rebuilding, eager thumbnail generation, duplicate/untracked signal connections, and globally subscribed selection handlers cause the flicker and avoidable work.",
+  "disproof": "The hypothesis is false if a stable layer-list signature still clears the combo or calls thumbnail(), if non-selection controls still receive selection events, or if selection bursts still emit repeated target changes without settling.",
+  "changed_files": [
+    "ai_diffusion/model/control.py",
+    "ai_diffusion/ui/control.py",
+    "tests/test_model.py",
+    "tests/test_nai.py",
+    "docs/quality-reports/control-layer-refresh-performance.json"
+  ],
+  "rollback": {
+    "kind": "git_commit",
+    "location": "92a895e47d64da9fbe2b821db729e53de5cb0d5f",
+    "artifact_hash": "7329D7D3F7059A3688CC3A5C24129C72BBA89C0CFE554A7AA127741042B19344"
+  },
+  "checks": {
+    "static": [
+      "python -m ruff format <all changed Python files>: passed",
+      "python -m ruff check <all changed Python files>: passed",
+      "python -m pyright <all changed Python files>: 0 errors, 0 warnings",
+      "git diff --check: passed",
+      "python -c import ai_diffusion.ui.control and ai_diffusion.model.control: passed"
+    ],
+    "contract": [
+      "python -m pytest tests/test_nai.py tests/test_model.py tests/test_document.py tests/test_persistence.py tests/test_api.py tests/test_text.py tests/test_layer.py -q: 94 passed",
+      "Three rapid selection-bound changes remain pending during the 100ms coalescing window and produce exactly one target-width change after settling",
+      "Stable layer-list signatures return none, name-only changes return names for in-place updates, and added entries return structure",
+      "Stable selector snapshots return without any combo mutation; name and structural changes are reconciled item-by-item without clear(), preserving the selected layer",
+      "Layer selector reconciliation no longer calls thumbnail generation; thumbnails are requested by QComboBox.highlighted and cached per item",
+      "ControlWidget layer/style connections are tracked by disconnect_all and control mode has exactly one layer-list refresh connection"
+    ],
+    "negative_controls": [
+      "NAI Vibe controls have no selection-bounds connection and no active selection target timer",
+      "Switching img2img from Selection to a concrete layer disconnects selection updates and preserves its target through later selection changes",
+      "Layer add/remove/move/name polling tests remain passing",
+      "Selection img2img, document-wrapper replacement, lasso transient selection, persistence, NAI request, and concrete-layer generation tests remain passing",
+      "Runnable fast suite excluding Python 3.11-only collection files: 324 passed, 32 skipped; 7 environment setup errors require tests/server"
+    ],
+    "build_deploy": [
+      "Final installed plugin backed up at C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-backups\\20260820-235900",
+      "Updated model/control.py and ui/control.py deployed to C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita\\ai_diffusion",
+      "Deployed artifact comparison: 647 files including ai_diffusion.desktop checked with 0 missing or hash-mismatched files",
+      "Deployed manifest SHA-256: 02958807C6B0E8D9017623C937717963174D000F933C09E80FE5DC1AD23ED1D6",
+      "User settings.json and nai_vibe_cache.json remained present after deployment",
+      "Krita process 20228 was left running and was not forcibly closed"
+    ],
+    "runtime": [],
+    "quality": []
+  },
+  "remaining_risks": [
+    "The exact frequency and wall-clock cost in the production Krita document has not yet been instrumented after deployment.",
+    "Krita host interaction and selector flicker require manual verification after restart.",
+    "Krita was running during deployment, so the new Python source requires a restart before host verification.",
+    "tests/test_workflow.py and tests/test_image_transfer.py cannot collect under the installed Python 3.10 because datetime.UTC requires Python 3.11 or newer.",
+    "Seven unrelated fast-suite tests require a local tests/server ComfyUI installation."
+  ],
+  "manual_verification": [
+    "Restart Krita, add multiple NAI controls, repeatedly paint, rename layers, switch active layers, and draw selections; confirm selectors do not flicker and interaction remains responsive."
+  ]
+}

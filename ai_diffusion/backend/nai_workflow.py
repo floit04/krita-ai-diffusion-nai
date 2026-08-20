@@ -19,7 +19,10 @@ from ..settings import ImageFileFormat
 
 
 class NaiModel(Enum):
-    # V4.5 models (latest, default)
+    # V5 models (latest)
+    v5_curated = "nai-diffusion-5-curated"
+    v5_full = "nai-diffusion-5-full"
+    # V4.5 models
     v4_5_curated = "nai-diffusion-4-5-curated"
     v4_5_full = "nai-diffusion-4-5-full"
     # V4 models
@@ -33,12 +36,14 @@ class NaiModel(Enum):
 
     @staticmethod
     def default():
-        return NaiModel.v4_5_curated
+        return NaiModel.v5_curated
 
     @staticmethod
     def list_generate():
         """Models available for text-to-image / img2img."""
         return [
+            NaiModel.v5_curated,
+            NaiModel.v5_full,
             NaiModel.v4_5_curated,
             NaiModel.v4_5_full,
             NaiModel.v4_curated,
@@ -50,6 +55,8 @@ class NaiModel(Enum):
     def list_display():
         """Human-readable names for UI display."""
         return {
+            NaiModel.v5_curated: "NAI Diffusion V5 (Curated)",
+            NaiModel.v5_full: "NAI Diffusion V5 (Full)",
             NaiModel.v4_5_curated: "NAI Diffusion V4.5 (Curated)",
             NaiModel.v4_5_full: "NAI Diffusion V4.5 (Full)",
             NaiModel.v4_curated: "NAI Diffusion V4 (Curated)",
@@ -66,8 +73,15 @@ class NaiModel(Enum):
         return self in (NaiModel.v4_5_curated, NaiModel.v4_5_full)
 
     @property
+    def is_v5(self):
+        return self in (NaiModel.v5_curated, NaiModel.v5_full)
+
+    @property
     def is_v4(self):
+        """Whether this model uses the V4+ structured prompt request fields."""
         return self in (
+            NaiModel.v5_curated,
+            NaiModel.v5_full,
             NaiModel.v4_5_curated,
             NaiModel.v4_5_full,
             NaiModel.v4_curated,
@@ -85,16 +99,38 @@ class NaiModel(Enum):
 
     @property
     def is_curated(self):
-        return self in (NaiModel.v4_5_curated, NaiModel.v4_curated)
+        return self in (NaiModel.v5_curated, NaiModel.v4_5_curated, NaiModel.v4_curated)
+
+    @property
+    def supports_vibe(self):
+        return not self.is_v5
+
+    @property
+    def supports_precise_reference(self):
+        return self.is_v4_5
+
+    @property
+    def supports_variety_plus(self):
+        return not self.is_v5
 
     @property
     def inpaint_model(self):
-        """Return the corresponding inpaint model, or self if V4/V4.5 (uses same model)."""
+        """Return the corresponding legacy inpaint enum when one exists."""
         if self is NaiModel.v3:
             return NaiModel.v3_inpaint
         if self is NaiModel.v3_furry:
             return NaiModel.v3_furry_inpaint
         return self
+
+    @property
+    def inpaint_model_name(self):
+        if self is NaiModel.v5_curated:
+            # The official V5 launch temporarily routes Curated inpainting through
+            # V4.5 Curated until the dedicated V5 Curated inpainting model ships.
+            return f"{NaiModel.v4_5_curated.value}-inpainting"
+        if self.is_v3:
+            return self.inpaint_model.value
+        return f"{self.value}-inpainting"
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +144,8 @@ class NaiModel(Enum):
 # generated image to report the toggle as on (and to actually get the boost).
 # Ported verbatim from the reference launcher's QualityTags (api_constants.dart).
 _NAI_QUALITY_TAGS: dict[NaiModel, str] = {
+    NaiModel.v5_full: "very aesthetic, masterpiece, no text",
+    NaiModel.v5_curated: "very aesthetic, masterpiece, no text",
     NaiModel.v4_5_full: "location, very aesthetic, masterpiece, no text",
     NaiModel.v4_5_curated: "location, masterpiece, no text, -0.8::feet::, rating:general",
     NaiModel.v4_full: "no text, best quality, very aesthetic, absurdres",
@@ -389,7 +427,9 @@ def build_generate_request(
     # "karras". Sending "native" to V4 is a primary cause of grid/overexposure.
     # Reference: nai_image_request_builder.dart L83-85.
     ns = noise_schedule.value
-    if model.is_v4 and ns == "native":
+    if model.is_v5:
+        ns = NaiNoiseSchedule.karras.value
+    elif model.is_v4 and ns == "native":
         ns = "karras"
 
     # add_original_image: True for ALL actions, including infill. This matches the
@@ -402,7 +442,7 @@ def build_generate_request(
     add_original_image = True
 
     parameters: dict[str, Any] = {
-        "params_version": 3,
+        "params_version": 4 if model.is_v5 else 3,
         "width": width,
         "height": height,
         "scale": scale,
@@ -432,14 +472,12 @@ def build_generate_request(
         "prefer_brownian": True,
     }
 
-    # Variety+ — skip CFG above a resolution-dependent sigma threshold. The
-    # launcher always sends this key (null when disabled). Reference L97-99.
-    if variety_plus:
-        parameters["skip_cfg_above_sigma"] = 58.0 * math.sqrt(
-            4.0 * (width / 8) * (height / 8) / 63232
+    # Variety+ — skip CFG above a resolution-dependent sigma threshold. V5 does
+    # not support CFG delay at launch, so its request must omit the field.
+    if model.supports_variety_plus:
+        parameters["skip_cfg_above_sigma"] = (
+            58.0 * math.sqrt(4.0 * (width / 8) * (height / 8) / 63232) if variety_plus else None
         )
-    else:
-        parameters["skip_cfg_above_sigma"] = None
 
     # SMEA (sm/sm_dyn) and the separate `uc` field are V3-only. V4/V4.5 must NOT
     # receive them. Reference L101-116.
@@ -484,7 +522,7 @@ def build_generate_request(
         parameters["mask"] = mask
 
     # Vibe Transfer references (must be encodings from ai/encode-vibe for V4+)
-    if reference_image_multiple:
+    if reference_image_multiple and model.supports_vibe:
         parameters["reference_image_multiple"] = reference_image_multiple
         parameters["reference_strength_multiple"] = reference_strength_multiple or [0.6] * len(
             reference_image_multiple
@@ -495,7 +533,7 @@ def build_generate_request(
 
     # Precise (director) reference — field-by-field from the launcher's
     # buildPreciseReferenceParameters (nai_image_request_builder.dart L349-385).
-    if precise_references:
+    if precise_references and model.supports_precise_reference:
         parameters["normalize_reference_strength_multiple"] = True
         parameters["director_reference_images"] = [r["image"] for r in precise_references]
         parameters["director_reference_descriptions"] = [
@@ -513,7 +551,7 @@ def build_generate_request(
             r["secondary"] for r in precise_references
         ]
 
-    # V4 structured prompt + structural flags. Reference buildV4Parameters L121-189.
+    # V4+ structured prompt + structural flags. Reference buildV4Parameters L121-189.
     if model.is_v4:
         parameters["use_coords"] = False
         parameters["legacy_v3_extend"] = False
@@ -525,15 +563,10 @@ def build_generate_request(
             parameters["v4_negative_prompt"] = v4_negative_prompt
 
     # Determine the actual model name for the API request.
-    # All NAI models require "-inpainting" model variant for infill action.
-    # v3: use dedicated inpaint_model enum (already has "-inpainting" suffix)
-    # v4/v4.5: append "-inpainting" suffix (no separate enum variant)
-    # Reference: ComfyUI-NAIDGenerator nodes.py L398
+    # Infill uses the provider's dedicated model. At the V5 launch, Full has a
+    # native V5 inpainting model while Curated officially falls back to V4.5.
     if action is NaiAction.infill:
-        if model.is_v3:
-            model_name = model.inpaint_model.value
-        else:
-            model_name = model.value + "-inpainting"
+        model_name = model.inpaint_model_name
     else:
         model_name = model.value
 

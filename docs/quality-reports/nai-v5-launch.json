@@ -1,0 +1,74 @@
+{
+  "state": "automated_verified",
+  "issue": "NovelAI Diffusion V5 and V5 Full inpainting are absent from the Krita plugin",
+  "before": {
+    "timestamp": "2026-08-21T06:41:21+08:00",
+    "reproduction": "Connect the NovelAI backend and open the NovelAI style model selector, then attempt text generation or selected-region inpainting with a V5 model.",
+    "expected": "V5 Curated and V5 Full are selectable; V5 Full inpainting uses nai-diffusion-5-full-inpainting; V5 Curated inpainting follows the official temporary fallback to nai-diffusion-4-5-curated-inpainting; unsupported V5 references are not sent or encoded.",
+    "actual": "The built-in model registry ends at V4.5, no V5 styles exist, and manually supplied V5 Curated would be routed to the unavailable nai-diffusion-5-curated-inpainting model while Vibe could incur an unsupported encode-vibe request."
+  },
+  "adjacent_working_case": "V4.5 Curated and Full generation, img2img, inpainting, Vibe Transfer, and Precise Reference must retain their existing request behavior.",
+  "hypothesis": "Adding the production V5 model identifiers and model-specific capability/routing rules at the NAI request boundary is sufficient to expose V5 without changing the established V4.5 path.",
+  "disproof": "The hypothesis is false if V5 requests require an undocumented endpoint or incompatible payload, if V5 Curated infill selects its unavailable V5 inpainting identifier, if a V5 Vibe control reaches encode-vibe, or if V4.5 request contracts change.",
+  "changed_files": [
+    "ai_diffusion/backend/nai_client.py",
+    "ai_diffusion/backend/nai_workflow.py",
+    "ai_diffusion/model/control.py",
+    "ai_diffusion/settings.py",
+    "ai_diffusion/ui/style.py",
+    "ai_diffusion/styles/nai-v5-curated.json",
+    "ai_diffusion/styles/nai-v5-full.json",
+    "README_NAI.md",
+    "tests/test_nai.py",
+    "tests/test_model.py",
+    "docs/quality-reports/nai-v5-launch.json"
+  ],
+  "rollback": {
+    "kind": "file_backup",
+    "location": "C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-dev-backups\\nai-v5-before-20260821-064120",
+    "artifact_hash": "79AED3302869FB29957CE8243999DB0E95CD247160627F35792D770244F08C47"
+  },
+  "checks": {
+    "static": [
+      "python -m ruff format <all changed Python files>: passed",
+      "python -m ruff check <all changed Python files>: passed",
+      "python -m pyright <all changed Python files>: 0 errors, 0 warnings",
+      "git diff --check: passed",
+      "Full-repository pyright reached unrelated pre-existing/environment errors in extension.py, ui/settings.py, optional script dependencies, and Python 3.10 datetime.UTC; no changed-file errors"
+    ],
+    "contract": [
+      "Official production pages and build 2a59d1f-production inspected on 2026-08-21: V5 Curated and Full model IDs, V5 Full inpainting launch, and temporary V4.5 Curated inpainting fallback confirmed",
+      "Current official _app bundle maps V5 Curated inpaint to nai-diffusion-4-5-curated-inpainting and V5 Full inpaint to nai-diffusion-5-full-inpainting",
+      "python -m pytest tests/test_nai.py tests/test_model.py -q: 43 passed",
+      "V5 Full generation contract verifies model ID, params_version 4, karras schedule, and omitted unsupported CFG-delay field",
+      "V5 Full img2img source scaling, action/model ID, strength/noise, params_version, and schedule are covered at the final request boundary",
+      "V5 Full and Curated inpainting routing, V5 quality tags, model registry/default/display, and built-in style defaults are covered",
+      "Runnable fast suite excluding Python 3.11-only collection files: 331 passed, 32 skipped; 7 environment setup errors require tests/server"
+    ],
+    "negative_controls": [
+      "V5 Vibe controls return before ai/encode-vibe and the paid binary endpoint mock is never awaited",
+      "V5 requests drop all Vibe Transfer and Precise Reference fields at both conversion and request boundaries",
+      "V5 control-layer UI marks Vibe Transfer and Precise Reference unsupported while img2img remains supported",
+      "Existing V4.5 Vibe, Precise Reference, img2img, inpainting, selection, restore-resolution, and performance tests remain passing",
+      "No real image-generation request was sent and no Anlas was spent"
+    ],
+    "build_deploy": [
+      "Installed plugin backed up at C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-backups\\20260821-065315",
+      "657 source artifacts deployed to C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita with 0 missing or SHA-256 mismatches",
+      "Deployed manifest SHA-256: FFA701D096B671371D3831C47BDDDC81A1DB8092AE33D1B1C1CCE554FBDD262F",
+      "User settings.json and nai_vibe_cache.json remained present after deployment",
+      "Krita process 29064 was left running and was not forcibly closed"
+    ],
+    "runtime": [],
+    "quality": []
+  },
+  "remaining_risks": [
+    "NovelAI's Swagger model enum is stale; production model identifiers and capability rules were obtained from the official 2026-08-20 update page and current production frontend bundle.",
+    "No paid real generation has been authorized or performed, so server acceptance and visual parity still need a small manual smoke test.",
+    "The repository has no .venv; full fast-suite collection is blocked under the installed Python 3.10 by datetime.UTC, and seven unrelated client tests require tests/server.",
+    "Krita was running during deployment, so the new Python source requires a restart before host verification."
+  ],
+  "manual_verification": [
+    "After deployment and Krita restart, select each V5 style and run text generation, img2img, and a small selected-region inpaint; inspect image metadata and visual output."
+  ]
+}

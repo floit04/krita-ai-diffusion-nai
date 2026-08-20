@@ -1,20 +1,21 @@
 # Krita AI Diffusion — NovelAI 版
 
-基于 [Acly/krita-ai-diffusion](https://github.com/Acly/krita-ai-diffusion)(v1.52.1)的分支,为 Krita 接入 **NovelAI 图像生成 API**(V4 / V4.5 系列模型),无需本地显卡和 ComfyUI。原插件的 ComfyUI / 云端功能保持不变,NovelAI 作为第四种后端并存。
+基于 [Acly/krita-ai-diffusion](https://github.com/Acly/krita-ai-diffusion)(v1.52.1)的分支,为 Krita 接入 **NovelAI 图像生成 API**(V4 / V4.5 / V5 系列模型),无需本地显卡和 ComfyUI。原插件的 ComfyUI / 云端功能保持不变,NovelAI 作为第四种后端并存。
 
 参数与算法参考了 NovelAI 官网前端与 Aaalice NAI Launcher 的实现。
 
 ## 功能
 
-- **文生图**:V4 / V4.5(curated / full)模型,支持风格预设、质量标签、负面预设、Variety+、SMEA 等
+- **文生图**:V4 / V4.5 / V5(curated / full)模型,支持风格预设、质量标签和负面预设等;V5 默认使用官方 23 步、CFG 7、Euler Ancestral、Karras 参数
 - **局部重绘(Inpaint)**:画选区直接重绘,使用 NAI 官方 `-inpainting` 重绘模型
+  - V5 Full 使用 `nai-diffusion-5-full-inpainting`;V5 Curated 的专用重绘模型尚未上线,按官网当前行为临时回退 V4.5 Curated Inpainting
   - 重绘幅度滑块真实有效(见下方"技术备注")
   - 蒙版严格按 8px latent 网格对齐,结果以透明补丁形式贴回画布——选区外像素零改动、无色偏、无黑边
 - **整图重绘**:无选区时把强度滑块调到 100% 以下即可
 - **NAI 专属控制层**(点"+"添加,按图层选择参考图,悬停可预览缩略图):
   - **图生图**:选一个图层(取完整原图拉伸)或"整张画布"(截取画布窗口)作为底图;强度(默认 0.7)和噪声(默认 0)在展开面板里独立调节,与主滑块无关
-  - **Vibe Transfer**:可挂多层,每层独立强度 / 信息提取度;V4+ 需经官方 `encode-vibe` 预编码(**每张图 2 Anlas**),编码结果按图片内容持久缓存,同一张图永远只付一次
-  - **精准参考(Director Reference)**:角色 / 风格 / 角色&风格三种类型,强度 + 保真度可调;仅 V4.5 模型可用
+  - **Vibe Transfer**:可挂多层,每层独立强度 / 信息提取度;V4 / V4.5 需经官方 `encode-vibe` 预编码(**每张图 2 Anlas**),编码结果按图片内容持久缓存,同一张图永远只付一次;V5 首发暂不支持,插件不会发起付费编码
+  - **精准参考(Director Reference)**:角色 / 风格 / 角色&风格三种类型,强度 + 保真度可调;目前仅 V4.5 模型可用,V5 首发暂不支持
   - Vibe 与精准参考取图**严格用图层完整原图**(不裁剪到画布、不缩放)
 - **多 Token 管理**:设置页可保存多个 NAI 账号 token 并切换,显示订阅等级与 Anlas 余额
 
@@ -53,7 +54,7 @@ Krita 的 AI 面板 → 右上角齿轮 → **连接** 页 → 选 **NovelAI** �
 **方式二:粘贴 Persistent Token**
 在 [novelai.net](https://novelai.net) 登录后到 **Account → Get Persistent API Token** 复制 `pst-` 开头的令牌,粘贴后点连接。
 
-登录成功后到 **NovelAI 风格** 页选择模型(推荐 `nai-diffusion-4-5-full`)并调整采样参数。
+登录成功后到 **NovelAI 风格** 页选择模型。默认推荐 `nai-diffusion-5-curated`;需要 V5 原生局部重绘时请选择 `nai-diffusion-5-full`。
 
 > 令牌只保存在本机 Krita 配置目录(`%APPDATA%\krita\ai_diffusion\settings.json`),不会进入本仓库。**密码和邮箱一律不落盘**,登录框关掉就没了。
 

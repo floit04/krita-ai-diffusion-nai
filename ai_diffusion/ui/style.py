@@ -24,10 +24,10 @@ from PyQt5.QtWidgets import (
 )
 
 from ..backend.client import filter_supported_styles, resolve_arch
+from ..backend.nai_workflow import NaiNoiseSchedule, NaiUCPreset
 from ..backend.resources import Arch, ResourceId, ResourceKind, search_paths
 from ..backend.server import Server
 from ..files import File, FileFilter, FileFormat, FileSource
-from ..backend.nai_workflow import NaiNoiseSchedule, NaiUCPreset
 from ..localization import translate as _
 from ..model.root import root
 from ..settings import ServerMode, Setting, settings
@@ -768,9 +768,7 @@ class StylePresets(SettingsTab):
         self._nai_uc_preset = add(
             "nai_uc_preset", ComboBoxSetting(StyleSettings.nai_uc_preset, parent=self)
         )
-        uc_items = [
-            (p.display_name, p.value) for p in NaiUCPreset
-        ]
+        uc_items = [(p.display_name, p.value) for p in NaiUCPreset]
         self._nai_uc_preset.set_items(uc_items)
 
         self._nai_quality_toggle = add(
@@ -782,7 +780,8 @@ class StylePresets(SettingsTab):
         )
 
         self._nai_cfg_rescale = add(
-            "nai_cfg_rescale", SliderSetting(StyleSettings.nai_cfg_rescale, self, 0.0, 1.0, "{:.2f}")
+            "nai_cfg_rescale",
+            SliderSetting(StyleSettings.nai_cfg_rescale, self, 0.0, 1.0, "{:.2f}"),
         )
 
         self._nai_noise_schedule = add(
@@ -853,11 +852,13 @@ class StylePresets(SettingsTab):
         if self._nai_only:
             # New styles on the NovelAI page default to a NAI model so they land
             # on this page (checkpoint prefix + architecture both mark them NAI).
-            new_style = Styles.list().create(checkpoint="nai-diffusion-4-5-full")
+            new_style = Styles.list().create(checkpoint="nai-diffusion-5-curated")
             new_style.architecture = Arch.nai
             new_style.sampler = "NAI - Euler Ancestral"
             new_style.live_sampler = "NAI - Euler Ancestral"  # not the SD Hyper preset
             new_style.style_prompt = ""
+            new_style.cfg_scale = 7.0
+            new_style.live_cfg_scale = 7.0
             new_style.save()
         else:
             cp = self._checkpoint_select.value
@@ -921,8 +922,6 @@ class StylePresets(SettingsTab):
     @staticmethod
     def _is_nai_style(style: Style) -> bool:
         """Return True if the style uses a NovelAI architecture."""
-        from ..backend.resources import Arch
-        from ..backend.client import resolve_arch
         arch = resolve_arch(style, root.connection.client_if_connected)
         if arch is Arch.nai:
             return True

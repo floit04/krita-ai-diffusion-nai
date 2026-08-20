@@ -212,7 +212,7 @@ class Settings(QObject):
     nai_model: str
     _nai_model = Setting(
         _("Default Model"),
-        "nai-diffusion-4-5-curated",
+        "nai-diffusion-5-curated",
         _("NovelAI model to use for generation"),
     )
 
@@ -226,7 +226,7 @@ class Settings(QObject):
     nai_cfg_scale: float
     _nai_cfg_scale = Setting(
         _("Prompt Guidance"),
-        5.0,
+        7.0,
         _("CFG scale — how strongly the image follows the prompt"),
     )
 
@@ -672,7 +672,7 @@ class Settings(QObject):
 
     def get_active_nai_token(self) -> str:
         """Return the currently active NovelAI API token string.
-        
+
         If nai_tokens list is populated, use nai_active_token_index to pick.
         Otherwise fall back to legacy nai_api_token string.
         """

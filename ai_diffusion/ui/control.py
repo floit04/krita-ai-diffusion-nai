@@ -22,12 +22,26 @@ from ..localization import translate as _
 from ..model.control import ControlLayer, ControlLayerList
 from ..model.control_utils import nai_selection_layer_id
 from ..model.properties import Binding, bind, bind_combo, bind_toggle
-from ..model.root import root
 from . import theme
 from .interval_slider import IntervalSlider
 from .theme import SignalBlocker
 
 _thumbnail_extent = Extent(192, 192)
+_layer_kind_role = int(Qt.ItemDataRole.UserRole) + 1
+
+
+def _layer_list_change(
+    previous: tuple[tuple[str, str, str], ...] | None,
+    current: tuple[tuple[str, str, str], ...],
+):
+    if previous == current:
+        return "none"
+    if previous is not None:
+        previous_keys = tuple((kind, layer_id) for kind, _name, layer_id in previous)
+        current_keys = tuple((kind, layer_id) for kind, _name, layer_id in current)
+        if previous_keys == current_keys:
+            return "names"
+    return "structure"
 
 
 def _thumbnail_tooltip(image: QImage | None, title: str) -> str:
@@ -52,7 +66,11 @@ class ControlWidget(QWidget):
         super().__init__(parent)
         self._control_list = control_list
         self._control = control
+        self._model = control.model
         self._connections: list[QMetaObject.Connection | Binding] = []
+        self._layer_snapshot: tuple[tuple[str, str, str], ...] | None = None
+        self._thumbnail_cache: dict[tuple[str, str], QImage | None] = {}
+        self._loaded_tooltips: set[tuple[str, str]] = set()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -67,9 +85,8 @@ class ControlWidget(QWidget):
         self.layer_select.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLength
         )
+        self.layer_select.highlighted.connect(self._ensure_layer_tooltip)
         self._update_layers()
-        root.active_model.layers.changed.connect(self._update_layers)
-        control.mode_changed.connect(self._update_layers)
 
         self.preset_slider = QSlider(self)
         self.preset_slider.setOrientation(Qt.Orientation.Horizontal)
@@ -258,15 +275,16 @@ class ControlWidget(QWidget):
             control.mode_changed.connect(self._update_layers),
             control.mode_changed.connect(self._update_custom_values),
             control.is_pose_vector_changed.connect(self._update_pose_utils),
-            root.active_model.style_changed.connect(self._update_visibility),
-            root.active_model.style_changed.connect(self._update_modes),
+            self._model.layers.changed.connect(self._update_layers),
+            self._model.style_changed.connect(self._update_visibility),
+            self._model.style_changed.connect(self._update_modes),
         ]
 
     def disconnect_all(self):
         Binding.disconnect_all(self._connections)
 
     def _update_modes(self):
-        is_nai = root.active_model.arch is Arch.nai
+        is_nai = self._model.arch is Arch.nai
         modes = [m for m in ControlMode if not m.is_internal and m.is_nai == is_nai]
         if self._control.mode not in modes:
             modes.insert(0, self._control.mode)  # keep showing the stored mode
@@ -285,7 +303,7 @@ class ControlWidget(QWidget):
             # reference layers may extend beyond the canvas and are sent uncropped,
             # so the preview must reflect the full layer, not the canvas crop.
             bounds = getattr(layer, "full_bounds", None) or layer.bounds
-            extent = bounds.extent if not bounds.is_zero else root.active_model.document.extent
+            extent = bounds.extent if not bounds.is_zero else self._model.document.extent
             scale = min(
                 _thumbnail_extent.width / max(extent.width, 1),
                 _thumbnail_extent.height / max(extent.height, 1),
@@ -295,46 +313,99 @@ class ControlWidget(QWidget):
         except Exception:
             return None
 
-    def _update_layers(self):
-        layers = reversed(root.active_model.layers.images)
+    def _layer_entries(self):
+        layers = list(reversed(self._model.layers.images))
         is_nai_mode = self._control.mode.is_nai
+        entries: list[tuple[str, str, QUuid]] = []
+        if is_nai_mode:
+            entries.append(("canvas", "整张画布", QUuid()))
+        if self._control.mode is ControlMode.nai_base:
+            entries.append(("selection", "选区", nai_selection_layer_id))
+        entries.extend(("layer", layer.name, layer.id) for layer in layers)
+        return entries
+
+    def _insert_layer_item(self, item: int, kind: str, name: str, layer_id: QUuid):
+        if kind == "canvas":
+            self.layer_select.insertItem(item, theme.icon("workspace-generation"), name, layer_id)
+        elif kind == "selection":
+            self.layer_select.insertItem(item, theme.icon("generate-region"), name, layer_id)
+        else:
+            self.layer_select.insertItem(item, name, layer_id)
+        self.layer_select.setItemData(item, kind, _layer_kind_role)
+        tooltip = "当前选区内可见图层的合成图像" if kind == "selection" else name
+        self.layer_select.setItemData(item, tooltip, Qt.ItemDataRole.ToolTipRole)
+
+    def _ensure_layer_tooltip(self, index: int):
+        if index < 0 or index >= self.layer_select.count():
+            return
+        kind = self.layer_select.itemData(index, _layer_kind_role)
+        if kind == "selection":
+            return
+        layer_id: QUuid = self.layer_select.itemData(index)
+        key = (kind, layer_id.toString())
+        if key in self._loaded_tooltips:
+            return
+        if key not in self._thumbnail_cache:
+            layer = (
+                self._model.layers.root if kind == "canvas" else self._model.layers.find(layer_id)
+            )
+            self._thumbnail_cache[key] = self._layer_thumbnail(layer) if layer else None
+        title = self.layer_select.itemText(index)
+        tooltip = _thumbnail_tooltip(self._thumbnail_cache[key], title)
+        self.layer_select.setItemData(index, tooltip, Qt.ItemDataRole.ToolTipRole)
+        self._loaded_tooltips.add(key)
+
+    def _update_layers(self):
+        entries = self._layer_entries()
+        snapshot = tuple((kind, name, layer_id.toString()) for kind, name, layer_id in entries)
+        change = _layer_list_change(self._layer_snapshot, snapshot)
+        if change == "none":
+            return
+
+        keys = tuple((kind, layer_id.toString()) for kind, _name, layer_id in entries)
+        self._loaded_tooltips.clear()
         with SignalBlocker(self.layer_select):
-            self.layer_select.clear()
-            index = -1
-            if is_nai_mode:  # NAI modes may use the flattened canvas as source
-                self.layer_select.addItem(theme.icon("workspace-generation"), "整张画布", QUuid())
-                canvas_thumb = self._layer_thumbnail(root.active_model.layers.root)
-                self.layer_select.setItemData(
-                    0, _thumbnail_tooltip(canvas_thumb, "整张画布"), Qt.ItemDataRole.ToolTipRole
-                )
-                if self._control.layer_id.isNull():
-                    index = 0
-            if self._control.mode is ControlMode.nai_base:
-                self.layer_select.addItem(
-                    theme.icon("generate-region"), "选区", nai_selection_layer_id
-                )
-                item = self.layer_select.count() - 1
-                self.layer_select.setItemData(
-                    item,
-                    "当前选区内可见图层的合成图像",
-                    Qt.ItemDataRole.ToolTipRole,
-                )
-                if self._control.is_selection:
-                    index = item
-            for layer in layers:
-                self.layer_select.addItem(layer.name, layer.id)
-                item = self.layer_select.count() - 1
-                self.layer_select.setItemData(
-                    item,
-                    _thumbnail_tooltip(self._layer_thumbnail(layer), layer.name),
-                    Qt.ItemDataRole.ToolTipRole,
-                )
-                if layer.id == self._control.layer_id:
-                    index = item
+            for item, (kind, name, layer_id) in enumerate(entries):
+                key = (kind, layer_id.toString())
+                current_key = None
+                if item < self.layer_select.count():
+                    current_kind = self.layer_select.itemData(item, _layer_kind_role)
+                    current_id: QUuid = self.layer_select.itemData(item)
+                    current_key = (current_kind, current_id.toString())
+                if current_key != key:
+                    existing = next(
+                        (
+                            i
+                            for i in range(item + 1, self.layer_select.count())
+                            if (
+                                self.layer_select.itemData(i, _layer_kind_role),
+                                self.layer_select.itemData(i).toString(),
+                            )
+                            == key
+                        ),
+                        -1,
+                    )
+                    if existing >= 0:
+                        self.layer_select.removeItem(existing)
+                    self._insert_layer_item(item, kind, name, layer_id)
+                else:
+                    self.layer_select.setItemText(item, name)
+                    tooltip = "当前选区内可见图层的合成图像" if kind == "selection" else name
+                    self.layer_select.setItemData(item, tooltip, Qt.ItemDataRole.ToolTipRole)
+
+            while self.layer_select.count() > len(entries):
+                self.layer_select.removeItem(self.layer_select.count() - 1)
+
+            index = self.layer_select.findData(self._control.layer_id)
             if index == -1 and self._control_list and self._control in self._control_list:
                 self.remove()
             elif index >= 0:
                 self.layer_select.setCurrentIndex(index)
+        self._layer_snapshot = snapshot
+        valid_keys = set(keys)
+        self._thumbnail_cache = {
+            key: image for key, image in self._thumbnail_cache.items() if key in valid_keys
+        }
 
     def remove(self):
         assert self._control_list is not None
@@ -347,12 +418,12 @@ class ControlWidget(QWidget):
     def _add_pose_character(self):
         layer = self._control.layer
         assert layer is not None
-        root.active_model.document.add_pose_character(layer)
+        self._model.document.add_pose_character(layer)
 
     def _update_visibility(self):
         is_small = self.width() < 420
         is_pose = self._control.mode is ControlMode.pose
-        is_edit = root.active_model.arch.supports_edit
+        is_edit = self._model.arch.supports_edit
         is_nai = self._control.mode.is_nai
         # All NAI modes have per-layer knobs in the extended panel: img2img gets
         # strength + noise, vibe gets strength + information extracted, precise

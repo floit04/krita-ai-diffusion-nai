@@ -342,6 +342,32 @@ async def test_nai_img2img_target_auto_fill_snap_and_aspect_adapt(workflows_dir:
 
 
 @qtapp
+async def test_nai_v5_marks_unavailable_reference_controls_as_unsupported(
+    workflows_dir: Path,
+):
+    krita_doc = Krita.instance().openDocument("test")
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+
+        vibe = model.regions.control.emplace()
+        vibe.set_mode(ControlMode.nai_vibe)
+        precise = model.regions.control.emplace()
+        precise.set_mode(ControlMode.nai_precise_character)
+        base = model.regions.control.emplace()
+        base.set_mode(ControlMode.nai_base)
+
+        assert not vibe.is_supported
+        assert "Vibe Transfer" in vibe.error_text
+        assert not precise.is_supported
+        assert "Precise Reference" in precise.error_text
+        assert base.is_supported
+        await asyncio.sleep(0)
+
+
+@qtapp
 async def test_nai_img2img_selection_uses_visible_projection_and_selection_bounds(
     workflows_dir: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -446,6 +472,57 @@ async def test_nai_img2img_selection_target_follows_replaced_document_wrapper(
         replacement._poll()  # type: ignore[attr-defined]
         assert control.target_extent == Extent(1216, 832)
         await asyncio.sleep(0)
+
+
+@qtapp
+async def test_nai_selection_target_updates_are_coalesced_and_only_subscribed_when_needed(
+    workflows_dir: Path,
+):
+    krita_doc = Krita.instance().openDocument("test")
+    selection = Selection()
+    selection.setPixelData(QByteArray(bytes([0xFF] * 192 * 192)), 20, 30, 192, 192)
+    krita_doc.setSelection(selection)
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+
+        base = model.regions.control.emplace()
+        base.set_mode(ControlMode.nai_base)
+        base.set_layer_id(nai_selection_layer_id)
+        vibe = model.regions.control.emplace()
+        vibe.set_mode(ControlMode.nai_vibe)
+
+        assert base._selection_bounds_connection is not None
+        assert vibe._selection_bounds_connection is None
+        width_changes: list[int] = []
+        base.target_width_changed.connect(width_changes.append)
+
+        for width, height in ((256, 192), (320, 192), (384, 128)):
+            selection = Selection()
+            selection.setPixelData(
+                QByteArray(bytes([0xFF] * width * height)), 20, 30, width, height
+            )
+            krita_doc.setSelection(selection)
+            model.document._poll()  # type: ignore[attr-defined]
+
+        assert base._selection_target_timer.isActive()
+        assert width_changes == []
+        await asyncio.sleep(0.12)
+        assert base.target_extent == Extent(1792, 576)
+        assert width_changes == [1792]
+        assert not vibe._selection_target_timer.isActive()
+
+        base.set_layer_id(model.layers.active.id)
+        assert base._selection_bounds_connection is None
+        preserved = base.target_extent
+        selection = Selection()
+        selection.setPixelData(QByteArray(bytes([0xFF] * 128 * 384)), 10, 10, 128, 384)
+        krita_doc.setSelection(selection)
+        model.document._poll()  # type: ignore[attr-defined]
+        await asyncio.sleep(0.12)
+        assert base.target_extent == preserved
 
 
 @qtapp
