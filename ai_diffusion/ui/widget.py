@@ -367,11 +367,12 @@ class StyleSelectWidget(QWidget):
         if root.connection.state is not ConnectionState.connected:
             return
         client = root.connection.client_if_connected
-        filtered = filter_supported_styles(Styles.list().filtered(), client)
+        styles = Styles.list()
+        filtered = filter_supported_styles(styles.selectable(), client)
         recent, remaining = sort_recent_styles(
             filtered, settings.recent_styles, settings.recent_styles_count
         )
-        if self._value not in chain(recent, remaining):
+        if self._value not in chain(recent, remaining) and styles.is_selectable(self._value):
             recent.insert(0, self._value)
         self._styles = recent + remaining
         with SignalBlocker(self._combo):

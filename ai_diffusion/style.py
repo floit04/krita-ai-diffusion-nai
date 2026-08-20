@@ -360,6 +360,12 @@ class Styles(QObject):
             show_builtin = settings.show_builtin_styles
         return [s for s in self._list if show_builtin or not self.is_builtin(s)]
 
+    def selectable(self, show_builtin: bool | None = None):
+        return [s for s in self.filtered(show_builtin) if self.is_selectable(s)]
+
+    def is_selectable(self, style: Style):
+        return not (self.is_builtin(style) and is_nai_style(style))
+
     def is_builtin(self, style: Style):
         return style.filepath.is_relative_to(self.builtin_folder)
 

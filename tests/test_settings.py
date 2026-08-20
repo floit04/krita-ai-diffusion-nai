@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from ai_diffusion.backend.resources import Arch
 from ai_diffusion.settings import PerformancePreset, ServerMode, Setting, Settings
 from ai_diffusion.style import (
     SamplerPreset,
@@ -109,6 +110,35 @@ def test_style_folders(tmp_path_factory):
     only_user = styles.filtered(show_builtin=False)
     assert len(only_user) == 1
     assert only_user[0].name == "User Style"
+
+
+def test_builtin_nai_styles_are_editor_templates_not_selectable_styles(tmp_path_factory):
+    builtin_dir = tmp_path_factory.mktemp("builtin")
+    user_dir = tmp_path_factory.mktemp("user")
+
+    builtin_nai = Style(builtin_dir / "nai-v5.json")
+    builtin_nai.name = "NAI V5"
+    builtin_nai.architecture = Arch.nai
+    builtin_nai.save()
+    builtin_local = Style(builtin_dir / "local.json")
+    builtin_local.name = "Local"
+    builtin_local.save()
+    user_nai = Style(user_dir / "custom-nai.json")
+    user_nai.name = "Custom NAI"
+    user_nai.architecture = Arch.nai
+    user_nai.save()
+
+    styles = Styles(builtin_dir, user_dir)
+    loaded_builtin_nai = styles.find("nai-v5.json")
+    loaded_user_nai = styles.find("custom-nai.json")
+
+    assert builtin_nai.name in [style.name for style in styles.filtered(show_builtin=True)]
+    assert [style.name for style in styles.selectable(show_builtin=True)] == [
+        "Custom NAI",
+        "Local",
+    ]
+    assert loaded_builtin_nai is not None and not styles.is_selectable(loaded_builtin_nai)
+    assert loaded_user_nai is not None and styles.is_selectable(loaded_user_nai)
 
 
 def test_bad_style_file(tmp_path_factory):

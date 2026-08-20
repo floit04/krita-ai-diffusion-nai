@@ -193,7 +193,7 @@ class DocumentModel(QObject, ObservableProperties):
         if self._connection.state is not ConnectionState.connected:
             return
         if client := self._connection.client_if_connected:
-            styles = filter_supported_styles(Styles.list().filtered(), client)
+            styles = filter_supported_styles(Styles.list().selectable(), client)
             if self.style not in styles and len(styles) > 0:
                 self.style = styles[0]
             if self.upscale.upscaler == "" and client.models.upscalers:

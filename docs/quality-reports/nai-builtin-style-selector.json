@@ -1,0 +1,62 @@
+{
+  "state": "automated_verified",
+  "issue": "Built-in NovelAI model presets clutter generation style selectors even though they are intended as templates in the style editor",
+  "before": {
+    "timestamp": "2026-08-21T07:17:33+08:00",
+    "reproduction": "Connect the NovelAI backend and open the style selector in the Generation workspace.",
+    "expected": "Built-in NAI V4, V4.5, and V5 Curated/Full templates appear only on the NovelAI style editing page; user-created and duplicated NAI styles remain selectable for generation.",
+    "actual": "The generation selector includes all six built-in NAI templates alongside user styles."
+  },
+  "adjacent_working_case": "Built-in non-NAI styles retain their existing selector behavior, user-created NAI styles remain selectable, and the style editor continues to list built-in NAI templates.",
+  "hypothesis": "The generation selector and document initialization both consume Styles.filtered(), which intentionally includes built-in templates for the editor; a separate selectable view can hide only built-in NAI templates without deleting or altering them.",
+  "disproof": "The hypothesis is false if a built-in NAI template remains in Styles.selectable(), a user NAI style disappears, a built-in local style changes behavior, or the complete editor list no longer contains the NAI template.",
+  "changed_files": [
+    "ai_diffusion/style.py",
+    "ai_diffusion/ui/widget.py",
+    "ai_diffusion/model/model.py",
+    "tests/test_settings.py",
+    "docs/quality-reports/nai-builtin-style-selector.json"
+  ],
+  "rollback": {
+    "kind": "file_backup",
+    "location": "C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-dev-backups\\style-selector-before-20260821-071733",
+    "artifact_hash": "A256B9582C37A6CE6CBC3737FD11632D382072A1F19196437830D6D2EE3B42A5"
+  },
+  "checks": {
+    "static": [
+      "python -m ruff format <changed Python files>: passed",
+      "python -m ruff check <changed Python files>: passed",
+      "python -m pyright <changed Python files>: 0 errors, 0 warnings",
+      "git diff --check: passed"
+    ],
+    "contract": [
+      "python -m pytest tests/test_settings.py tests/test_model.py -q: 40 passed",
+      "Styles.filtered(show_builtin=True) retains a built-in NAI template for the editor",
+      "Styles.selectable(show_builtin=True) excludes the built-in NAI template while retaining a user NAI style and a built-in local style",
+      "DocumentModel connection initialization now chooses from the same selectable view used by StyleSelectWidget"
+    ],
+    "negative_controls": [
+      "No style files are deleted, renamed, or modified",
+      "A duplicated NAI template lives in the user style folder and remains selectable",
+      "Recent-style sorting only receives selectable styles, so a recent built-in NAI template cannot be reintroduced",
+      "The current-value fallback explicitly refuses to reinsert a hidden built-in NAI template"
+    ],
+    "build_deploy": [
+      "Installed plugin backed up at C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-backups\\20260821-071945",
+      "Updated style.py, ui/widget.py, and model/model.py deployed to the current Krita installation",
+      "657 source artifacts checked with 0 missing or SHA-256 mismatches",
+      "Deployed manifest SHA-256: 4CACE50485D430C631A7025BD4130ADE76C9FEB1704DAD0473AC073F928FD4C8",
+      "User settings.json and nai_vibe_cache.json remained present",
+      "Krita process 9872 was left running and was not forcibly closed"
+    ],
+    "runtime": [],
+    "quality": []
+  },
+  "remaining_risks": [
+    "Krita was running during deployment, so the new selector source requires a restart before host verification.",
+    "If an installation has no user-created NAI styles, generation can retain its internal current style but the selector will be empty until a style is created or duplicated in the editor."
+  ],
+  "manual_verification": [
+    "Restart Krita, open the Generation style selector, confirm the six built-in NAI V4/V4.5/V5 templates are absent, then open NovelAI Styles and confirm they remain available for duplication."
+  ]
+}
