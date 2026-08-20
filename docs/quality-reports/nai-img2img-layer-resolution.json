@@ -1,0 +1,76 @@
+{
+  "state": "automated_verified",
+  "issue": "NAI img2img must use an editable target resolution and both img2img and redraw must restore the original pixel extent",
+  "before": {
+    "timestamp": "2026-08-20T06:04:37+08:00",
+    "reproduction": "Add an NAI img2img control for a layer, expand it, and try to type a custom target width or adapt one side to the source aspect ratio; also redraw a canvas larger than 2048 pixels on one side.",
+    "expected": "Width and height are editable, snap to the nearest legal 64-pixel grid after Enter or focus loss, auto-fill on layer selection, and can auto-adapt the other side to the source ratio. Each side remains at most 2048 and total pixels remain at most 3145728. Img2img and redraw stretch to the request target and stretch back to the exact original extent and offset.",
+    "actual": "The target was a three-item Normal-preset combo box. Custom dimensions and aspect adaptation were unavailable, and ordinary redraw retained a separate approximately 3MP request policy instead of the requested 1MP-to-2048 edit policy."
+  },
+  "adjacent_working_case": "NAI text generation keeps its existing provider request limit, and selection inpaint without an img2img base remains an infill request with a mask.",
+  "hypothesis": "Fixed-preset normalization in the control model, combo-box-only UI, and request conversion prevents custom targets, while redraw lacks an explicit source/target extent pair at the NAI boundary.",
+  "disproof": "The hypothesis would be false if arbitrary dimensions were already persisted and snapped only on commit, or if ordinary redraw already carried a distinct NAI target and restored provider-sized results to the source extent.",
+  "changed_files": [
+    "ai_diffusion/backend/api.py",
+    "ai_diffusion/backend/nai_client.py",
+    "ai_diffusion/backend/nai_workflow.py",
+    "ai_diffusion/model/control.py",
+    "ai_diffusion/model/jobs.py",
+    "ai_diffusion/model/model.py",
+    "ai_diffusion/ui/control.py",
+    "tests/test_nai.py",
+    "tests/test_model.py",
+    "tests/test_persistence.py",
+    "docs/quality-reports/nai-img2img-layer-resolution.json"
+  ],
+  "rollback": {
+    "kind": "git_commit",
+    "location": "f6b0b9d8995fd1b102a678df43d1404d15cdbc29"
+  },
+  "checks": {
+    "static": [
+      "python -m ruff check <changed Python files>: passed",
+      "python -m ruff format --check <changed Python files>: passed",
+      "python -m pyright <changed Python files>: 0 errors"
+    ],
+    "contract": [
+      "python -m pytest tests/test_nai.py tests/test_model.py tests/test_persistence.py tests/test_api.py tests/test_text.py -q: 71 passed",
+      "Editable resolution assertion: 1599x914 snaps to 1600x896; values clamp to the 64..2048 NAI grid",
+      "Automatic resolution assertions cover 192x192, 640x360, 1344x768, 1600x896, 1792x2048, 2500x1400, 3000x3000, and extreme-aspect sources without exceeding 3145728 pixels",
+      "Aspect adaptation assertion: a 1344x768 source with target long side 1600 becomes 1600x896",
+      "NAI img2img request assertion: action=img2img, custom 1216x832 target, no mask, encoded source is 1216x832",
+      "Redraw request assertion: a 2500x1400 source is encoded at 2048x1152 and restored to 2500x1400 before history",
+      "Inpaint request assertion: an 1800x1800 source and mask are sent at the same legal 1728x1792 grid size",
+      "Precise Reference assertion: V4.5 director fields, fidelity inversion, and 1024x1536 normalization"
+    ],
+    "negative_controls": [
+      "NAI img2img plus selection ignores the selection and preserves 73,91,192,192 job bounds",
+      "Small sources upscale toward but do not exceed 1024x1024 pixels; mid-range sources are not intentionally rescaled",
+      "Text generation remains on its existing 3145728-pixel clamp and does not use the small-source edit upscaling policy",
+      "Precise Reference is omitted for V4 and suppresses incompatible Vibe data on V4.5",
+      "Vibe without Precise Reference keeps its encoded image, strength, and information-extracted fields",
+      "Existing model, API, text, and persistence focused suites pass"
+    ],
+    "build_deploy": [
+      "Deployed source-layout plugin to C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita\\ai_diffusion and ai_diffusion.desktop",
+      "Deployed artifact comparison: 647 files including ai_diffusion.desktop checked with 0 missing or hash-mismatched files",
+      "Development-only debugpy, __pycache__, and *.pyc content excluded from deployment",
+      "Previous installed plugin backed up at C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-backups\\20260820-072052",
+      "User settings.json and nai_vibe_cache.json confirmed present after deployment"
+    ],
+    "runtime": [],
+    "quality": []
+  },
+  "remaining_risks": [
+    "The updated plugin has not been restarted and exercised in a real Krita host; Krita was running during deployment and must be restarted.",
+    "No paid NovelAI request was sent, so live provider acceptance, output quality after stretch round-trips, and actual Anlas charging remain unverified.",
+    "The full fast suite is blocked by Python 3.10 datetime.UTC collection failures and a missing tests/server installation; the runnable remainder reached 320 passed and 32 skipped with 7 environment setup errors."
+  ],
+  "manual_verification": [
+    "Restart Krita, select NAI V4.5, add 图生图 for an offset layer, enter a non-64 width, press Enter, and confirm it snaps to the nearest 64.",
+    "For a 1344x768 layer, enter target width 1600, click 自动, and confirm the target becomes 1600x896.",
+    "Generate once and confirm the history result is restored to the exact source-layer dimensions and pixel offset without using an unrelated selection.",
+    "Remove 图生图, repeat with an ordinary selection redraw on a large canvas, and confirm the mask location and final canvas dimensions are unchanged.",
+    "With user approval to spend Anlas, run one V4.5 精准参考 generation and confirm the account is charged 5 Anlas per reference and the provider accepts the director fields."
+  ]
+}

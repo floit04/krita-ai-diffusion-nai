@@ -2,21 +2,27 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
-from PyQt5.QtCore import QObject, Qt, QUuid, pyqtSignal
+from PyQt5.QtCore import QMetaObject, QObject, Qt, QUuid, pyqtSignal
 
 from .. import util
 from ..backend import resources
 from ..backend.api import ControlInput
+from ..backend.nai_workflow import nai_auto_resolution, nai_edit_resolution
 from ..backend.resources import Arch, ControlMode, ResourceKind, resource_id
+from ..document import Document, SelectionModifiers
 from ..image import Bounds, Extent, Image
 from ..layer import Layer, LayerType
 from ..localization import translate as _
 from ..util import PluginError
 from ..util import client_logger as log
-from . import jobs, model
+from . import jobs
+from .control_utils import nai_selection_layer_id
 from .properties import ObservableProperties, Property
+
+if TYPE_CHECKING:
+    from . import model
 
 
 class ControlLayer(QObject, ObservableProperties):
@@ -25,7 +31,7 @@ class ControlLayer(QObject, ObservableProperties):
     clip_vision_extent = Extent(224, 224)
 
     mode = Property(ControlMode.reference, persist=True, setter="set_mode")
-    layer_id = Property(QUuid(), persist=True)
+    layer_id = Property(QUuid(), persist=True, setter="set_layer_id")
     preset_value = Property(2, persist=True, setter="set_preset_value")
     strength = Property(50, persist=True)
     start = Property(0.0, persist=True)
@@ -33,6 +39,8 @@ class ControlLayer(QObject, ObservableProperties):
     # Secondary parameter for NAI modes, in percent (0-100): vibe "information
     # extracted" (default 70) or precise-reference "fidelity" (default 100).
     param2 = Property(100, persist=True)
+    target_width = Property(1024, persist=True, setter="set_target_width")
+    target_height = Property(1024, persist=True, setter="set_target_height")
     use_custom_strength = Property(False, persist=True, setter="set_use_custom_strength")
     is_supported = Property(True)
     is_pose_vector = Property(False)
@@ -48,6 +56,8 @@ class ControlLayer(QObject, ObservableProperties):
     start_changed = pyqtSignal(float)
     end_changed = pyqtSignal(float)
     param2_changed = pyqtSignal(int)
+    target_width_changed = pyqtSignal(int)
+    target_height_changed = pyqtSignal(int)
     use_custom_strength_changed = pyqtSignal(bool)
     is_supported_changed = pyqtSignal(bool)
     is_pose_vector_changed = pyqtSignal(bool)
@@ -73,6 +83,10 @@ class ControlLayer(QObject, ObservableProperties):
         model.edit_mode_changed.connect(self._update_is_supported)
         root.connection.state_changed.connect(self._update_is_supported)
         self.layer_id_changed.connect(self._update_is_pose_vector)
+        self._selection_bounds_connection: QMetaObject.Connection = (
+            model.document.selection_bounds_changed.connect(self._update_selection_target)
+        )
+        model.document_changed.connect(self._update_document)
         model.jobs.job_finished.connect(self._update_active_job)
 
     @property
@@ -81,8 +95,12 @@ class ControlLayer(QObject, ObservableProperties):
         return self.layer_id.isNull()
 
     @property
+    def is_selection(self):
+        return self.layer_id == nai_selection_layer_id
+
+    @property
     def layer(self):
-        if self.layer_id.isNull():
+        if self.layer_id.isNull() or self.is_selection:
             return None
         layer = self._model.layers.updated().find(self.layer_id)
         assert layer is not None, "Control layer has been deleted"
@@ -90,6 +108,8 @@ class ControlLayer(QObject, ObservableProperties):
 
     def set_mode(self, mode: ControlMode):
         if mode != self.mode:
+            if mode is not ControlMode.nai_base and self.is_selection:
+                self.layer_id = QUuid()
             self._mode = mode
             self.mode_changed.emit(mode)
             self._update_is_pose_vector()
@@ -98,12 +118,87 @@ class ControlLayer(QObject, ObservableProperties):
                 # extracted (default 0.7); precise: fidelity (default 1.0).
                 if mode is ControlMode.nai_base:
                     self.param2 = 0
+                    self._reset_target_resolution()
                 elif mode is ControlMode.nai_vibe:
                     self.param2 = 70
                 else:
                     self.param2 = 100
             if not self.use_custom_strength:
                 self._set_values_from_preset()
+
+    def set_layer_id(self, layer_id: QUuid):
+        if layer_id != self.layer_id:
+            self._layer_id = layer_id
+            self.layer_id_changed.emit(layer_id)
+            self.modified.emit(self, "layer_id")
+            if self.mode is ControlMode.nai_base:
+                self._reset_target_resolution()
+
+    @property
+    def target_extent(self):
+        return Extent(self.target_width, self.target_height)
+
+    def _set_target_extent(self, extent: Extent):
+        target = nai_edit_resolution(extent)
+        for name, value in (("target_width", target.width), ("target_height", target.height)):
+            if value != getattr(self, name):
+                setattr(self, f"_{name}", value)
+                getattr(self, f"{name}_changed").emit(value)
+                self.modified.emit(self, name)
+
+    def set_target_width(self, value: int):
+        self._set_target_extent(Extent(value, self.target_height))
+
+    def set_target_height(self, value: int):
+        self._set_target_extent(Extent(self.target_width, value))
+
+    def set_target_extent(self, extent: Extent):
+        self._set_target_extent(extent)
+
+    def _source_extent(self):
+        if self.is_selection:
+            if bounds := self.selection_bounds:
+                return bounds.extent
+            return self._model.document.extent
+        layer = self.layer
+        if layer is None:
+            return self._model.document.extent
+        bounds = layer.full_bounds
+        return bounds.extent if not bounds.is_zero else self._model.document.extent
+
+    def _reset_target_resolution(self):
+        self.set_target_extent(nai_auto_resolution(self._source_extent()))
+
+    def _update_selection_target(self):
+        bounds = self._model.document.selection_bounds
+        if self.mode is ControlMode.nai_base and self.is_selection and bounds:
+            self.set_target_extent(nai_auto_resolution(bounds.extent))
+
+    def _update_document(self, document: Document):
+        QObject.disconnect(self._selection_bounds_connection)
+        self._selection_bounds_connection = document.selection_bounds_changed.connect(
+            self._update_selection_target
+        )
+        self._update_selection_target()
+
+    @property
+    def selection_bounds(self):
+        if not self.is_selection:
+            return None
+        if bounds := self._model.document.selection_bounds:
+            return bounds
+        _, bounds = self._model.document.create_mask_from_selection(SelectionModifiers(multiple=1))
+        return bounds
+
+    def adapt_target_resolution(self):
+        source = self._source_extent()
+        if source.width >= source.height:
+            width = self.target_width
+            height = round(width * source.height / max(source.width, 1))
+        else:
+            height = self.target_height
+            width = round(height * source.width / max(source.height, 1))
+        self.set_target_extent(Extent(width, height))
 
     def set_preset_value(self, value: int):
         if value != self.preset_value:
@@ -148,7 +243,9 @@ class ControlLayer(QObject, ObservableProperties):
 
     def to_api(self, bounds: Bounds | None = None, time: int | None = None):
         layer = self.layer
-        layer_name = layer.name if layer else _("Whole canvas")
+        layer_name = (
+            _("Selection") if self.is_selection else layer.name if layer else _("Whole canvas")
+        )
         if not self.is_supported:
             raise PluginError(f"Can't use '{layer_name}' as control layer: {self.error_text}")
 
@@ -157,7 +254,12 @@ class ControlLayer(QObject, ObservableProperties):
             # no line/stencil preprocessing. Whole-canvas (null layer_id) uses the
             # flattened document projection minus control/preview layers.
             doc_bounds = Bounds(0, 0, *self._model.document.extent)
-            if layer is None:
+            if self.is_selection:
+                selection_bounds = self.selection_bounds
+                if selection_bounds is None:
+                    raise PluginError(_("There is no active selection for img2img"))
+                image = self._model._get_current_image(selection_bounds)
+            elif layer is None:
                 image = self._model._get_current_image(doc_bounds)
             elif self.mode is ControlMode.nai_base:
                 # A specific layer as img2img base = the FULL original image (not
@@ -179,7 +281,8 @@ class ControlLayer(QObject, ObservableProperties):
                 image = layer.get_pixels(ref_bounds, time)
             strength = min(self.strength / self.strength_multiplier, 1.0)
             param2 = min(max(self.param2 / 100.0, 0.0), 1.0)
-            return ControlInput(self.mode, image, strength, (0.0, 1.0), param2)
+            target = self.target_extent if self.mode is ControlMode.nai_base else None
+            return ControlInput(self.mode, image, strength, (0.0, 1.0), param2, target)
 
         assert layer is not None, "Control layer has been deleted"
         extent = bounds.extent if bounds else self._model.document.extent
@@ -283,9 +386,7 @@ class ControlLayer(QObject, ObservableProperties):
     def _update_is_pose_vector(self):
         layer = self.layer
         self.is_pose_vector = (
-            self.mode is ControlMode.pose
-            and layer is not None
-            and layer.type is LayerType.vector
+            self.mode is ControlMode.pose and layer is not None and layer.type is LayerType.vector
         )
 
     def _update_active_job(self):

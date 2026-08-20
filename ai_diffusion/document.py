@@ -15,7 +15,6 @@ from .localization import translate as _
 from .pose import Pose
 from .util import acquire_elements
 
-
 # Name of the reusable overlay layer for painting the inpaint selection. Also used
 # to find the layer again after a plugin reload, so it must not change.
 SELECTION_PAINT_LAYER_NAME = "AI 重绘选区 (涂抹)"
@@ -340,19 +339,19 @@ class KritaDocument(Document):
         view = window.activeView() if window else None
         if view is not None:
             try:  # brush preset: hard-edged ink pen, as requested
-                self._sel_paint_prev_preset = view.currentBrushPreset()
+                self._sel_paint_prev_preset = view.currentBrushPreset()  # type: ignore[attr-defined]
                 presets = Krita.instance().resources("preset")
                 if gpen := presets.get("d) Ink-3 Gpen"):
-                    view.setCurrentBrushPreset(gpen)
+                    view.setCurrentBrushPreset(gpen)  # type: ignore[attr-defined]
             except Exception as e:
                 log.warning(f"selection paint: could not switch brush preset: {e}")
             try:  # NAI web mask blue (#8286D9). ManagedColor RGBA/U8 is BGRA order.
                 from krita import ManagedColor
 
                 self._sel_paint_prev_color = view.foregroundColor()
-                color = ManagedColor("RGBA", "U8", "")
+                color = ManagedColor("RGBA", "U8", "")  # type: ignore[call-arg]
                 color.setComponents([0.851, 0.525, 0.510, 1.0])
-                view.setForeGroundColor(color)
+                view.setForeGroundColor(color)  # type: ignore[attr-defined]
             except Exception as e:
                 log.warning(f"selection paint: could not set foreground color: {e}")
         if brush_tool := Krita.instance().action("KritaShape/KisToolBrush"):
@@ -364,6 +363,8 @@ class KritaDocument(Document):
         The button only shows and hides the overlay. The painted mask stays in
         effect while hidden and is only cancelled by deleting the layer.
         """
+        from .util import client_logger as log
+
         doc = self._doc
         self._sel_paint_active = False
         if layer := self.selection_paint_layer:
@@ -373,19 +374,19 @@ class KritaDocument(Document):
             prev = getattr(self, "_sel_paint_prev_node", None)
             if prev is not None:
                 doc.setActiveNode(prev)
-        except Exception:
-            pass  # previous layer may have been deleted meanwhile
+        except Exception as e:
+            log.warning(f"selection paint: could not restore previous layer: {e}")
         self._sel_paint_prev_node = None
         window = Krita.instance().activeWindow()
         view = window.activeView() if window else None
         if view is not None:
             try:
                 if preset := getattr(self, "_sel_paint_prev_preset", None):
-                    view.setCurrentBrushPreset(preset)
+                    view.setCurrentBrushPreset(preset)  # type: ignore[attr-defined]
                 if color := getattr(self, "_sel_paint_prev_color", None):
-                    view.setForeGroundColor(color)
-            except Exception:
-                pass
+                    view.setForeGroundColor(color)  # type: ignore[attr-defined]
+            except Exception as e:
+                log.warning(f"selection paint: could not restore brush settings: {e}")
         self._sel_paint_prev_preset = None
         self._sel_paint_prev_color = None
         doc.refreshProjection()
@@ -402,7 +403,7 @@ class KritaDocument(Document):
             # converted from paint layers work without a marching-ants selection.
             active = self._doc.activeNode()
             if active is not None and active.type() == "selectionmask":
-                user_selection = active.selection()
+                user_selection = active.selection()  # type: ignore[attr-defined]
         if not user_selection:
             return None, None
 
@@ -414,6 +415,8 @@ class KritaDocument(Document):
             selection.x(), selection.y(), selection.width(), selection.height()
         )
         original_bounds = Bounds.clamp(original_bounds, self.extent)
+        if original_bounds.is_zero:
+            return None, None
         size_factor = original_bounds.extent.diagonal
         pad_px = max(int(mod.feather_rel * size_factor), mod.feather_min_px)
         pad_px += mod.pad_offset_px
@@ -427,6 +430,8 @@ class KritaDocument(Document):
             bounds, pad_px, multiple=mod.multiple, min_size=mod.size_min_px, square=mod.square
         )
         bounds = Bounds.clamp(bounds, self.extent)
+        if bounds.is_zero:
+            return None, None
         data = selection.pixelData(*bounds)
         return Mask(bounds, data), original_bounds
 
@@ -507,6 +512,8 @@ class KritaDocument(Document):
             self._was_valid = True
             selection = self._doc.selection()
             selection_bounds = _selection_bounds(selection) if selection else None
+            if selection_bounds is not None and selection_bounds.is_zero:
+                selection_bounds = None
             if selection_bounds != self._selection_bounds:
                 self._selection_bounds = selection_bounds
                 self.selection_bounds_changed.emit()

@@ -14,12 +14,16 @@ import json
 import uuid
 import zipfile
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from PyQt5.QtNetwork import QNetworkReply
 
+from ..image import Extent, Image, ImageCollection
+from ..localization import translate as _
+from ..settings import PerformanceSettings, settings
+from ..util import client_logger as log
 from .api import WorkflowInput
 from .client import (
     Client,
@@ -30,10 +34,9 @@ from .client import (
     ClientModels,
     DeviceInfo,
 )
-from ..image import Image, ImageCollection
-from ..localization import translate as _
-from .network import NetworkError, RequestManager
 from .nai_workflow import (
+    NAI_EDIT_MAX_PIXELS,
+    NAI_MAX_PIXELS,
     NaiAction,
     NaiModel,
     NaiNoiseSchedule,
@@ -44,14 +47,13 @@ from .nai_workflow import (
     clamp_resolution,
     composite_nai_patch,
     image_to_base64,
-    map_sampler,
     map_noise_schedule,
+    map_sampler,
+    nai_auto_resolution,
     prepare_nai_precise_reference_image,
     prepare_nai_request_mask,
 )
-from ..settings import PerformanceSettings, settings
-from ..util import client_logger as log
-
+from .network import NetworkError, RequestManager
 
 # ---------------------------------------------------------------------------
 # Job tracking
@@ -173,7 +175,6 @@ class NaiClient(Client):
                 e.message = _("NovelAI API token is invalid or expired. Please check your token.")
             raise
         log.info(f"Connected to NovelAI API at {self.url}")
-        return self
 
     def __init__(self, url: str, token: str = ""):
         self.url = url.rstrip("/")
@@ -215,9 +216,7 @@ class NaiClient(Client):
         )
 
     async def _post(self, path: str, data: dict, timeout: float | None = None):
-        return await self._requests.post(
-            f"{self.url}/{path}", data, bearer=self._current_token()
-        )
+        return await self._requests.post(f"{self.url}/{path}", data, bearer=self._current_token())
 
     async def _post_binary(self, path: str, data: dict, timeout: float | None = 300):
         """POST that expects a binary (ZIP) response.
@@ -295,7 +294,9 @@ class NaiClient(Client):
         # We mark the current job as cancelled so that we don't report its result.
         if self._current_job is not None:
             self._current_job.state = NaiJobState.cancelled
-            log.info(f"Marked {self._current_job} as cancelled (NAI does not support server-side cancel)")
+            log.info(
+                f"Marked {self._current_job} as cancelled (NAI does not support server-side cancel)"
+            )
 
     async def cancel(self, job_ids: Iterable[str]):
         id_set = set(job_ids)
@@ -358,7 +359,9 @@ class NaiClient(Client):
         cond = work.conditioning
         if cond is None or not cond.control:
             return result
-        if work.kind in (WorkflowKind.inpaint, WorkflowKind.refine_region):
+        if work.kind in (WorkflowKind.inpaint, WorkflowKind.refine_region) and (
+            _find_nai_base_control(work) is None
+        ):
             return result  # infill drops vibes (server 500) — don't waste Anlas
         model, _cp = resolve_nai_model(work)
         for i, ctrl in enumerate(cond.control):
@@ -370,12 +373,15 @@ class NaiClient(Client):
             key = f"{digest}|{model.value}|{info}"
             encoding = self._vibe_cache.get(key)
             if encoding is None:
-                log.info(f"NAI encode-vibe: encoding reference {i} (model={model.value}, ie={info})")
+                log.info(
+                    f"NAI encode-vibe: encoding reference {i} (model={model.value}, ie={info})"
+                )
                 data = await self._post_binary(
                     "ai/encode-vibe",
                     {"image": image_b64, "model": model.value, "information_extracted": info},
                     timeout=60,
                 )
+                assert data is not None, "NAI encode-vibe returned an empty response"
                 encoding = base64.b64encode(bytes(data)).decode("ascii")
                 self._vibe_cache[key] = encoding
                 _save_vibe_cache(self._vibe_cache)
@@ -431,11 +437,13 @@ class NaiClient(Client):
             if len(images) == 0:
                 raise RuntimeError("NAI returned an empty response (no images in ZIP)")
 
+            base_ctrl = _find_nai_base_control(job.work)
+            images = restore_nai_results(job.work, images)
             # Inpaint/refine_region: NAI regenerates the whole canvas, so composite
             # each result into a transparent patch whose alpha is the selection mask.
             # Written back, the original shows through outside the selection (no
             # colour drift, no black border); only the masked area changes.
-            if job.work.images and job.work.images.hires_mask is not None:
+            if base_ctrl is None and job.work.images and job.work.images.hires_mask is not None:
                 mask_img = job.work.images.hires_mask
                 images = ImageCollection(
                     composite_nai_patch(im, mask_img, mask_img.extent) for im in images
@@ -443,13 +451,13 @@ class NaiClient(Client):
 
             job.state = NaiJobState.completed
             log.info(f"{job} completed, got {len(images)} images")
-            await self._report(
-                ClientEvent.finished, job.local_id, 1.0, images=images
-            )
+            await self._report(ClientEvent.finished, job.local_id, 1.0, images=images)
 
         except NetworkError as e:
             job.state = NaiJobState.failed
-            log.error(f"{job} NetworkError: status={e.status}, code={e.code}, raw_message={e.message}")
+            log.error(
+                f"{job} NetworkError: status={e.status}, code={e.code}, raw_message={e.message}"
+            )
             error_msg = self._handle_nai_error(e)
             log.error(f"{job} user-facing error: {error_msg}")
             await self._report(ClientEvent.error, job.local_id, error=error_msg)
@@ -476,13 +484,19 @@ class NaiClient(Client):
         if status == 400:
             return _("Invalid request to NovelAI API: ") + detail
         elif status == 401:
-            return _("NovelAI API token is invalid or expired. Please update your token in settings.")
+            return _(
+                "NovelAI API token is invalid or expired. Please update your token in settings."
+            )
         elif status == 402:
             return _("Insufficient Anlas (NovelAI credits). Please purchase more on novelai.net.")
         elif status == 429:
             return _("NovelAI rate limit exceeded. Please wait a moment and try again.")
         elif status and status >= 500:
-            return _("NovelAI server error") + f" ({status}): {detail}" if detail else _("NovelAI server error. Please try again later. ") + f"({status})"
+            return (
+                _("NovelAI server error") + f" ({status}): {detail}"
+                if detail
+                else _("NovelAI server error. Please try again later. ") + f"({status})"
+            )
         else:
             return _("NovelAI API error: ") + detail
 
@@ -520,9 +534,44 @@ def _parse_zip_response(data: bytes | Any) -> ImageCollection:
 # ---------------------------------------------------------------------------
 
 
+def _find_nai_base_control(work: WorkflowInput):
+    from .resources import ControlMode
+
+    if cond := work.conditioning:
+        return next(
+            (
+                ctrl
+                for ctrl in cond.control
+                if ctrl.mode is ControlMode.nai_base and ctrl.image is not None
+            ),
+            None,
+        )
+    return None
+
+
+def restore_nai_results(work: WorkflowInput, images: ImageCollection) -> ImageCollection:
+    """Stretch provider-sized edit results back to their exact source extent."""
+    base_ctrl = _find_nai_base_control(work)
+    if base_ctrl is not None and base_ctrl.image is not None:
+        source_extent = base_ctrl.image.extent
+    elif work.images is not None and work.images.initial_image is not None:
+        source_extent = work.images.initial_image.extent
+    else:
+        return images
+    return ImageCollection(
+        image if image.extent == source_extent else Image.scale(image, source_extent)
+        for image in images
+    )
+
+
+def restore_nai_base_results(work: WorkflowInput, images: ImageCollection) -> ImageCollection:
+    return restore_nai_results(work, images)
+
+
 def _find_style_for_checkpoint(checkpoint: str):
     """Find the Style whose checkpoints list contains the given checkpoint ID."""
     from ..style import Styles
+
     for s in Styles.list():
         if checkpoint in s.checkpoints:
             return s
@@ -559,8 +608,8 @@ def convert_workflow(
     ``vibe_encodings`` maps indices into ``work.conditioning.control`` to
     pre-fetched vibe encodings (from ai/encode-vibe, see NaiClient).
     """
-    from .api import WorkflowKind
     from ..text import merge_prompt
+    from .api import WorkflowKind
 
     # --- Prompt ---
     cond = work.conditioning
@@ -571,20 +620,51 @@ def convert_workflow(
     # Use merge_prompt to correctly substitute {prompt} placeholder in style template
     prompt = merge_prompt(prompt, style_prompt)
 
+    base_ctrl = _find_nai_base_control(work)
+
+    # --- Action ---
+    if base_ctrl is not None:
+        action = NaiAction.img2img
+    elif work.kind is WorkflowKind.inpaint or work.kind is WorkflowKind.refine_region:
+        action = NaiAction.infill
+    elif (
+        work.kind is WorkflowKind.refine
+        or work.images
+        and work.images.initial_image is not None
+        and work.kind is not WorkflowKind.generate
+    ):
+        action = NaiAction.img2img
+    else:
+        action = NaiAction.generate
+
     # --- Resolution (from WorkflowInput) ---
-    # For img2img/inpaint, the image has already been cropped to bbox by model.py.
-    # We must use the actual image dimensions (not extent.desired which may differ
-    # due to ComfyUI 2-pass resolution scaling that NAI doesn't use).
-    if work.images and work.images.initial_image:
+    # Image edits use their explicit or automatically selected 64px-grid target.
+    # Text generation retains the provider's separate API pixel limit.
+    if base_ctrl is not None:
+        assert base_ctrl.image is not None
+        target = base_ctrl.target_extent or base_ctrl.image.extent
+        extent = target
+        log.info(f"NAI img2img resolution: {extent.width}x{extent.height}")
+    elif action in (NaiAction.img2img, NaiAction.infill):
+        if work.nai_target_extent is not None:
+            extent = work.nai_target_extent
+        elif work.images and work.images.initial_image:
+            extent = nai_auto_resolution(work.images.initial_image.extent)
+        else:
+            extent = Extent(1024, 1024)
+        log.info(f"NAI redraw resolution: {extent.width}x{extent.height}")
+    elif work.images and work.images.initial_image:
         extent = work.images.initial_image.extent
         log.info(f"NAI resolution: using initial_image extent {extent.width}x{extent.height}")
     elif work.images:
         extent = work.images.extent.desired
         log.info(f"NAI resolution: using extent.desired {extent.width}x{extent.height}")
     else:
-        from ..image import Extent
         extent = Extent(1024, 1024)
-    extent = clamp_resolution(extent)
+    max_pixels = (
+        NAI_EDIT_MAX_PIXELS if action in (NaiAction.img2img, NaiAction.infill) else NAI_MAX_PIXELS
+    )
+    extent = clamp_resolution(extent, max_pixels)
 
     # --- Model (resolve before action so we know v3 vs v4) ---
     model, checkpoint_id = resolve_nai_model(work)
@@ -592,41 +672,16 @@ def convert_workflow(
     # --- NAI control layers (img2img base / vibe transfer / precise reference) ---
     from .resources import ControlMode
 
-    base_ctrl = None
     vibe_ctrls: list[tuple[int, Any]] = []  # (index into cond.control, ControlInput)
     precise_ctrls: list[Any] = []
     if cond:
         for i, ctrl in enumerate(cond.control):
             if ctrl.image is None:
                 continue
-            if ctrl.mode is ControlMode.nai_base and base_ctrl is None:
-                base_ctrl = ctrl
-            elif ctrl.mode is ControlMode.nai_vibe:
+            if ctrl.mode is ControlMode.nai_vibe:
                 vibe_ctrls.append((i, ctrl))
             elif ctrl.mode.is_nai_precise:
                 precise_ctrls.append(ctrl)
-
-    # --- Action ---
-    if work.kind is WorkflowKind.inpaint:
-        # All NAI models use infill for inpainting (v3 switches to inpaint model variant)
-        action = NaiAction.infill
-    elif work.kind is WorkflowKind.refine_region:
-        # refine_region with mask: also use infill for proper mask-based inpainting
-        action = NaiAction.infill
-    elif work.kind in (WorkflowKind.refine,):
-        action = NaiAction.img2img
-    elif work.images and work.images.initial_image is not None and work.kind is not WorkflowKind.generate:
-        action = NaiAction.img2img
-    else:
-        action = NaiAction.generate
-
-    # An img2img base layer (垫图) turns plain generation into img2img with that
-    # image as source. A selection (mask) takes priority: infill stays untouched.
-    if action is NaiAction.generate and base_ctrl is not None:
-        action = NaiAction.img2img
-    if action is NaiAction.infill and base_ctrl is not None:
-        log.info("NAI: selection redraw active, ignoring img2img base layer")
-        base_ctrl = None
 
     # Server-side compatibility rules (mirrors the launcher):
     if precise_ctrls and not model.is_v4_5:
@@ -644,6 +699,7 @@ def convert_workflow(
     # filename of the selected style). Fall back to guessing by checkpoint only
     # for legacy inputs that predate the threaded field.
     from ..style import Styles
+
     style = None
     if getattr(work, "nai_style", ""):
         style = Styles.list().find(work.nai_style)
@@ -653,6 +709,7 @@ def convert_workflow(
     # --- Sampling (from style preset → sampler preset → fallback settings) ---
     # Steps & CFG come from the style's sampler preset
     from ..style import SamplerPresets
+
     sampler_preset_name = style.sampler if style else None
     sampler_preset = None
     if sampler_preset_name:
@@ -663,8 +720,16 @@ def convert_workflow(
 
     if sampler_preset:
         # Map ComfyUI sampler name → NAI sampler
-        sampler = map_sampler(sampler_preset.sampler) if hasattr(sampler_preset, 'sampler') else NaiSampler.default()
-        noise_schedule = map_noise_schedule(sampler_preset.scheduler) if hasattr(sampler_preset, 'scheduler') else NaiNoiseSchedule.default()
+        sampler = (
+            map_sampler(sampler_preset.sampler)
+            if hasattr(sampler_preset, "sampler")
+            else NaiSampler.default()
+        )
+        noise_schedule = (
+            map_noise_schedule(sampler_preset.scheduler)
+            if hasattr(sampler_preset, "scheduler")
+            else NaiNoiseSchedule.default()
+        )
         steps = style.sampler_steps if style else settings.nai_steps
         cfg_scale = style.cfg_scale if style else settings.nai_cfg_scale
     else:
@@ -717,7 +782,7 @@ def convert_workflow(
     # omitted from the request entirely.
     inpaint_strength: float | None = None
     # Both inpaint and refine_region carry a mask.
-    needs_mask = work.kind in (WorkflowKind.inpaint, WorkflowKind.refine_region)
+    needs_mask = action is NaiAction.infill
 
     if action in (NaiAction.img2img, NaiAction.infill):
         # Source image: NAI's img2img/infill requires the image to match the
@@ -732,6 +797,8 @@ def convert_workflow(
         if src is not None:
             if src.extent != extent:
                 src = Image.scale(src, extent)
+            else:
+                src = Image.copy(src)
             src.make_opaque()  # NAI requires RGB, strip alpha
             image_b64 = image_to_base64(src)
         # Mask: a clean binary mask aligned to NAI's 8px latent grid. No
@@ -759,8 +826,7 @@ def convert_workflow(
             noise_val = 0.0
         if strength >= 1.0:  # avoid degenerate full replacement at the slider max
             strength = 0.99
-        if strength < 0.01:
-            strength = 0.01
+        strength = max(strength, 0.01)
 
     if action is NaiAction.infill:
         # Masked redraw follows the working reference implementation
@@ -880,8 +946,8 @@ def _build_nai_models() -> ClientModels:
     we populate the ``checkpoints`` dict with NAI model identifiers so
     that the existing style / UI code can reference them.
     """
-    from .client import CheckpointInfo
     from ..files import FileFormat
+    from .client import CheckpointInfo
     from .resources import Arch
 
     models = ClientModels()

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from ..backend.api import InpaintMode
+from ..backend.resources import ControlMode
 from ..image import Bounds, ImageCollection
 from ..settings import settings
 from ..style import Style
@@ -101,6 +102,11 @@ class JobParams:
                 "image": c.layer.name if c.layer is not None else "整张画布",
                 "start": c.start,
                 "end": c.end,
+                "target_resolution": (
+                    f"{c.target_width}x{c.target_height}"
+                    if c.mode is ControlMode.nai_base
+                    else None
+                ),
             }
             for c in control
         ]

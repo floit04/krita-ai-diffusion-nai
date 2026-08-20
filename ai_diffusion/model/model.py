@@ -22,6 +22,7 @@ from ..backend.api import (
     ConditioningInput,
     ControlInput,
     CustomWorkflowInput,
+    ExtentInput,
     FillMode,
     ImageInput,
     InpaintContext,
@@ -41,6 +42,7 @@ from ..backend.client import (
     is_style_supported,
     resolve_arch,
 )
+from ..backend.nai_workflow import nai_auto_resolution
 from ..backend.network import NetworkError
 from ..backend.resolution import compute_bounds, compute_relative_bounds
 from ..backend.resources import ControlMode
@@ -161,6 +163,7 @@ class DocumentModel(QObject, ObservableProperties):
     progress_kind_changed = pyqtSignal(ProgressKind)
     progress_changed = pyqtSignal(float)
     error_changed = pyqtSignal(Error)
+    document_changed = pyqtSignal(object)
     modified = pyqtSignal(QObject, str)
 
     def __init__(self, document: Document, connection: Connection, workflows: WorkflowCollection):
@@ -231,43 +234,70 @@ class DocumentModel(QObject, ObservableProperties):
 
     def _prepare_workflow(self, dryrun=False):
         arch = self.arch
+        regions = self.active_regions
+        is_nai = arch is Arch.nai
+        nai_base = None
+        if is_nai:
+            nai_base = next(
+                (
+                    control
+                    for control in regions.control
+                    if control.is_supported and control.mode is ControlMode.nai_base
+                ),
+                None,
+            )
+
         workflow_kind = WorkflowKind.generate
         strength = self.strength
         if arch is Arch.qwen_l:
             strength = 1.0
-        if self._doc.has_selection_paint_mask:
+        if nai_base is None and self._doc.has_selection_paint_mask:
             # A painted mask always means "redraw this area", never "generate from
             # scratch": at full strength the existing pixels are discarded and the
             # strokes lose their meaning, so cap it just below.
             strength = min(strength, 0.99)
-        if strength < 1.0 or self.is_editing:
+        if nai_base is None and (strength < 1.0 or self.is_editing):
             workflow_kind = WorkflowKind.refine
         client = self._connection.client
         image = None
         inpaint_mode: InpaintMode | None = None
         inpaint = None
         extent = self._doc.extent
-        regions = self.active_regions
         region_layer = None
-        is_nai = arch is Arch.nai
 
         smod = get_selection_modifiers(arch, self.inpaint.mode, strength)
-        mask, selection_bounds = self._doc.create_mask_from_selection(smod)
         bounds = Bounds(0, 0, *extent)
-        if mask is None:  # Check for region inpaint
-            region_layer = regions.get_active_region_layer(use_parent=not self.region_only)
-            if not region_layer.is_root:
-                mask = get_region_inpaint_mask(region_layer, extent)
-                bounds = mask.bounds
-                inpaint_mode = InpaintMode.add_object
-        else:  # Selection inpaint or refine
-            if is_nai:
-                # NAI inpaint: use full canvas, don't crop to bbox
-                bounds = Bounds(0, 0, *extent)
-            else:
-                bounds = compute_bounds(extent, mask.bounds if mask else None, workflow_kind)
-                bounds = self.inpaint.get_context(self, mask) or bounds
-            inpaint_mode = self.resolve_inpaint_mode()
+        mask = None
+        selection_bounds = None
+        if nai_base is not None:
+            # A base-image control is an independent img2img job. Its source layer
+            # or visible projection inside the explicit "选区" source defines both
+            # the input pixels and where the restored result is previewed/applied.
+            if nai_base.is_selection:
+                if selection_bounds := nai_base.selection_bounds:
+                    bounds = selection_bounds
+                else:
+                    raise PluginError(_("There is no active selection for img2img"))
+            elif layer := nai_base.layer:
+                bounds = layer.full_bounds
+                if bounds.is_zero:
+                    bounds = Bounds(0, 0, *extent)
+        else:
+            mask, selection_bounds = self._doc.create_mask_from_selection(smod)
+            if mask is None:  # Check for region inpaint
+                region_layer = regions.get_active_region_layer(use_parent=not self.region_only)
+                if not region_layer.is_root:
+                    mask = get_region_inpaint_mask(region_layer, extent)
+                    bounds = mask.bounds
+                    inpaint_mode = InpaintMode.add_object
+            else:  # Selection inpaint or refine
+                if is_nai:
+                    # NAI inpaint: use full canvas, don't crop to bbox
+                    bounds = Bounds(0, 0, *extent)
+                else:
+                    bounds = compute_bounds(extent, mask.bounds if mask else None, workflow_kind)
+                    bounds = self.inpaint.get_context(self, mask) or bounds
+                inpaint_mode = self.resolve_inpaint_mode()
 
         if not dryrun:
             conditioning, job_regions = process_regions(regions, bounds, region_layer)
@@ -312,9 +342,10 @@ class DocumentModel(QObject, ObservableProperties):
                 )
             inpaint = calc_selection_pre_process(inpaint, selection_bounds, smod)
 
+        canvas = image or (nai_base.target_extent if nai_base is not None else extent)
         input = workflow.prepare(
             workflow_kind,
-            image or extent,
+            canvas,
             conditioning,
             self.active_style,
             seed,
@@ -328,6 +359,16 @@ class DocumentModel(QObject, ObservableProperties):
             layer_count=self.layer_count,
         )
         if is_nai:
+            if nai_base is not None:
+                input.nai_target_extent = nai_base.target_extent
+            elif image is not None:
+                source_extent = image.extent
+                input.nai_target_extent = nai_auto_resolution(source_extent)
+                if input.images is not None:
+                    input.images.extent = ExtentInput(
+                        source_extent, source_extent, source_extent, source_extent
+                    )
+                    input.images.initial_image = image
             # Thread the exact selected style's filename to the NAI backend so it
             # reads the right params. Checkpoint IDs are not unique across styles
             # (e.g. built-in "NAI V4.5" and a user style share the same checkpoint),
@@ -1086,6 +1127,7 @@ class DocumentModel(QObject, ObservableProperties):
         if self._doc is not doc:
             log.warning(f"Document instance changed {self._doc} -> {doc}")
             self._doc = doc
+            self.document_changed.emit(doc)
 
     @property
     def layers(self):

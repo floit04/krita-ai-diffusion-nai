@@ -4,7 +4,7 @@ from krita import Document as MockDocument
 from krita import Krita, Selection
 from PyQt5.QtCore import QByteArray
 
-from ai_diffusion.document import KritaDocument
+from ai_diffusion.document import KritaDocument, SelectionModifiers
 from ai_diffusion.image import Bounds
 
 from .conftest import qtapp
@@ -73,6 +73,20 @@ def test_active_open_copy_gets_new_instance_and_id():
     # Retrieving the copy a second time returns the same new instance.
     kd_copy2 = KritaDocument.active()
     assert kd_copy2 is kd_copy
+
+
+def test_empty_in_progress_selection_does_not_create_a_mask():
+    doc = Krita.instance().openDocument("")
+    kd = KritaDocument.active()
+    assert kd is not None
+    doc.setSelection(Selection())
+
+    mask, bounds = kd.create_mask_from_selection(SelectionModifiers(multiple=1))
+    kd._poll()
+
+    assert mask is None
+    assert bounds is None
+    assert kd.selection_bounds is None
 
 
 @qtapp

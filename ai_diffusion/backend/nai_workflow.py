@@ -10,14 +10,13 @@ import math
 from enum import Enum
 from typing import Any
 
-from ..image import Extent, Image, multiple_of
+from ..image import Extent, Image
 from ..settings import ImageFileFormat
-from ..util import client_logger as log
-
 
 # ---------------------------------------------------------------------------
 # NAI model identifiers
 # ---------------------------------------------------------------------------
+
 
 class NaiModel(Enum):
     # V4.5 models (latest, default)
@@ -69,13 +68,20 @@ class NaiModel(Enum):
     @property
     def is_v4(self):
         return self in (
-            NaiModel.v4_5_curated, NaiModel.v4_5_full,
-            NaiModel.v4_curated, NaiModel.v4_full,
+            NaiModel.v4_5_curated,
+            NaiModel.v4_5_full,
+            NaiModel.v4_curated,
+            NaiModel.v4_full,
         )
 
     @property
     def is_v3(self):
-        return self in (NaiModel.v3, NaiModel.v3_inpaint, NaiModel.v3_furry, NaiModel.v3_furry_inpaint)
+        return self in (
+            NaiModel.v3,
+            NaiModel.v3_inpaint,
+            NaiModel.v3_furry,
+            NaiModel.v3_furry_inpaint,
+        )
 
     @property
     def is_curated(self):
@@ -133,6 +139,7 @@ def apply_quality_tags(prompt: str, model: NaiModel) -> str:
 # NAI sampler names
 # ---------------------------------------------------------------------------
 
+
 class NaiSampler(Enum):
     k_euler = "k_euler"
     k_euler_ancestral = "k_euler_ancestral"
@@ -168,6 +175,7 @@ def map_sampler(comfy_sampler: str) -> NaiSampler:
 # NAI noise schedules
 # ---------------------------------------------------------------------------
 
+
 class NaiNoiseSchedule(Enum):
     native = "native"
     karras = "karras"
@@ -197,6 +205,7 @@ def map_noise_schedule(comfy_scheduler: str) -> NaiNoiseSchedule:
 # NAI UC (Undesired Content) presets
 # ---------------------------------------------------------------------------
 
+
 class NaiUCPreset(Enum):
     heavy = 0
     light = 1
@@ -215,6 +224,7 @@ class NaiUCPreset(Enum):
 # NAI action types
 # ---------------------------------------------------------------------------
 
+
 class NaiAction(Enum):
     generate = "generate"
     img2img = "img2img"
@@ -225,8 +235,11 @@ class NaiAction(Enum):
 # Resolution utilities
 # ---------------------------------------------------------------------------
 
-# NAI requires width/height to be multiples of 64
-_NAI_RESOLUTION_MULTIPLE = 64
+# NAI requires width/height to be multiples of 64.
+NAI_RESOLUTION_MULTIPLE = 64
+NAI_MIN_SIDE = 64
+NAI_MAX_SIDE = 2048
+NAI_FREE_PIXELS = 1024 * 1024
 
 # Maximum total pixel count NAI accepts for a generation request.
 # 3145728 is the official cap (novelai.net web build, cross-checked against the
@@ -234,31 +247,86 @@ _NAI_RESOLUTION_MULTIPLE = 64
 # NOTE: 1024*1024 = 1048576 is NOT the API limit — it is only the threshold below
 # which Opus subscribers generate for free. Clamping to it silently shrank valid
 # canvases (e.g. 1600x896 came back as 1344x768).
-_NAI_MAX_PIXELS = 3145728
+NAI_MAX_PIXELS = 3_145_728
+NAI_EDIT_MAX_PIXELS = NAI_MAX_PIXELS
+
+
+def nai_resolution_value(value: int) -> int:
+    value = max(NAI_MIN_SIDE, min(int(value), NAI_MAX_SIDE))
+    return max(
+        NAI_MIN_SIDE,
+        min(
+            ((value + NAI_RESOLUTION_MULTIPLE // 2) // NAI_RESOLUTION_MULTIPLE)
+            * NAI_RESOLUTION_MULTIPLE,
+            NAI_MAX_SIDE,
+        ),
+    )
 
 
 def nai_resolution(extent: Extent) -> Extent:
-    """Adjust extent to be compatible with NAI requirements (multiple of 64)."""
-    w = multiple_of(extent.width, _NAI_RESOLUTION_MULTIPLE)
-    h = multiple_of(extent.height, _NAI_RESOLUTION_MULTIPLE)
-    return Extent(max(w, _NAI_RESOLUTION_MULTIPLE), max(h, _NAI_RESOLUTION_MULTIPLE))
+    """Snap both sides to the nearest valid NAI value."""
+    return Extent(nai_resolution_value(extent.width), nai_resolution_value(extent.height))
 
 
-def clamp_resolution(extent: Extent, max_pixels: int = _NAI_MAX_PIXELS) -> Extent:
+def _reduce_to_pixel_limit(extent: Extent, source: Extent, max_pixels: int) -> Extent:
+    result = extent
+    source_aspect = source.width / max(source.height, 1)
+    while result.pixel_count > max_pixels:
+        candidates = []
+        if result.width > NAI_MIN_SIDE:
+            candidates.append(Extent(result.width - NAI_RESOLUTION_MULTIPLE, result.height))
+        if result.height > NAI_MIN_SIDE:
+            candidates.append(Extent(result.width, result.height - NAI_RESOLUTION_MULTIPLE))
+        if not candidates:
+            break
+        result = min(
+            candidates,
+            key=lambda candidate: (
+                abs(candidate.width / candidate.height - source_aspect),
+                -candidate.pixel_count,
+            ),
+        )
+    return result
+
+
+def nai_auto_resolution(extent: Extent) -> Extent:
+    """Choose an edit resolution from the source size while preserving its ratio."""
+    source = Extent(max(extent.width, 1), max(extent.height, 1))
+    scale = 1.0
+    pixel_limit = NAI_EDIT_MAX_PIXELS
+    if source.pixel_count < NAI_FREE_PIXELS:
+        scale = (NAI_FREE_PIXELS / source.pixel_count) ** 0.5
+        pixel_limit = NAI_FREE_PIXELS
+    elif source.pixel_count > NAI_EDIT_MAX_PIXELS:
+        scale = (NAI_EDIT_MAX_PIXELS / source.pixel_count) ** 0.5
+
+    scale = min(scale, NAI_MAX_SIDE / source.longest_side)
+    target = nai_resolution(Extent(round(source.width * scale), round(source.height * scale)))
+    return _reduce_to_pixel_limit(target, source, pixel_limit)
+
+
+def clamp_resolution(extent: Extent, max_pixels: int = NAI_MAX_PIXELS) -> Extent:
     """Scale down if total pixel count exceeds NAI limits, then align to 64."""
     total = extent.width * extent.height
     if total <= max_pixels:
-        return nai_resolution(extent)
+        target = nai_resolution(extent)
+        return _reduce_to_pixel_limit(target, extent, max_pixels)
 
     scale = (max_pixels / total) ** 0.5
     w = int(extent.width * scale)
     h = int(extent.height * scale)
-    return nai_resolution(Extent(w, h))
+    target = nai_resolution(Extent(w, h))
+    return _reduce_to_pixel_limit(target, extent, max_pixels)
+
+
+def nai_edit_resolution(extent: Extent) -> Extent:
+    return clamp_resolution(extent, NAI_EDIT_MAX_PIXELS)
 
 
 # ---------------------------------------------------------------------------
 # Image encoding
 # ---------------------------------------------------------------------------
+
 
 def image_to_base64(image: Image) -> str:
     """Encode an Image to base64 PNG string for NAI API."""
@@ -268,6 +336,7 @@ def image_to_base64(image: Image) -> str:
 # ---------------------------------------------------------------------------
 # Request body builders
 # ---------------------------------------------------------------------------
+
 
 def build_generate_request(
     prompt: str,
@@ -366,8 +435,8 @@ def build_generate_request(
     # Variety+ — skip CFG above a resolution-dependent sigma threshold. The
     # launcher always sends this key (null when disabled). Reference L97-99.
     if variety_plus:
-        parameters["skip_cfg_above_sigma"] = (
-            58.0 * math.sqrt(4.0 * (width / 8) * (height / 8) / 63232)
+        parameters["skip_cfg_above_sigma"] = 58.0 * math.sqrt(
+            4.0 * (width / 8) * (height / 8) / 63232
         )
     else:
         parameters["skip_cfg_above_sigma"] = None
@@ -417,12 +486,11 @@ def build_generate_request(
     # Vibe Transfer references (must be encodings from ai/encode-vibe for V4+)
     if reference_image_multiple:
         parameters["reference_image_multiple"] = reference_image_multiple
-        parameters["reference_strength_multiple"] = reference_strength_multiple or [
-            0.6
-        ] * len(reference_image_multiple)
+        parameters["reference_strength_multiple"] = reference_strength_multiple or [0.6] * len(
+            reference_image_multiple
+        )
         parameters["reference_information_extracted_multiple"] = (
-            reference_information_extracted_multiple
-            or [1.0] * len(reference_image_multiple)
+            reference_information_extracted_multiple or [1.0] * len(reference_image_multiple)
         )
 
     # Precise (director) reference — field-by-field from the launcher's
@@ -437,9 +505,7 @@ def build_generate_request(
             }
             for r in precise_references
         ]
-        parameters["director_reference_information_extracted"] = [
-            1 for _ in precise_references
-        ]
+        parameters["director_reference_information_extracted"] = [1 for _ in precise_references]
         parameters["director_reference_strength_values"] = [
             r["strength"] for r in precise_references
         ]
@@ -587,7 +653,9 @@ def prepare_nai_precise_reference_image(image: Image) -> Image:
     then center-paste onto a black RGB background.
     """
     from PyQt5.QtCore import Qt as _Qt
-    from PyQt5.QtGui import QColor as _QColor, QImage as _QImage, QPainter as _QPainter
+    from PyQt5.QtGui import QColor as _QColor
+    from PyQt5.QtGui import QImage as _QImage
+    from PyQt5.QtGui import QPainter as _QPainter
 
     src = image._qimage
     w, h = max(src.width(), 1), max(src.height(), 1)
@@ -599,7 +667,9 @@ def prepare_nai_precise_reference_image(image: Image) -> Image:
     scale = min(tw / w, th / h)
     nw, nh = max(round(w * scale), 1), max(round(h * scale), 1)
     scaled = src.scaled(
-        nw, nh, _Qt.AspectRatioMode.IgnoreAspectRatio,
+        nw,
+        nh,
+        _Qt.AspectRatioMode.IgnoreAspectRatio,
         _Qt.TransformationMode.SmoothTransformation,
     )
     canvas = _QImage(tw, th, _QImage.Format.Format_RGB32)
@@ -628,9 +698,9 @@ def prepare_nai_request_mask(mask: Image, target: Extent, latent: int = 8) -> Im
     lh = max(1, th // latent)
 
     gray = _mask_coverage_gray(mask)
-    small = _scale_gray(gray, lw, lh, smooth=False)    # -> latent grid (nearest)
-    binary = _threshold_gray(small)                    # >155 -> 255 else 0
-    big = _scale_gray(binary, tw, th, smooth=False)    # -> target (nearest, aligned)
+    small = _scale_gray(gray, lw, lh, smooth=False)  # -> latent grid (nearest)
+    binary = _threshold_gray(small)  # >155 -> 255 else 0
+    big = _scale_gray(binary, tw, th, smooth=False)  # -> target (nearest, aligned)
     # Grayscale8 0/255 -> RGBA replicates the value into R,G,B with opaque alpha:
     # white (255,255,255,255) where repaint, black (0,0,0,255) elsewhere.
     return Image(big.convertToFormat(_QImage.Format.Format_RGBA8888))
@@ -650,7 +720,7 @@ def _to_alpha8(img):
     if img.format() != _QImage.Format.Format_Grayscale8:
         img = img.convertToFormat(_QImage.Format.Format_Grayscale8)
     else:
-        img = img.copy()                               # detach so reinterpret is legal
+        img = img.copy()  # detach so reinterpret is legal
     img.reinterpretAsFormat(_QImage.Format.Format_Alpha8)
     return img
 
@@ -676,23 +746,24 @@ def composite_nai_patch(generated: Image, mask: Image, target: Extent, feather: 
     A soft edge would have to be biased *outward* (launcher: dilate+blur) to avoid
     re-introducing the interior wash-out; kept out for now to guarantee opacity.
     """
-    from PyQt5.QtGui import QImage as _QImage, QPainter as _QPainter
+    from PyQt5.QtGui import QImage as _QImage
+    from PyQt5.QtGui import QPainter as _QPainter
 
     tw, th = target.width, target.height
     gen = Image.scale(generated, target)
     q = gen._qimage
     patch = q.convertToFormat(_QImage.Format.Format_ARGB32)  # opaque RGB base
-    if patch is q:                                     # already ARGB32 -> own a copy
+    if patch is q:  # already ARGB32 -> own a copy
         patch = patch.copy()
 
-    cov = _mask_coverage_gray(mask)                    # fresh Grayscale8 coverage
-    cov = _scale_gray(cov, tw, th, smooth=False)       # to target (nearest, keep 8bpp)
-    binary = _threshold_gray(cov)                      # >155 -> 255 else 0 (solid interior)
-    clip = _to_alpha8(binary)                          # binarised coverage as alpha
+    cov = _mask_coverage_gray(mask)  # fresh Grayscale8 coverage
+    cov = _scale_gray(cov, tw, th, smooth=False)  # to target (nearest, keep 8bpp)
+    binary = _threshold_gray(cov)  # >155 -> 255 else 0 (solid interior)
+    clip = _to_alpha8(binary)  # binarised coverage as alpha
 
     painter = _QPainter(patch)
     painter.setCompositionMode(_QPainter.CompositionMode.CompositionMode_DestinationIn)
-    painter.drawImage(0, 0, clip)                      # patch.alpha = 255 inside, 0 outside
+    painter.drawImage(0, 0, clip)  # patch.alpha = 255 inside, 0 outside
     painter.end()
     return Image(patch)
 
@@ -825,7 +896,7 @@ def parse_nai_stream_response(data: bytes) -> list[bytes]:
             try:
                 img = base64.b64decode(img)
             except Exception:
-                continue
+                img = b""
         if isinstance(img, (bytes, bytearray)) and len(img) > 0:
             try:
                 sample = int(msg.get("samp_ix") or 0)

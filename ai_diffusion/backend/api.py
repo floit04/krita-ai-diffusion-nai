@@ -95,6 +95,9 @@ class ControlInput:
     # Secondary parameter for NAI modes: vibe "information extracted" (default 0.7)
     # or precise-reference "fidelity" (default 1.0). Unused by other backends.
     param2: float = 1.0
+    # NAI img2img request size. The source image keeps its original extent so the
+    # result can be stretched back to it before it enters generation history.
+    target_extent: Extent | None = None
 
 
 @dataclass
@@ -203,6 +206,7 @@ class WorkflowInput:
     nsfw_filter: float = 0.0
     custom_workflow: CustomWorkflowInput | None = None
     nai_style: str = ""  # filename of the originating Style (NAI: exact-match params)
+    nai_target_extent: Extent | None = None
 
     @property
     def extent(self):

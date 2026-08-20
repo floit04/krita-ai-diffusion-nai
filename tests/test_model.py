@@ -20,11 +20,13 @@ from ai_diffusion.document import KritaDocument
 from ai_diffusion.image import BlendMode, Bounds, Extent, Image, ImageCollection
 from ai_diffusion.layer import Layer, LayerType
 from ai_diffusion.model.connection import Connection, ConnectionState
+from ai_diffusion.model.control_utils import nai_selection_layer_id
 from ai_diffusion.model.custom_workflow import WorkflowCollection
 from ai_diffusion.model.jobs import Job, JobKind, JobParams, JobRegion, JobState
 from ai_diffusion.model.model import DocumentModel, ErrorKind, ProgressKind, no_error
 from ai_diffusion.settings import ApplyBehavior, ApplyRegionBehavior
 from ai_diffusion.style import Style
+from ai_diffusion.util import PluginError
 
 from .conftest import qtapp
 from .mock.client import MockClient
@@ -274,6 +276,216 @@ async def test_generate_inpaint(workflows_dir: Path):
         # (value 255 in grayscale) to confirm the selection was transferred.
         mask_arr = mask_img.to_array()  # shape (H, W, 1), values in [0, 1]
         assert float(mask_arr.max()) > 0.99, "hires_mask should have fully-selected pixels"
+
+
+@qtapp
+async def test_nai_img2img_uses_layer_bounds_and_ignores_selection(workflows_dir: Path):
+    krita_doc = Krita.instance().openDocument("test")
+    source_node = krita_doc.createNode("img2img source", "paintlayer")
+    source = Image.create(Extent(192, 192), fill=Qt.GlobalColor.red)
+    source_bounds = Bounds(73, 91, 192, 192)
+    source_node.setPixelData(source.to_packed_bytes(), *source_bounds)
+    krita_doc.rootNode().addChildNode(source_node, None)
+    krita_doc.setActiveNode(source_node)
+
+    selection = Selection()
+    selection.setPixelData(QByteArray(bytes([0xFF] * 64 * 64)), 10, 20, 64, 64)
+    krita_doc.setSelection(selection)
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+        control = model.regions.control.emplace()
+        control.set_mode(ControlMode.nai_base)
+
+        job = await _run_generate(model, client)
+        work = client.enqueued[0]
+
+        assert work.kind is WorkflowKind.generate
+        assert work.images is not None
+        assert work.images.initial_image is None
+        assert work.images.hires_mask is None
+        assert work.images.extent.target == Extent(1024, 1024)
+        assert job.params.bounds == source_bounds
+
+        assert work.conditioning is not None
+        base = next(c for c in work.conditioning.control if c.mode is ControlMode.nai_base)
+        assert base.image is not None and base.image.extent == source.extent
+        assert base.target_extent == Extent(1024, 1024)
+
+
+@qtapp
+async def test_nai_img2img_target_auto_fill_snap_and_aspect_adapt(workflows_dir: Path):
+    krita_doc = Krita.instance().openDocument("test")
+    source_node = krita_doc.createNode("img2img source", "paintlayer")
+    source = Image.create(Extent(1344, 768), fill=Qt.GlobalColor.red)
+    source_node.setPixelData(source.to_packed_bytes(), 20, 30, *source.extent)
+    krita_doc.rootNode().addChildNode(source_node, None)
+    krita_doc.setActiveNode(source_node)
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+        control = model.regions.control.emplace()
+        control.set_mode(ControlMode.nai_base)
+
+        assert control.target_extent == Extent(1344, 768)
+        control.set_target_extent(Extent(1599, 1000))
+        assert control.target_extent == Extent(1600, 1024)
+        control.adapt_target_resolution()
+        assert control.target_extent == Extent(1600, 896)
+        control.set_target_extent(Extent(1792, 2048))
+        assert control.target_extent == Extent(1664, 1856)
+        await asyncio.sleep(0)
+
+
+@qtapp
+async def test_nai_img2img_selection_uses_visible_projection_and_selection_bounds(
+    workflows_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    krita_doc = Krita.instance().openDocument("test")
+    selection = Selection()
+    selection.setPixelData(QByteArray(bytes([0xFF] * 320 * 192)), 40, 60, 320, 192)
+    krita_doc.setSelection(selection)
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+        control = model.regions.control.emplace()
+        control.set_mode(ControlMode.nai_base)
+        control.set_layer_id(nai_selection_layer_id)
+
+        assert control.is_selection
+        assert control.target_extent == Extent(1344, 768)
+
+        def fail_on_live_mask_read(*args, **kwargs):
+            raise AssertionError("live selection resolution must not materialize a mask")
+
+        monkeypatch.setattr(model.document, "create_mask_from_selection", fail_on_live_mask_read)
+        krita_doc.setSelection(Selection())
+        model.document._poll()  # type: ignore[attr-defined]
+        assert control.target_extent == Extent(1344, 768)
+
+        selection = Selection()
+        selection.setPixelData(QByteArray(bytes([0xFF] * 192 * 192)), 73, 91, 192, 192)
+        krita_doc.setSelection(selection)
+        for _ in range(15):
+            await asyncio.sleep(0.02)
+            if control.target_extent == Extent(1024, 1024):
+                break
+        assert control.target_extent == Extent(1024, 1024)
+
+        captured_bounds: list[Bounds] = []
+        get_current_image = model._get_current_image
+
+        def capture_visible_projection(bounds: Bounds, exclude_internal=True):
+            captured_bounds.append(bounds)
+            return get_current_image(bounds, exclude_internal)
+
+        monkeypatch.setattr(model, "_get_current_image", capture_visible_projection)
+        job = await _run_generate(model, client)
+        work = client.enqueued[0]
+
+        selection_bounds = Bounds(73, 91, 192, 192)
+        assert captured_bounds == [selection_bounds]
+        assert job.params.bounds == selection_bounds
+        assert work.kind is WorkflowKind.generate
+        assert work.images is not None and work.images.hires_mask is None
+        assert work.conditioning is not None
+        base = next(c for c in work.conditioning.control if c.mode is ControlMode.nai_base)
+        assert base.image is not None and base.image.extent == selection_bounds.extent
+        assert base.target_extent == Extent(1024, 1024)
+
+
+@qtapp
+async def test_nai_img2img_selection_target_follows_replaced_document_wrapper(
+    workflows_dir: Path,
+):
+    krita_doc = Krita.instance().openDocument("test")
+    selection = Selection()
+    selection.setPixelData(QByteArray(bytes([0xFF] * 192 * 192)), 20, 30, 192, 192)
+    krita_doc.setSelection(selection)
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+        control = model.regions.control.emplace()
+        control.set_mode(ControlMode.nai_base)
+        control.set_layer_id(nai_selection_layer_id)
+        assert control.target_extent == Extent(1024, 1024)
+
+        replacement_doc = MockKritaDocument(512, 512)  # type: ignore[call-arg]
+        Krita.instance().setActiveDocument(replacement_doc)
+        Krita.instance().openDocument("replacement")
+        original = model.document
+        assert isinstance(original, KritaDocument)
+        replacement = KritaDocument(replacement_doc, original.id)
+        model.document = replacement
+
+        replacement_selection = Selection()
+        replacement_selection.setPixelData(QByteArray(bytes([0xFF] * 320 * 192)), 40, 60, 320, 192)
+        replacement_doc.setSelection(replacement_selection)
+        for _ in range(15):
+            await asyncio.sleep(0.02)
+            if control.target_extent == Extent(1344, 768):
+                break
+        Krita.instance().setActiveDocument(krita_doc)
+
+        assert control.target_extent == Extent(1344, 768)
+
+        replacement_layer = replacement.layers.active
+        control.set_layer_id(replacement_layer.id)
+        control.set_target_extent(Extent(1216, 832))
+        replacement_selection = Selection()
+        replacement_selection.setPixelData(QByteArray(bytes([0xFF] * 384 * 128)), 10, 15, 384, 128)
+        replacement_doc.setSelection(replacement_selection)
+        replacement._poll()  # type: ignore[attr-defined]
+        assert control.target_extent == Extent(1216, 832)
+        await asyncio.sleep(0)
+
+
+@qtapp
+async def test_nai_img2img_selection_requires_an_active_selection(workflows_dir: Path):
+    krita_doc = Krita.instance().openDocument("test")
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+        control = model.regions.control.emplace()
+        control.set_mode(ControlMode.nai_base)
+        control.set_layer_id(nai_selection_layer_id)
+
+        with pytest.raises(PluginError, match="no active selection"):
+            model._prepare_workflow()
+        await asyncio.sleep(0)
+
+
+@qtapp
+async def test_nai_redraw_preserves_source_and_sets_automatic_target(workflows_dir: Path):
+    krita_doc = MockKritaDocument(2500, 1400)  # type: ignore[call-arg]
+    Krita.instance().setActiveDocument(krita_doc)
+    Krita.instance().openDocument("test")
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+        model.strength = 0.5
+
+        job = await _run_generate(model, client)
+        work = client.enqueued[0]
+
+        assert work.kind is WorkflowKind.refine
+        assert work.images is not None and work.images.initial_image is not None
+        assert work.images.initial_image.extent == Extent(2500, 1400)
+        assert work.images.extent.target == Extent(2500, 1400)
+        assert work.nai_target_extent == Extent(2048, 1152)
+        assert job.params.bounds == Bounds(0, 0, 2500, 1400)
 
 
 @qtapp

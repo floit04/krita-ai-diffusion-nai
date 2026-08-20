@@ -1,0 +1,67 @@
+{
+  "state": "automated_verified",
+  "issue": "NAI edit targets must not exceed the provider total-pixel limit",
+  "before": {
+    "timestamp": "2026-08-20T07:14:26+08:00",
+    "reproduction": "Choose NAI img2img, enter or automatically obtain a 1792x2048 target, and submit the generation request.",
+    "expected": "The target is corrected on commit to a 64-pixel-grid size with each side at most 2048 and total pixels at most 3145728; the final request repeats the same validation.",
+    "actual": "The UI accepted 1792x2048 (3670016 pixels) because edit requests incorrectly used 2048x2048 as their total-pixel limit, and NovelAI rejected the request with HTTP 400: resolution and n_samples are above the allowed limit."
+  },
+  "adjacent_working_case": "A 1600x896 img2img target is already legal and must remain unchanged; text generation, independent layer img2img, selection img2img, redraw, infill, Vibe, and Precise Reference request paths must retain their existing behavior.",
+  "hypothesis": "NAI_EDIT_MAX_PIXELS incorrectly equaled 2048 squared even though 2048 is only a per-side cap and the provider total-pixel cap is 3145728.",
+  "disproof": "The hypothesis would be false if any edit request could still leave the final request boundary above 3145728 pixels after replacing the edit cap and applying pair-wise validation at UI/model entry points.",
+  "changed_files": [
+    "ai_diffusion/backend/nai_workflow.py",
+    "ai_diffusion/model/control.py",
+    "tests/test_nai.py",
+    "tests/test_model.py",
+    "docs/quality-reports/nai-edit-pixel-limit.json",
+    "docs/quality-reports/nai-img2img-layer-resolution.json"
+  ],
+  "rollback": {
+    "kind": "deployed_backup",
+    "location": "C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-backups\\20260820-071011",
+    "artifact_hash": "0F367F232757C94670B9FD21D2B35987F3A264A06599B195A3049025D10E7CDC"
+  },
+  "checks": {
+    "static": [
+      "python -m ruff format <all changed Python files>: 2 files reformatted, 9 unchanged",
+      "python -m ruff check <all changed Python files>: passed",
+      "python -m pyright <all changed Python files>: 0 errors, 0 warnings"
+    ],
+    "contract": [
+      "python -m pytest tests/test_nai.py tests/test_model.py tests/test_persistence.py tests/test_api.py tests/test_text.py -q: 71 passed",
+      "1792x2048 is corrected to 1664x1856 at both the editable model boundary and final NovelAI request boundary",
+      "Automatic edit targets spanning small, middle, oversized, square, and extreme-aspect sources are multiples of 64, have sides no larger than 2048, and total no larger than 3145728",
+      "An 1800x1800 infill source and mask are both encoded at the same legal 1728x1792 request extent"
+    ],
+    "negative_controls": [
+      "1600x896 and 1344x768 legal middle-range edit targets remain unchanged",
+      "192x192 automatically enlarges to 1024x1024 under the free-pixel policy",
+      "Independent layer img2img keeps action=img2img and sends no infill mask",
+      "Selection img2img still uses the visible projection inside selection bounds and restores the same offset",
+      "Precise Reference and Vibe request compatibility assertions remain passing",
+      "Runnable fast suite excluding Python 3.11-only collection files: 320 passed, 32 skipped; 7 environment setup errors require tests/server"
+    ],
+    "build_deploy": [
+      "Installed plugin backed up at C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-backups\\20260820-072052",
+      "Updated backend/nai_workflow.py and model/control.py deployed to C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita\\ai_diffusion",
+      "Deployed artifact comparison: 647 files including ai_diffusion.desktop checked with 0 missing or hash-mismatched files",
+      "User settings.json and nai_vibe_cache.json remained present after deployment",
+      "Krita process 23228 was left running and was not forcibly closed"
+    ],
+    "runtime": [],
+    "quality": []
+  },
+  "remaining_risks": [
+    "No paid NovelAI request was sent, so live provider acceptance is not yet verified.",
+    "Krita was running during deployment preparation; the newly deployed Python sources require a Krita restart before host verification.",
+    "tests/test_workflow.py and tests/test_image_transfer.py cannot collect under the installed Python 3.10 because datetime.UTC requires Python 3.11 or newer.",
+    "Seven unrelated fast-suite tests require a local tests/server ComfyUI installation."
+  ],
+  "manual_verification": [
+    "Restart Krita, choose NAI img2img, enter 1792x2048, press Enter or leave the field, and confirm the displayed target becomes 1664x1856.",
+    "Repeat with the img2img source set to Selection and confirm the same correction applies without sending an infill mask.",
+    "With approval to spend Anlas, submit one corrected request and confirm NovelAI no longer returns the resolution-and-n_samples HTTP 400."
+  ]
+}

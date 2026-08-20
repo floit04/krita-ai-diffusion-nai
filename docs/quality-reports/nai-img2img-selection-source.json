@@ -1,0 +1,70 @@
+{
+  "state": "automated_verified",
+  "issue": "NAI img2img needs a visible-projection selection source",
+  "before": {
+    "timestamp": "2026-08-20T07:08:18+08:00",
+    "reproduction": "Add an NAI img2img control and open its source-layer dropdown while a Krita selection is active.",
+    "expected": "The dropdown includes 选区; choosing it captures the visible-layer projection inside the exact selection bounds, auto-fills the target resolution, runs independent img2img, and returns the result at the selection offset.",
+    "actual": "The dropdown only offered whole canvas and document layers, so a visible composite inside the selection could not be used as the independent img2img source."
+  },
+  "adjacent_working_case": "Whole-canvas and concrete-layer img2img sources retain their existing source pixels, automatic target sizing, and result placement.",
+  "hypothesis": "The source selector and ControlLayer only represent a null whole-canvas ID or a real layer ID, so no stable value can route selection bounds to the visible document projection.",
+  "disproof": "The hypothesis would be false if a persisted selection source ID already reached ControlLayer.to_api as a visible projection crop and DocumentModel already used its selection bounds for job placement.",
+  "changed_files": [
+    "ai_diffusion/model/control.py",
+    "ai_diffusion/model/control_utils.py",
+    "ai_diffusion/model/model.py",
+    "ai_diffusion/ui/control.py",
+    "tests/test_model.py",
+    "tests/test_persistence.py",
+    "docs/quality-reports/nai-img2img-selection-source.json"
+  ],
+  "rollback": {
+    "kind": "git_commit",
+    "location": "f6b0b9d8995fd1b102a678df43d1404d15cdbc29"
+  },
+  "checks": {
+    "static": [
+      "python -m ruff check <changed Python files>: passed",
+      "python -m ruff format --check <changed Python files>: passed",
+      "python -m pyright <changed Python files>: 0 errors",
+      "python -c import ai_diffusion.ui.control: passed"
+    ],
+    "contract": [
+      "python -m pytest tests/test_nai.py tests/test_model.py tests/test_persistence.py tests/test_api.py tests/test_text.py -q: 71 passed",
+      "Selection source assertion: visible-projection capture receives exact Bounds(73,91,192,192)",
+      "Independent img2img assertion: workflow kind remains generate, hires_mask is absent, and nai_base image is 192x192",
+      "Automatic target assertion: a 320x192 selection chooses 1344x768 and changing it to 192x192 updates the target to 1024x1024",
+      "Placement assertion: job bounds equal the selection bounds and the restored result therefore retains the selection offset",
+      "Persistence assertion: the special selection source ID and custom target extent survive document ModelSync reload"
+    ],
+    "negative_controls": [
+      "No active selection raises an explicit PluginError instead of silently falling back to whole-canvas generation",
+      "Concrete-layer img2img still ignores an unrelated selection and preserves the source layer's full bounds",
+      "Whole-canvas source remains represented by the null layer ID",
+      "Non-img2img NAI modes reset the selection sentinel to whole canvas",
+      "Runnable fast suite reached 320 passed and 32 skipped; 7 unrelated tests require a local ComfyUI test server"
+    ],
+    "build_deploy": [
+      "Deployed source-layout plugin to C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita\\ai_diffusion and ai_diffusion.desktop",
+      "Deployed manifest comparison: 647 files checked with 0 missing, unexpected, or hash-mismatched files",
+      "Selection-source runtime files model/control.py, model/control_utils.py, model/model.py, and ui/control.py match workspace SHA256 hashes",
+      "Previous installed plugin backed up at C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-backups\\20260820-072052",
+      "User settings.json and nai_vibe_cache.json confirmed present after deployment"
+    ],
+    "runtime": [],
+    "quality": []
+  },
+  "remaining_risks": [
+    "The updated plugin has not been restarted and exercised in a real Krita host.",
+    "No paid NovelAI request or controlled same-seed website comparison was run, so provider acceptance and output parity remain unverified.",
+    "Irregular selections use their rectangular pixel bounds as the img2img source and placement extent; they are not sent as an infill mask.",
+    "The full suite still cannot collect test_workflow.py and test_image_transfer.py under Python 3.10 because datetime.UTC requires Python 3.11."
+  ],
+  "manual_verification": [
+    "Restart Krita, create a selection over content composed from multiple visible layers, add 图生图, and choose 选区 in its source dropdown.",
+    "Confirm the target width and height update from the selection dimensions and continue to snap/edit like concrete-layer targets.",
+    "Generate and confirm the result-list preview is selection-sized and applies at the exact original selection offset without turning into ordinary inpaint.",
+    "For output-parity testing, use the same source pixels, model, seed, prompt, negative prompt, sampler, steps, guidance, strength, noise, and target resolution on the NovelAI website and in Krita."
+  ]
+}

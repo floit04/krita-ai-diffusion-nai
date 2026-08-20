@@ -10,9 +10,11 @@ from krita import Document as MockKritaDocument
 from krita import Krita
 
 from ai_diffusion.backend.api import FillMode, InpaintMode
+from ai_diffusion.backend.resources import ControlMode
 from ai_diffusion.document import KritaDocument
 from ai_diffusion.image import Bounds, Extent, Image, ImageCollection
 from ai_diffusion.model.connection import Connection
+from ai_diffusion.model.control_utils import nai_selection_layer_id
 from ai_diffusion.model.custom_workflow import WorkflowCollection
 from ai_diffusion.model.jobs import Job, JobKind, JobParams, JobState
 from ai_diffusion.model.model import DocumentModel, InpaintContext, QueueMode
@@ -115,12 +117,15 @@ def test_recently_used(workflows_dir: Path, tmp_path: Path):
 
 
 @qtapp
-async def test_sync(workflows_dir: Path):
+async def test_sync(workflows_dir: Path, monkeypatch: pytest.MonkeyPatch):
     """ModelSync persists DocumentModel state as a document annotation and restores it when a new
     ModelSync is created for the same document."""
 
     krita_doc = Krita.instance().openDocument("test")
     model1 = _make_model(krita_doc, workflows_dir)
+    from ai_diffusion.model.root import root as plugin_root
+
+    monkeypatch.setattr(plugin_root, "_connection", model1._connection, raising=False)
 
     style = _make_style("synced.json", "synced_sd15.safetensors")
     model1.style = style
@@ -140,6 +145,10 @@ async def test_sync(workflows_dir: Path):
     model1.upscale.upscaler = "4x-UltraSharp.pt"
     model1.upscale.strength = 0.42
     model1.upscale.use_diffusion = False
+    control = model1.regions.control.emplace()
+    control.set_mode(ControlMode.nai_base)
+    control.set_layer_id(nai_selection_layer_id)
+    control.set_target_extent(Extent(832, 1216))
 
     # Create sync and let it flush (it saves immediately on construction and on demand)
     sync1 = ModelSync(model1)
@@ -150,6 +159,7 @@ async def test_sync(workflows_dir: Path):
     Krita.instance().setActiveDocument(krita_doc)
     doc2 = KritaDocument(krita_doc, None)
     conn2 = Connection()
+    monkeypatch.setattr(plugin_root, "_connection", conn2)
     wf_coll2 = WorkflowCollection(conn2, folder=workflows_dir)
     model2 = DocumentModel(doc2, conn2, wf_coll2)
     _sync2 = ModelSync(model2)  # triggers _load() from annotation
@@ -170,6 +180,10 @@ async def test_sync(workflows_dir: Path):
     assert model2.upscale.upscaler == model1.upscale.upscaler
     assert model2.upscale.strength == pytest.approx(model1.upscale.strength)
     assert model2.upscale.use_diffusion == model1.upscale.use_diffusion
+    assert len(model2.regions.control) == 1
+    assert model2.regions.control[0].mode is ControlMode.nai_base
+    assert model2.regions.control[0].is_selection
+    assert model2.regions.control[0].target_extent == Extent(832, 1216)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,63 @@
+{
+  "state": "automated_verified",
+  "issue": "NAI selection resolution listener raises inside Krita lasso events",
+  "before": {
+    "timestamp": "2026-08-20T07:36:38+08:00",
+    "reproduction": "Choose Selection as the NAI img2img source and begin or replace a lasso selection so Krita briefly exposes a Selection object with zero-sized bounds before the lasso closes.",
+    "expected": "The transient state is ignored, Krita's lasso remains usable, and the target resolution updates only after valid non-zero bounds are available.",
+    "actual": "ControlLayer._update_selection_target called create_mask_from_selection during the transient event; Mask received zero-sized bounds, constructed a null QImage, and raised AssertionError into Krita's tool event loop."
+  },
+  "adjacent_working_case": "A completed non-zero selection updates the target resolution, clearing a selection preserves the last target, concrete-layer img2img ignores selection events, and completed masks remain available to redraw workflows.",
+  "hypothesis": "The live target-resolution listener unnecessarily materializes the full selection mask, and create_mask_from_selection does not reject zero-sized transitional selections before constructing Mask.",
+  "disproof": "The hypothesis is false if the listener still raises after it reads only cached bounds and the document boundary returns no mask for zero-sized selections.",
+  "changed_files": [
+    "ai_diffusion/document.py",
+    "ai_diffusion/model/control.py",
+    "tests/test_document.py",
+    "tests/test_model.py",
+    "docs/quality-reports/krita-lasso-transient-selection.json"
+  ],
+  "rollback": {
+    "kind": "deployed_backup",
+    "location": "C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-backups\\20260820-073459",
+    "artifact_hash": "75262DD599F50E71244D55F62F39950A353F18AE40CAF73C622866B3D5781063"
+  },
+  "checks": {
+    "static": [
+      "python -m ruff format <all changed Python files>: passed",
+      "python -m ruff check <all changed Python files>: passed",
+      "python -m pyright <all changed Python files>: 0 errors, 0 warnings"
+    ],
+    "contract": [
+      "Pre-change canonical regression reproduced ai_diffusion/image.py Mask.__init__ AssertionError for Bounds(0,0,0,0)",
+      "python -m pytest tests/test_document.py tests/test_model.py -q -k 'empty_in_progress_selection or nai_img2img_selection': 4 passed",
+      "python -m pytest tests/test_nai.py tests/test_model.py tests/test_document.py tests/test_persistence.py tests/test_api.py tests/test_text.py -q: 80 passed",
+      "Zero-sized Selection returns (None, None) from create_mask_from_selection and is normalized to no cached selection bounds",
+      "After the zero-sized transition, a completed 192x192 selection updates the target from the preserved 1344x768 value to 1024x1024"
+    ],
+    "negative_controls": [
+      "The live target-resolution test replaces create_mask_from_selection with a failing stub and still completes selection updates and independent img2img request assembly",
+      "Completed non-zero selections still provide exact visible-projection bounds and automatic target resolution",
+      "Concrete-layer img2img keeps its explicit target when selection changes",
+      "Runnable fast suite excluding Python 3.11-only collection files: 322 passed, 32 skipped; 7 environment setup errors require tests/server"
+    ],
+    "build_deploy": [
+      "Installed plugin backed up at C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-backups\\20260820-074219",
+      "Updated document.py and model/control.py deployed to C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita\\ai_diffusion",
+      "Deployed artifact comparison: 647 files including ai_diffusion.desktop checked with 0 missing or hash-mismatched files",
+      "User settings.json and nai_vibe_cache.json remained present after deployment",
+      "Krita process 19876 was left running and was not forcibly closed"
+    ],
+    "runtime": [],
+    "quality": []
+  },
+  "remaining_risks": [
+    "The exact lasso gesture has not yet been replayed inside the production Krita host after deployment.",
+    "Krita was running during deployment, so the new Python source requires a restart before host verification.",
+    "tests/test_workflow.py and tests/test_image_transfer.py cannot collect under the installed Python 3.10 because datetime.UTC requires Python 3.11 or newer.",
+    "Seven unrelated fast-suite tests require a local tests/server ComfyUI installation."
+  ],
+  "manual_verification": [
+    "Restart Krita, choose Selection as the NAI img2img source, repeatedly start, cancel, replace, and close lasso selections, and confirm no traceback appears and the target updates after each completed selection."
+  ]
+}

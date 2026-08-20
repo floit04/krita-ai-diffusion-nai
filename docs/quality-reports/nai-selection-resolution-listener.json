@@ -1,0 +1,62 @@
+{
+  "state": "automated_verified",
+  "issue": "NAI selection img2img target resolution does not follow selection changes",
+  "before": {
+    "timestamp": "2026-08-20T07:29:16+08:00",
+    "reproduction": "Choose Selection as the NAI img2img source, note the automatically calculated target resolution, then replace or resize the Krita selection after the document wrapper has been refreshed by the host.",
+    "expected": "The current selection bounds trigger a new automatic target resolution and the width and height controls update without reselecting Selection.",
+    "actual": "The target resolution remains calculated from the previous selection. The existing automated test manually called the original document wrapper poll method and did not cover host wrapper replacement."
+  },
+  "adjacent_working_case": "Selecting Selection initially calculates a target, changing the selection on the original document wrapper updates it, and concrete-layer img2img targets must not react to selection changes.",
+  "hypothesis": "ControlLayer connects directly to the document wrapper that existed at construction, while DocumentModel may replace that wrapper when Krita refreshes its Python document object; the selection signal is never rebound to the current wrapper.",
+  "disproof": "The hypothesis is false if a control connected only to the original wrapper still updates when selection_bounds_changed is emitted exclusively by a replacement wrapper.",
+  "changed_files": [
+    "ai_diffusion/model/control.py",
+    "ai_diffusion/model/model.py",
+    "tests/test_model.py",
+    "docs/quality-reports/nai-selection-resolution-listener.json"
+  ],
+  "rollback": {
+    "kind": "deployed_backup",
+    "location": "C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-backups\\20260820-072052",
+    "artifact_hash": "81F48CA6AFA24DE3B67CDC9B51B05F2AC6F037AAA04E0B1FB1F070477F7DB0A2"
+  },
+  "checks": {
+    "static": [
+      "python -m ruff format <all changed Python files>: passed",
+      "python -m ruff check <all changed Python files>: passed",
+      "python -m pyright <all changed Python files>: 0 errors, 0 warnings"
+    ],
+    "contract": [
+      "Pre-change canonical regression: replacement document wrapper emitted its selection change but target stayed 1024x1024; test failed as expected",
+      "python -m pytest tests/test_model.py -q -k nai_img2img_selection: 3 passed",
+      "python -m pytest tests/test_nai.py tests/test_model.py tests/test_document.py tests/test_persistence.py tests/test_api.py tests/test_text.py -q: 79 passed",
+      "Selection target follows a real 20ms polling event from 192x192 to 320x192 and updates from 1024x1024 to 1344x768",
+      "After DocumentModel replaces its KritaDocument wrapper, ControlLayer disconnects the old selection signal and binds the new wrapper before recalculating"
+    ],
+    "negative_controls": [
+      "Changing selection after switching the same control to a concrete layer preserves its explicit 1216x832 target",
+      "No active selection still raises the explicit img2img selection error",
+      "Independent selection img2img still captures the visible projection at the selection bounds",
+      "Runnable fast suite excluding Python 3.11-only collection files: 321 passed, 32 skipped; 7 environment setup errors require tests/server"
+    ],
+    "build_deploy": [
+      "Installed plugin backed up at C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita-backups\\20260820-073459",
+      "Updated model/control.py and model/model.py deployed to C:\\Users\\Tu\\AppData\\Roaming\\krita\\pykrita\\ai_diffusion",
+      "Deployed artifact comparison: 647 files including ai_diffusion.desktop checked with 0 missing or hash-mismatched files",
+      "User settings.json and nai_vibe_cache.json remained present after deployment",
+      "Krita process 19876 was left running and was not forcibly closed"
+    ],
+    "runtime": [],
+    "quality": []
+  },
+  "remaining_risks": [
+    "The exact production event sequence has not yet been reproduced under an instrumented Krita host.",
+    "Krita was running during deployment, so the new Python source requires a restart before host verification.",
+    "tests/test_workflow.py and tests/test_image_transfer.py cannot collect under the installed Python 3.10 because datetime.UTC requires Python 3.11 or newer.",
+    "Seven unrelated fast-suite tests require a local tests/server ComfyUI installation."
+  ],
+  "manual_verification": [
+    "Restart Krita, select NAI img2img source Selection, resize or replace the selection, and confirm the target resolution changes without reselecting the source."
+  ]
+}
