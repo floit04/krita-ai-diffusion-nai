@@ -29,6 +29,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
     QHBoxLayout,
+    QLabel,
     QListView,
     QListWidget,
     QListWidgetItem,
@@ -37,15 +38,18 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSlider,
+    QSpinBox,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ..backend.api import InpaintContext
-from ..backend.resources import Arch
+from ..backend.nai_focused import MIN_CONTEXT_MAX, MIN_CONTEXT_MIN
+from ..backend.resources import Arch, ControlMode
 from ..backend.workflow import FillMode, InpaintMode
-from ..document import SELECTION_PAINT_LAYER_NAME
+from ..document import FOCUS_BOX_LAYER_NAME, SELECTION_PAINT_LAYER_NAME
 from ..image import Bounds, Extent, Image
 from ..localization import translate as _
 from ..model.jobs import Job, JobKind, JobParams, JobQueue, JobState
@@ -757,6 +761,41 @@ class GenerationWidget(QWidget):
         self.region_prompt = RegionPromptWidget(self)
         layout.addWidget(self.region_prompt)
 
+        # NAI output resolution. Applies to txt2img, img2img and inpaint alike, so
+        # it lives here rather than inside the img2img control layer where it used
+        # to hide. It follows the selection/canvas automatically (debounced in the
+        # model) and can be edited or snapped to the free tier at any time.
+        self.target_resolution_row = QWidget(self)
+        target_layout = QHBoxLayout(self.target_resolution_row)
+        target_layout.setContentsMargins(0, 0, 0, 0)
+        target_layout.setSpacing(4)
+        target_layout.addWidget(QLabel("目标分辨率:", self.target_resolution_row))
+        self.target_width_input = QSpinBox(self.target_resolution_row)
+        self.target_height_input = QSpinBox(self.target_resolution_row)
+        for spinbox in (self.target_width_input, self.target_height_input):
+            spinbox.setRange(1, 16384)
+            spinbox.setSingleStep(64)
+            spinbox.setKeyboardTracking(False)
+            spinbox.editingFinished.connect(self._commit_target_resolution)
+        self.target_resolution_adapt = QToolButton(self.target_resolution_row)
+        self.target_resolution_adapt.setText("自动")
+        self.target_resolution_adapt.setToolTip(
+            "按当前选区(没有选区时按画布)的原始比例自动适配分辨率"
+        )
+        self.target_resolution_free = QToolButton(self.target_resolution_row)
+        self.target_resolution_free.setText("小")
+        self.target_resolution_free.setToolTip(
+            "缩到免费档内的最大分辨率(保持当前比例)。\n"
+            "NAI 的免费判定看的是总像素数 ≤ 1024x1024 = 1,048,576(且步数 ≤ 28),"
+            "不是单边长度 —— 所以 1024x1024 和 1920x512 一样免费。"
+        )
+        target_layout.addWidget(self.target_width_input, 1)
+        target_layout.addWidget(QLabel("×", self.target_resolution_row))
+        target_layout.addWidget(self.target_height_input, 1)
+        target_layout.addWidget(self.target_resolution_adapt)
+        target_layout.addWidget(self.target_resolution_free)
+        layout.addWidget(self.target_resolution_row)
+
         self.strength_slider = StrengthWidget(parent=self)
         self.layer_count_widget = LayerCountWidget(self)
         self.layer_count_widget.setVisible(False)
@@ -774,19 +813,69 @@ class GenerationWidget(QWidget):
             self.paint_selection_button.setIcon(theme.icon("region-add"))
         self.paint_selection_button.setToolTip(
             "绘制重绘区域:开启后用 Krita 画笔直接在画布上涂抹要重绘的区域"
-            "(压感/笔刷预设/橡皮擦都是原生逻辑)。此按钮只控制涂抹图层的显示和隐藏,不会删除它。\n"
+            "(压感/笔刷预设/橡皮擦都是原生逻辑)。再次点击此按钮会删除涂抹图层。\n"
             f"只要「{SELECTION_PAINT_LAYER_NAME}」图层还在,不论显示还是隐藏,点生成都按涂抹区域重绘"
-            "(此时强度最高 99%);要取消重绘,在图层面板里删掉该图层。\n"
+            "(此时强度最高 99%);生成后图层自动隐藏但仍然生效。\n"
+            "在图层面板里手动删掉该图层同样取消重绘,按钮会自动回到未开启状态。\n"
             "画布上已有选区时以选区为准,涂抹图层不参与。"
         )
         self.paint_selection_button.toggled.connect(self._toggle_selection_paint)
+
+        self.focus_inpaint_button = QToolButton(self)
+        self.focus_inpaint_button.setCheckable(True)
+        try:
+            from krita import Krita as _Krita
+
+            self.focus_inpaint_button.setIcon(_Krita.instance().icon("tool_crop"))
+        except Exception:
+            self.focus_inpaint_button.setIcon(theme.icon("inpaint-expand"))
+        self.focus_inpaint_button.setToolTip(
+            "聚焦重绘:开启后画布上出现一个可拖动的框,只有框内(加一圈上下文)的画面会被发出去重绘。\n"
+            "大画布上正常重绘会先把整张图压到目标分辨率,选区那一小块因此糊掉一档;聚焦重绘让选区独占"
+            "整个请求分辨率。\n"
+            f"框是「{FOCUS_BOX_LAYER_NAME}」矢量图层,用 Krita 的形状工具拖拽缩放"
+            "(开启时会自动切到该工具并选中该图层)。\n"
+            "框被限制在 1 MP 以内:松开鼠标后超出的部分会自动收回,收的是另一条边,"
+            "所以聚焦重绘不消耗点数。\n"
+            "再次点击此按钮会删除该图层;生成后图层自动隐藏但仍然生效;"
+            "在图层面板里手动删掉它,按钮会自动回到未开启状态。\n"
+            "重绘区域仍然以画布选区(优先)或涂抹图层为准,框只决定发送范围。"
+        )
+        self.focus_inpaint_button.toggled.connect(self._toggle_focus_inpaint)
+
         strength_layout = QHBoxLayout()
         strength_layout.addWidget(self.strength_slider)
         strength_layout.addWidget(self.layer_count_widget)
         strength_layout.addWidget(self.paint_selection_button)
+        strength_layout.addWidget(self.focus_inpaint_button)
         strength_layout.addWidget(self.add_control_button)
         strength_layout.addWidget(self.add_region_button)
         layout.addLayout(strength_layout)
+
+        # Revealed by the focus button: how much surrounding context is included in
+        # the crop, plus a readout of the resolution the crop will be sent at.
+        self.focus_options = QWidget(self)
+        self.focus_options.setVisible(False)
+        focus_layout = QHBoxLayout(self.focus_options)
+        focus_layout.setContentsMargins(0, 0, 0, 0)
+        focus_layout.setSpacing(4)
+        focus_layout.addWidget(QLabel("最小上下文:", self.focus_options))
+        self.min_context_slider = QSlider(Qt.Orientation.Horizontal, self.focus_options)
+        self.min_context_slider.setRange(MIN_CONTEXT_MIN, MIN_CONTEXT_MAX)
+        self.min_context_slider.setSingleStep(8)
+        self.min_context_slider.setPageStep(16)
+        self.min_context_slider.setToolTip(
+            "框的四周额外附带多少像素的画面作为上下文,让重绘结果能接上周围的内容。"
+        )
+        self.min_context_label = QLabel(self.focus_options)
+        self.focus_request_label = QLabel(self.focus_options)
+        self.focus_request_label.setToolTip(
+            "聚焦重绘实际发送的分辨率(始终 ≤ 1 MP,不受目标分辨率影响)"
+        )
+        focus_layout.addWidget(self.min_context_slider, 1)
+        focus_layout.addWidget(self.min_context_label)
+        focus_layout.addWidget(self.focus_request_label)
+        layout.addWidget(self.focus_options)
 
         self.custom_inpaint = CustomInpaintWidget(self)
         layout.addWidget(self.custom_inpaint)
@@ -843,22 +932,63 @@ class GenerationWidget(QWidget):
     def model(self):
         return self._model
 
+    def _commit_target_resolution(self):
+        self.model.set_nai_target_extent(
+            Extent(self.target_width_input.value(), self.target_height_input.value())
+        )
+        self._update_target_resolution()
+
+    def _update_target_resolution(self):
+        # The model normalizes to the 64px grid, so echo back what it actually took.
+        blocked = (
+            theme.SignalBlocker(self.target_width_input),
+            theme.SignalBlocker(self.target_height_input),
+        )
+        with blocked[0], blocked[1]:
+            self.target_width_input.setValue(self.model.nai_target_width)
+            self.target_height_input.setValue(self.model.nai_target_height)
+
+    def _toggle_focus_inpaint(self, checked: bool):
+        self.model.nai_focused_inpaint = checked
+
+    def _sync_focus_inpaint_button(self):
+        enabled = self.model.nai_focused_inpaint
+        with theme.SignalBlocker(self.focus_inpaint_button):
+            self.focus_inpaint_button.setChecked(enabled)
+        self.focus_options.setVisible(enabled)
+        self._update_focus_options()
+
+    def _update_focus_options(self):
+        self.min_context_label.setText(f"{self.model.nai_min_context} px")
+        geometry = self.model.nai_focus_geometry
+        if geometry is None:
+            self.focus_request_label.setText("聚焦请求: —")
+        else:
+            request = geometry.request
+            self.focus_request_label.setText(f"聚焦请求: {request.width}×{request.height}")
+
     def _toggle_selection_paint(self, checked: bool):
         doc = self._model.document
         if checked:
             doc.start_selection_painting()
         else:
-            doc.stop_selection_painting()
+            doc.discard_selection_painting()
 
-    def _update_selection_paint_button(self):
-        self._sync_selection_paint_button(self._model)
+    def _update_overlay_buttons(self):
+        """Both overlays are owned by their layer, so deleting a layer in the
+        docker has to put its button back into the "create one" state — otherwise
+        the next click would be spent switching a state that is already gone."""
+        model = self._model
+        if model.nai_focused_inpaint and model.document.focus_box_layer is None:
+            model.nai_focused_inpaint = False
+        self._sync_selection_paint_button(model)
+        self._sync_focus_inpaint_button()
 
     def _sync_selection_paint_button(self, model: DocumentModel):
-        """Reflect the overlay's actual state — it may have been deleted or hidden
-        in the layer docker, or belong to a document we just switched to."""
-        layer = model.document.selection_paint_layer
+        """Checked means the layer exists, hidden or not: that is what the next
+        click deletes. Generating hides the layer, and leaves it in effect."""
         with theme.SignalBlocker(self.paint_selection_button):
-            self.paint_selection_button.setChecked(layer is not None and layer.is_visible)
+            self.paint_selection_button.setChecked(model.document.selection_paint_layer is not None)
 
     @model.setter
     def model(self, model: DocumentModel):
@@ -866,6 +996,8 @@ class GenerationWidget(QWidget):
             Binding.disconnect_all(self._model_bindings)
             self._sync_selection_paint_button(model)
             self._model = model
+            self._sync_focus_inpaint_button()
+            self._update_target_resolution()
             self._model_bindings = [
                 bind(model, "workspace", self.workspace_select, "value", Bind.one_way),
                 bind(model, "style", self.style_select, "value"),
@@ -877,12 +1009,20 @@ class GenerationWidget(QWidget):
                 model.strength_changed.connect(self.update_generate_options),
                 model.document.selection_bounds_changed.connect(self.update_generate_options),
                 model.document.layers.active_changed.connect(self.update_generate_options),
-                # Deleting the overlay in the layer docker cancels redraw mode.
-                model.document.layers.changed.connect(self._update_selection_paint_button),
+                # Deleting an overlay in the layer docker cancels its mode.
+                model.document.layers.changed.connect(self._update_overlay_buttons),
                 model.regions.active_changed.connect(self.update_generate_options),
                 model.region_only_changed.connect(self.update_generate_options),
                 model.style_changed.connect(self.update_generate_options),
                 model.edit_mode_changed.connect(self.update_generate_options),
+                bind(model, "nai_min_context", self.min_context_slider, "value"),
+                model.nai_target_width_changed.connect(self._update_target_resolution),
+                model.nai_target_height_changed.connect(self._update_target_resolution),
+                model.nai_focused_inpaint_changed.connect(self._sync_focus_inpaint_button),
+                model.nai_focus_geometry_changed.connect(self._update_focus_options),
+                model.nai_min_context_changed.connect(self._update_focus_options),
+                self.target_resolution_adapt.clicked.connect(model.adapt_nai_target_resolution),
+                self.target_resolution_free.clicked.connect(model.shrink_nai_target_to_free),
                 self.add_control_button.clicked.connect(self.add_control),
                 self.add_region_button.clicked.connect(self.add_region),
                 self.region_prompt.activated.connect(model.generate),
@@ -1035,6 +1175,11 @@ class GenerationWidget(QWidget):
         self.strength_slider.setVisible(arch is not Arch.qwen_l)
         self.layer_count_widget.setVisible(arch is Arch.qwen_l)
 
+        # An img2img control layer is an independent job with its own strength and
+        # noise knobs; the main slider is ignored for it (see nai_client), so say so.
+        is_img2img = any(c.mode is ControlMode.nai_base for c in self.model.active_regions.control)
+        self.strength_slider.setEnabled(not is_img2img)
+
         regions = self.model.active_regions
         self.region_prompt.regions = regions
 
@@ -1092,6 +1237,8 @@ class GenerationWidget(QWidget):
                 else:
                     icon = "edit"
 
+        if is_img2img:
+            text = "图生图"
         self.generate_button.operation = text
         self.generate_button.setIcon(theme.icon(icon))
 

@@ -207,6 +207,9 @@ class WorkflowInput:
     custom_workflow: CustomWorkflowInput | None = None
     nai_style: str = ""  # filename of the originating Style (NAI: exact-match params)
     nai_target_extent: Extent | None = None
+    # Focused inpaint: the region of the canvas that is actually sent. When set,
+    # nai_target_extent is the resolution that *crop* is sent at, not the canvas.
+    nai_focus_crop: Bounds | None = None
 
     @property
     def extent(self):

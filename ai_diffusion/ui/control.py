@@ -10,7 +10,6 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QSlider,
-    QSpinBox,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -207,27 +206,6 @@ class ControlWidget(QWidget):
         self.param2_slider.setPageStep(10)
         self.param2_label = QLabel("1.00", self.extended_widget)
 
-        self.target_resolution_label = QLabel("目标分辨率:", self.extended_widget)
-        self.target_resolution_widget = QWidget(self.extended_widget)
-        target_resolution_layout = QHBoxLayout(self.target_resolution_widget)
-        target_resolution_layout.setContentsMargins(0, 0, 0, 0)
-        target_resolution_layout.setSpacing(4)
-        self.target_width_input = QSpinBox(self.target_resolution_widget)
-        self.target_height_input = QSpinBox(self.target_resolution_widget)
-        for spinbox in (self.target_width_input, self.target_height_input):
-            spinbox.setRange(1, 16384)
-            spinbox.setSingleStep(64)
-            spinbox.setKeyboardTracking(False)
-            spinbox.editingFinished.connect(self._commit_target_resolution)
-        self.target_resolution_adapt = QToolButton(self.target_resolution_widget)
-        self.target_resolution_adapt.setText("自动")
-        self.target_resolution_adapt.setToolTip("按所选图层的原始比例自动适配分辨率")
-        self.target_resolution_adapt.clicked.connect(self._control.adapt_target_resolution)
-        target_resolution_layout.addWidget(self.target_width_input)
-        target_resolution_layout.addWidget(QLabel("×", self.target_resolution_widget))
-        target_resolution_layout.addWidget(self.target_height_input)
-        target_resolution_layout.addWidget(self.target_resolution_adapt)
-
         slider_layout = QGridLayout()
         slider_layout.setSpacing(8)
         slider_layout.addWidget(QLabel(_("Strength") + ":"), 0, 0)
@@ -240,8 +218,6 @@ class ControlWidget(QWidget):
         slider_layout.addWidget(self.param2_name_label, 2, 0)
         slider_layout.addWidget(self.param2_slider, 2, 2)
         slider_layout.addWidget(self.param2_label, 2, 3)
-        slider_layout.addWidget(self.target_resolution_label, 3, 0)
-        slider_layout.addWidget(self.target_resolution_widget, 3, 1, 1, 3)
         extended_layout.addLayout(slider_layout)
 
         self._update_visibility()
@@ -249,7 +225,6 @@ class ControlWidget(QWidget):
         self._update_strength()
         self._update_range()
         self._update_param2()
-        self._update_target_resolution()
         self._update_custom_values()
 
         self._connections = [
@@ -264,8 +239,6 @@ class ControlWidget(QWidget):
             control.start_changed.connect(self._update_range),
             control.end_changed.connect(self._update_range),
             control.param2_changed.connect(self._update_param2),
-            control.target_width_changed.connect(self._update_target_resolution),
-            control.target_height_changed.connect(self._update_target_resolution),
             control.has_active_job_changed.connect(self._update_job_active),
             control.error_text_changed.connect(self._set_error),
             control.is_supported_changed.connect(self._update_visibility),
@@ -446,9 +419,6 @@ class ControlWidget(QWidget):
             self.param2_name_label.setVisible(has_param2)
             self.param2_slider.setVisible(has_param2)
             self.param2_label.setVisible(has_param2)
-            is_img2img = self._control.mode is ControlMode.nai_base
-            self.target_resolution_label.setVisible(is_img2img)
-            self.target_resolution_widget.setVisible(is_img2img)
             if has_param2:
                 if self._control.mode is ControlMode.nai_base:
                     self.param2_name_label.setText("噪声:")
@@ -488,21 +458,9 @@ class ControlWidget(QWidget):
         self.generate_button.setEnabled(enabled)
         self.generate_tool_button.setEnabled(enabled)
         self.layer_select.setEnabled(enabled)
-        self.target_resolution_widget.setEnabled(enabled)
 
     def _update_param2(self):
         self.param2_label.setText(f"{self._control.param2 / 100:.2f}")
-
-    def _update_target_resolution(self):
-        with SignalBlocker(self.target_width_input), SignalBlocker(self.target_height_input):
-            self.target_width_input.setValue(self._control.target_width)
-            self.target_height_input.setValue(self._control.target_height)
-
-    def _commit_target_resolution(self):
-        self._control.set_target_extent(
-            Extent(self.target_width_input.value(), self.target_height_input.value())
-        )
-        self._update_target_resolution()
 
     def _update_custom_values(self):
         is_nai = self._control.mode.is_nai  # NAI modes always use direct values

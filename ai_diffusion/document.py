@@ -19,6 +19,10 @@ from .util import acquire_elements
 # to find the layer again after a plugin reload, so it must not change.
 SELECTION_PAINT_LAYER_NAME = "AI 重绘选区 (涂抹)"
 
+# Name of the vector layer holding the focused-inpaint box, found again the same
+# way as the mask overlay, so it must not change either.
+FOCUS_BOX_LAYER_NAME = "AI 聚焦框"
+
 
 class SelectionModifiers(NamedTuple):
     feather_rel: float = 0.0
@@ -90,6 +94,31 @@ class Document(QObject):
 
     def stop_selection_painting(self):
         """Leave paint-selection mode (see KritaDocument). No-op by default."""
+
+    def discard_selection_painting(self):
+        """Delete the painted mask overlay (see KritaDocument). No-op by default."""
+
+    def start_focus_box(self, bounds: Bounds):
+        """Create/show the focus box overlay (see KritaDocument). No-op by default."""
+
+    def hide_focus_box(self):
+        """Hide the focus box, keeping it (see KritaDocument). No-op by default."""
+
+    def stop_focus_box(self):
+        """Delete the focus box overlay (see KritaDocument). No-op by default."""
+
+    def set_focus_box_bounds(self, bounds: Bounds):
+        """Move/resize the focus box (see KritaDocument). No-op by default."""
+
+    @property
+    def focus_box_layer(self) -> Layer | None:
+        """The vector layer holding the focus box (see KritaDocument)."""
+        return None
+
+    @property
+    def focus_box_bounds(self) -> Bounds | None:
+        """The focus box in document pixels (see KritaDocument)."""
+        return None
 
     @property
     def selection_paint_layer(self) -> Layer | None:
@@ -366,9 +395,14 @@ class KritaDocument(Document):
         from .util import client_logger as log
 
         doc = self._doc
+        was_active = getattr(self, "_sel_paint_active", False)
         self._sel_paint_active = False
         if layer := self.selection_paint_layer:
             layer.hide()
+        if not was_active:
+            # Nothing was taken over, so there is nothing to give back. Generating
+            # calls this on every run, and it must not touch the user's tool then.
+            return
 
         try:  # restore previous layer / brush / color
             prev = getattr(self, "_sel_paint_prev_node", None)
@@ -390,6 +424,135 @@ class KritaDocument(Document):
         self._sel_paint_prev_preset = None
         self._sel_paint_prev_color = None
         doc.refreshProjection()
+
+    def discard_selection_painting(self):
+        """Delete the mask overlay entirely.
+
+        Hiding it would keep the mask in effect, so the button's off state has to
+        remove the layer: that is what makes the next click start from a clean
+        one instead of an old mask.
+        """
+        self.stop_selection_painting()
+        if layer := self.selection_paint_layer:
+            layer.remove()
+        self._sel_paint_layer_id = None
+        self._doc.refreshProjection()
+
+    # -- Focused inpaint box --
+
+    def _focus_box_svg(self, bounds: Bounds) -> str:
+        """A single rectangle, authored in document pixels like the pose layer:
+        Krita maps SVG user units to points 1:1, and `resolution` converts back.
+
+        Filled, with no stroke on purpose. A stroke inflates Shape.boundingBox()
+        by half its width, so reading the box back and writing it out again would
+        make it creep outwards a little on every poll.
+        """
+        width, height = self.extent
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"'
+            f' viewBox="0 0 {width} {height}">'
+            f'<rect id="nai-focus-box" x="{bounds.x}" y="{bounds.y}"'
+            f' width="{bounds.width}" height="{bounds.height}"'
+            ' fill="#8286D9" fill-opacity="0.15" stroke="none"/>'
+            "</svg>"
+        )
+
+    @property
+    def focus_box_layer(self) -> Layer | None:
+        """The vector layer holding the focus box, if it still exists.
+
+        Like the mask overlay, the layer is the source of truth: deleting it in
+        the layer docker is how the user turns focused inpainting off.
+        """
+        layers = self._layers.updated()
+        layer_id = getattr(self, "_focus_box_layer_id", None)
+        if layer_id is not None:
+            if layer := layers.find(layer_id):
+                return layer
+            self._focus_box_layer_id = None  # deleted in the layer docker
+        layer = next(
+            (
+                l
+                for l in layers.all
+                if l.type is LayerType.vector and l.name == FOCUS_BOX_LAYER_NAME
+            ),
+            None,
+        )
+        if layer is not None:
+            self._focus_box_layer_id = layer.id
+        return layer
+
+    @property
+    def focus_box_bounds(self) -> Bounds | None:
+        """The box the user has dragged on canvas, in document pixels."""
+        from .util import client_logger as log
+
+        layer = self.focus_box_layer
+        if layer is None:
+            return None
+        try:
+            shapes = acquire_elements(cast(krita.VectorLayer, layer.node).shapes())
+        except Exception as e:
+            log.warning(f"focus box: could not read the box layer: {e}")
+            return None
+        if len(shapes) == 0:
+            return None
+        rect = shapes[0].boundingBox()
+        for shape in shapes[1:]:  # a copy-pasted box counts too
+            rect = rect.united(shape.boundingBox())
+        res = self.resolution
+        bounds = Bounds(
+            round(rect.x() * res),
+            round(rect.y() * res),
+            round(rect.width() * res),
+            round(rect.height() * res),
+        )
+        bounds = Bounds.clamp(bounds, self.extent)
+        return None if bounds.is_zero else bounds
+
+    def set_focus_box_bounds(self, bounds: Bounds):
+        """Replace the box with one of exactly these bounds."""
+        layer = self.focus_box_layer
+        if layer is None:
+            return
+        node = cast(krita.VectorLayer, layer.node)
+        for shape in acquire_elements(node.shapes()):
+            shape.remove()
+        node.addShapesFromSvg(self._focus_box_svg(bounds))
+        layer.refresh()
+
+    def start_focus_box(self, bounds: Bounds):
+        """Show the focus box and hand it to Krita's shape tool to be dragged."""
+        from .util import client_logger as log
+
+        layer = self.focus_box_layer
+        if layer is None:
+            layer = self._layers.create_vector(FOCUS_BOX_LAYER_NAME, self._focus_box_svg(bounds))
+            self._focus_box_layer_id = layer.id
+        else:
+            layer.show()
+        layer.move_to_top()
+        self._doc.setActiveNode(layer.node)
+        self._doc.refreshProjection()
+        # The shape tool is what actually moves and scales the box, and it only
+        # acts on the active layer — which is why the box layer is activated here.
+        if tool := Krita.instance().action("InteractionTool"):
+            tool.trigger()
+        else:
+            log.warning("focus box: shape selection tool not found")
+
+    def hide_focus_box(self):
+        """Hide the box without deleting it — it stays in effect while hidden."""
+        if layer := self.focus_box_layer:
+            layer.hide()
+
+    def stop_focus_box(self):
+        """Delete the box layer, which is what turns focused inpainting off."""
+        if layer := self.focus_box_layer:
+            layer.remove()
+        self._focus_box_layer_id = None
+        self._doc.refreshProjection()
 
     def create_mask_from_selection(self, mod: SelectionModifiers):
         # A real selection wins; the painted overlay is then ignored entirely.
@@ -441,11 +604,30 @@ class KritaDocument(Document):
             for layer in filter(lambda l: l.is_visible, exclude_layers):
                 layer.hide()
                 excluded.append(layer)
-        if len(excluded) > 0:
-            self._doc.refreshProjection()
+        # Always refresh: overlays may have been hidden right before this call
+        # (generating hides them without a refresh), and the projection updates
+        # asynchronously — reading it stale would bake them into the image.
+        self._doc.refreshProjection()
 
         bounds = bounds or Bounds(0, 0, self._doc.width(), self._doc.height())
-        img = Image.from_packed_bytes(self._doc.pixelData(*bounds), bounds.extent)
+        # Use Krita's visible projection instead of raw pixel data to avoid
+        # color-channel assumptions across document color spaces (the NAI
+        # launcher's own Krita bridge does the same). Raw pixelData is in the
+        # document's color profile; a generated result pasted back would only
+        # match inside the repainted area, showing as a colour shift there.
+        img = None
+        projection = getattr(self._doc, "projection", None)
+        if projection is not None:
+            try:
+                qimage = projection(*bounds)
+                if qimage is not None and not qimage.isNull():
+                    img = Image(qimage)
+            except Exception as e:
+                from .util import client_logger as log
+
+                log.warning(f"projection() capture failed, falling back to pixelData: {e}")
+        if img is None:
+            img = Image.from_packed_bytes(self._doc.pixelData(*bounds), bounds.extent)
 
         for layer in excluded:
             layer.show()

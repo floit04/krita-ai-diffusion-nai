@@ -256,8 +256,14 @@ class Connection(QObject, ObservableProperties):
             # Disconnect if client type doesn't match the new mode
             client_matches_mode = (
                 (isinstance(self._client, CloudClient) and settings.server_mode is ServerMode.cloud)
-                or (isinstance(self._client, NaiClient) and settings.server_mode is ServerMode.novelai)
-                or (isinstance(self._client, ComfyClient) and settings.server_mode in (ServerMode.managed, ServerMode.external))
+                or (
+                    isinstance(self._client, NaiClient)
+                    and settings.server_mode is ServerMode.novelai
+                )
+                or (
+                    isinstance(self._client, ComfyClient)
+                    and settings.server_mode in (ServerMode.managed, ServerMode.external)
+                )
             )
             if not client_matches_mode and self._client is not None:
                 self.error = ""
@@ -269,10 +275,7 @@ class Connection(QObject, ObservableProperties):
 
         elif key == "nai_active_token_index":
             # Token switched — disconnect and reconnect with new token
-            if (
-                settings.server_mode is ServerMode.novelai
-                and isinstance(self._client, NaiClient)
-            ):
+            if settings.server_mode is ServerMode.novelai and isinstance(self._client, NaiClient):
                 eventloop.run(self._reconnect_nai())
 
     async def _reconnect_nai(self):

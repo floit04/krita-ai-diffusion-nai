@@ -20,10 +20,11 @@ from typing import Any
 
 from PyQt5.QtNetwork import QNetworkReply
 
-from ..image import Extent, Image, ImageCollection
+from ..image import Bounds, Extent, Image, ImageCollection
 from ..localization import translate as _
 from ..settings import PerformanceSettings, settings
 from ..util import client_logger as log
+from ..util import ensure
 from .api import WorkflowInput
 from .client import (
     Client,
@@ -34,6 +35,17 @@ from .client import (
     ClientModels,
     DeviceInfo,
 )
+from .nai_mask_utils import InpaintMaskArtifacts, apply_composite_mask
+from .nai_registry import UcPresets
+from .nai_request_builder import (
+    ACTION_GENERATE,
+    ACTION_IMG2IMG,
+    ACTION_INFILL,
+    NaiGenerationParams,
+    PreciseReference,
+    VibeReference,
+    build_request,
+)
 from .nai_workflow import (
     NAI_EDIT_MAX_PIXELS,
     NAI_MAX_PIXELS,
@@ -42,16 +54,12 @@ from .nai_workflow import (
     NaiNoiseSchedule,
     NaiSampler,
     NaiUCPreset,
-    apply_quality_tags,
-    build_generate_request,
     clamp_resolution,
-    composite_nai_patch,
     image_to_base64,
     map_noise_schedule,
     map_sampler,
     nai_auto_resolution,
     prepare_nai_precise_reference_image,
-    prepare_nai_request_mask,
 )
 from .network import NetworkError, RequestManager
 
@@ -400,7 +408,8 @@ class NaiClient(Client):
             vibe_encodings = await self._ensure_vibe_encodings(job.work)
 
             # Build the NAI request from WorkflowInput
-            nai_request = convert_workflow(job.work, vibe_encodings)
+            converted = convert_workflow(job.work, vibe_encodings)
+            nai_request = converted.request
             job.nai_request = nai_request
 
             # Report progress start (NAI doesn't provide intermediate progress)
@@ -439,17 +448,16 @@ class NaiClient(Client):
             if len(images) == 0:
                 raise RuntimeError("NAI returned an empty response (no images in ZIP)")
 
-            base_ctrl = _find_nai_base_control(job.work)
-            images = restore_nai_results(job.work, images)
-            # Inpaint/refine_region: NAI regenerates the whole canvas, so composite
-            # each result into a transparent patch whose alpha is the selection mask.
-            # Written back, the original shows through outside the selection (no
-            # colour drift, no black border); only the masked area changes.
-            if base_ctrl is None and job.work.images and job.work.images.hires_mask is not None:
-                mask_img = job.work.images.hires_mask
-                images = ImageCollection(
-                    composite_nai_patch(im, mask_img, mask_img.extent) for im in images
+            if converted.mask_artifacts is not None:
+                # Infill: the launcher never uses the raw server image. It builds
+                # a transparent patch from the generated pixels and the soft
+                # composite mask (add_original_image is false), so unmasked
+                # pixels never change and the seam is feathered client-side.
+                images = compose_infill_results(
+                    job.work, images, converted.mask_artifacts, converted.focus_crop
                 )
+            else:
+                images = restore_nai_results(job.work, images)
 
             job.state = NaiJobState.completed
             log.info(f"{job} completed, got {len(images)} images")
@@ -536,6 +544,16 @@ def _parse_zip_response(data: bytes | Any) -> ImageCollection:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class NaiWorkflowRequest:
+    """What convert_workflow hands to _process_job: the wire request plus the
+    client-side artifacts needed to composite the result."""
+
+    request: dict[str, Any]
+    mask_artifacts: InpaintMaskArtifacts | None = None
+    focus_crop: Bounds | None = None
+
+
 def _find_nai_base_control(work: WorkflowInput):
     from .resources import ControlMode
 
@@ -564,6 +582,37 @@ def restore_nai_results(work: WorkflowInput, images: ImageCollection) -> ImageCo
         image if image.extent == source_extent else Image.scale(image, source_extent)
         for image in images
     )
+
+
+def compose_infill_results(
+    work: WorkflowInput,
+    images: ImageCollection,
+    artifacts: InpaintMaskArtifacts,
+    crop: Bounds | None,
+) -> ImageCollection:
+    """Launcher-semantics infill compositing (composeGeneratedImageArtifact).
+
+    The generated image is resized to the crop (focused) or the canvas first and
+    only then combined with the equally-resized soft composite mask, so the
+    patch's RGB stays clean at the edges. The output is a canvas-sized
+    transparent patch; Krita composites it over the original, which is what the
+    launcher's Krita bridge sends too (transparentPatchBytes).
+    """
+    source = ensure(ensure(work.images).initial_image)
+    canvas_extent = source.extent
+    result = ImageCollection()
+    for image in images:
+        target = crop.extent if crop is not None else canvas_extent
+        generated = Image.scale(image, target)
+        alpha, _, _ = artifacts.composite_alpha_scaled(target)
+        patch = apply_composite_mask(generated, alpha, target)
+        if crop is not None:
+            full = Image.create(canvas_extent, fill=0)  # transparent
+            full.draw_image(patch, crop.offset)
+            result.append(full)
+        else:
+            result.append(patch)
+    return result
 
 
 def restore_nai_base_results(work: WorkflowInput, images: ImageCollection) -> ImageCollection:
@@ -600,7 +649,7 @@ def resolve_nai_model(work: WorkflowInput) -> tuple[NaiModel, str]:
 
 def convert_workflow(
     work: WorkflowInput, vibe_encodings: dict[int, str] | None = None
-) -> dict[str, Any]:
+) -> NaiWorkflowRequest:
     """Convert a ``WorkflowInput`` into a NAI API request body.
 
     Reads NAI-specific generation parameters from the matching Style preset.
@@ -777,43 +826,42 @@ def convert_workflow(
     # Seed comes from WorkflowInput (per-generation from UI)
     seed = work.sampling.seed if work.sampling else 0
 
-    # --- img2img / inpaint (from WorkflowInput) ---
-    image_b64 = None
-    mask_b64 = None
+    # The plugin's NaiUCPreset enum predates the registry port and has its own
+    # numbering (none=2, which the SERVER reads as humanFocus) — map it to the
+    # official API values before it goes anywhere near a request.
+    uc_preset_api = {
+        NaiUCPreset.heavy: UcPresets.heavy_api_value,
+        NaiUCPreset.light: UcPresets.light_api_value,
+        NaiUCPreset.none: UcPresets.none_api_value,
+    }[uc_preset]
+
+    # --- img2img / inpaint sources (from WorkflowInput) ---
+    src: Image | None = None
+    mask_img: Image | None = None
     strength = 0.7
     noise_val = 0.0
-    # 重绘幅度 drives `strength` for both img2img and infill (see below).
-    # inpaintImg2ImgStrength is inert in our NAI requests, so it stays None and is
-    # omitted from the request entirely.
-    inpaint_strength: float | None = None
-    # Both inpaint and refine_region carry a mask.
-    needs_mask = action is NaiAction.infill
+    inpaint_strength = 1.0
+    # Focused inpaint: send only the focus box plus its context margin. The
+    # masked area then gets the whole request resolution instead of the few
+    # pixels it would occupy in a downscaled full canvas; compose_infill_results
+    # puts the patch back at the crop offset.
+    focus_crop = work.nai_focus_crop if base_ctrl is None else None
 
     if action in (NaiAction.img2img, NaiAction.infill):
-        # Source image: NAI's img2img/infill requires the image to match the
-        # requested width/height, so scale (stretch) it to the request extent first
-        # — same as the launcher's normalizeImageForRequest. An img2img base layer
-        # replaces the canvas as the source.
-        src = None
         if base_ctrl is not None:
             src = base_ctrl.image
         elif work.images and work.images.initial_image:
             src = work.images.initial_image
         if src is not None:
-            if src.extent != extent:
-                src = Image.scale(src, extent)
+            if focus_crop is not None:
+                src = Image.crop(src, focus_crop)
             else:
                 src = Image.copy(src)
             src.make_opaque()  # NAI requires RGB, strip alpha
-            image_b64 = image_to_base64(src)
-        # Mask: a clean binary mask aligned to NAI's 8px latent grid. No
-        # feather/grow/blend — Krita's ComfyUI-oriented preprocessing corrupts NAI
-        # inpaint (redraws a wrong-shaped region with black borders). See
-        # prepare_nai_request_mask; the result is composited client-side in
-        # _process_job so unmasked pixels keep the exact original.
-        if needs_mask and work.images and work.images.hires_mask:
-            req_mask = prepare_nai_request_mask(work.images.hires_mask, extent)
-            mask_b64 = image_to_base64(req_mask)
+        if action is NaiAction.infill and work.images and work.images.hires_mask:
+            mask_img = work.images.hires_mask
+            if focus_crop is not None:
+                mask_img = Image.crop(mask_img, focus_crop)
 
     if action is NaiAction.img2img:
         if base_ctrl is not None:
@@ -824,8 +872,7 @@ def convert_workflow(
             strength = base_ctrl.strength
             noise_val = base_ctrl.param2
         else:
-            # Whole-canvas refine: main slider -> `strength`. Verified working
-            # end-to-end via client.log + user tests on the non-stream endpoint.
+            # Whole-canvas refine: main slider -> `strength`.
             if work.sampling:
                 strength = work.sampling.denoise_strength
             noise_val = 0.0
@@ -834,109 +881,74 @@ def convert_workflow(
         strength = max(strength, 0.01)
 
     if action is NaiAction.infill:
-        # Masked redraw follows the working reference implementation
-        # (ComfyUI_RS_NAI_API_Request NAIInpaintNode) exactly:
-        #   inpaintImg2ImgStrength = 重绘幅度 slider
-        #   add_original_image     = true  (set in build_generate_request)
-        #   noise                  = 0.0
-        #   `strength`             = NOT SENT (build_generate_request omits it for
-        #                            infill; it belongs to action=img2img only)
-        # The launcher's wiring (strength=0.7 + add_original_image=false) is NOT
-        # honored by the server (pixel-proven full repaint at any value).
+        # 重绘幅度 -> inpaintImg2ImgStrength (and, below 100%, the nested img2img
+        # object with color_correct). The flat `strength` is sent too, exactly as
+        # the launcher and the web UI do; the server ignores it for infill.
         if work.sampling:
             inpaint_strength = work.sampling.denoise_strength
+            strength = inpaint_strength
         noise_val = 0.0
 
     # --- Vibe Transfer ---
     # V4/V4.5 requires PRE-ENCODED vibes (ai/encode-vibe) in reference_image_multiple,
-    # never raw images. Encodings are fetched (and cached) in NaiClient._process_job
-    # and passed in via vibe_encodings, keyed by control index.
-    ref_images: list[str] = []
-    ref_strengths: list[float] = []
-    ref_info_extracted: list[float] = []
+    # never raw images; V3 sends the raw image directly. Encodings are fetched (and
+    # cached) in NaiClient._process_job and passed in via vibe_encodings by index.
+    vibes: list[VibeReference] = []
     for i, ctrl in vibe_ctrls:
+        if model.is_v3:
+            assert ctrl.image is not None
+            vibes.append(VibeReference(image_to_base64(ctrl.image), ctrl.strength, ctrl.param2))
+            continue
         encoding = (vibe_encodings or {}).get(i)
         if encoding is None:
             log.warning("NAI: missing vibe encoding for control layer %d, skipping", i)
             continue
-        ref_images.append(encoding)
-        ref_strengths.append(ctrl.strength)
-        ref_info_extracted.append(ctrl.param2)
+        vibes.append(VibeReference(encoding, ctrl.strength, ctrl.param2))
 
     # --- Precise (director) reference — V4.5 only ---
-    precise_refs: list[dict[str, Any]] = []
-    for ctrl in precise_ctrls:
-        ref_img = prepare_nai_precise_reference_image(ctrl.image)
-        precise_refs.append({
-            "image": image_to_base64(ref_img),
-            "caption": ctrl.mode.nai_precise_caption,
-            "strength": ctrl.strength,
-            # Launcher: secondary strength = 1.0 - fidelity (note the inversion).
-            "secondary": 1.0 - ctrl.param2,
-        })
+    precise_refs = [
+        PreciseReference(
+            image_b64=image_to_base64(prepare_nai_precise_reference_image(ctrl.image)),
+            type_caption=ctrl.mode.nai_precise_caption,
+            strength=ctrl.strength,
+            # Launcher: secondary strength = 1.0 - fidelity; the builder inverts.
+            fidelity=ctrl.param2,
+        )
+        for ctrl in precise_ctrls
+    ]
 
-    # --- Quality tags ---
-    # When "Add Quality Tags" is on, append the model-specific quality tags to the
-    # (already style-merged, post-positioned) prompt. NAI reads the toggle state
-    # from the tags' presence in the prompt, so appending them is what actually
-    # turns "Add Quality Tags" on for the generated image. Must run BEFORE the
-    # prompt is consumed by v4_prompt_obj and build_generate_request below.
-    if quality_toggle:
-        prompt = apply_quality_tags(prompt, model)
-        log.info(f"NAI quality tags appended for {model.value}")
-
-    # --- V4/V4.5 structured prompt ---
-    v4_prompt_obj = None
-    v4_negative_obj = None
-    if model.is_v4:
-        v4_prompt_obj = {
-            "caption": {
-                "base_caption": prompt,
-                "char_captions": [],
-            },
-            "use_coords": False,
-            "use_order": True,
-        }
-        v4_negative_obj = {
-            "caption": {
-                "base_caption": negative,
-                "char_captions": [],
-            },
-            "legacy_uc": False,
-        }
-
-    # --- Build request ---
-    request = build_generate_request(
-        prompt=prompt,
-        negative_prompt=negative,
+    # --- Build the launcher-contract request ---
+    params = NaiGenerationParams(
+        model=model.value,
+        action={
+            NaiAction.generate: ACTION_GENERATE,
+            NaiAction.img2img: ACTION_IMG2IMG,
+            NaiAction.infill: ACTION_INFILL,
+        }[action],
         width=extent.width,
         height=extent.height,
-        model=model,
-        action=action,
-        sampler=sampler,
-        steps=steps,
+        prompt=prompt,
+        negative_prompt=negative,
         scale=cfg_scale,
-        cfg_rescale=cfg_rescale_val,
-        noise_schedule=noise_schedule,
-        seed=seed,
+        sampler=sampler.value,
+        steps=steps,
         n_samples=work.batch_count,
+        seed=seed,
+        uc_preset=uc_preset_api,
         quality_toggle=quality_toggle,
-        uc_preset=uc_preset,
+        cfg_rescale=cfg_rescale_val,
+        noise_schedule=noise_schedule.value,
         variety_plus=variety_plus,
-        image=image_b64,
+        source_image=src,
+        mask_image=mask_img,
         strength=strength,
         noise=noise_val,
-        mask=mask_b64,
-        inpaint_img2img_strength=inpaint_strength,
-        reference_image_multiple=ref_images if ref_images else None,
-        reference_strength_multiple=ref_strengths if ref_strengths else None,
-        reference_information_extracted_multiple=ref_info_extracted if ref_info_extracted else None,
-        precise_references=precise_refs if precise_refs else None,
-        v4_prompt=v4_prompt_obj,
-        v4_negative_prompt=v4_negative_obj,
+        inpaint_strength=inpaint_strength,
+        vibes=vibes,
+        precise_references=precise_refs,
     )
-
-    return request
+    result = build_request(params)
+    return NaiWorkflowRequest(result.request_data, result.mask_artifacts, focus_crop)
 
 
 # ---------------------------------------------------------------------------

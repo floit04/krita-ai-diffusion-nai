@@ -421,7 +421,12 @@ class ServerModeSelect(QWidget):
         self._external_button = ServerModeButton(ServerMode.external, "not_connected", self)
         self._novelai_button = ServerModeButton(ServerMode.novelai, "not_connected", self)
 
-        for button in (self._cloud_button, self._managed_button, self._external_button, self._novelai_button):
+        for button in (
+            self._cloud_button,
+            self._managed_button,
+            self._external_button,
+            self._novelai_button,
+        ):
             button.toggled.connect(self._change_mode)
 
         layout.addWidget(self._cloud_button)
@@ -644,6 +649,7 @@ class NovelAIConnectionWidget(QWidget):
     async def _fetch_subscription(self):
         try:
             from ..backend.network import RequestManager
+
             rm = RequestManager()
             token = settings.nai_api_token
             if not token:
@@ -652,8 +658,10 @@ class NovelAIConnectionWidget(QWidget):
             # IMAGE API host. api.novelai.net answers 400 "update to the image URL"
             # for third-party tools. (Launcher: nai_api_endpoint.dart userUrl().)
             data = await rm.http(
-                "GET", "https://image.novelai.net/user/subscription",
-                timeout=15, bearer=token,
+                "GET",
+                "https://image.novelai.net/user/subscription",
+                timeout=15,
+                bearer=token,
             )
             if isinstance(data, dict):
                 tier_val = data.get("tier", 0)
@@ -905,7 +913,7 @@ class NovelAISettings(SettingsTab):
             return
 
         for i, entry in enumerate(tokens):
-            name = entry.get("name", f"Token {i+1}")
+            name = entry.get("name", f"Token {i + 1}")
             tier = entry.get("tier", "")
             anlas = entry.get("anlas", 0)
             display = name
@@ -936,7 +944,7 @@ class NovelAISettings(SettingsTab):
         if dlg.exec_() == QDialog.DialogCode.Accepted and dlg.token:
             tokens = list(settings.nai_tokens)
             new_entry = {
-                "name": dlg.name or f"Token {len(tokens)+1}",
+                "name": dlg.name or f"Token {len(tokens) + 1}",
                 "token": dlg.token,
                 "tier": "",
                 "anlas": 0,
@@ -997,14 +1005,17 @@ class NovelAISettings(SettingsTab):
     async def _fetch_subscription(self):
         try:
             from ..backend.network import RequestManager
+
             rm = RequestManager()
             token = settings.get_active_nai_token()
             if not token:
                 return
             # User endpoints live on the image API host (see note above).
             data = await rm.http(
-                "GET", "https://image.novelai.net/user/subscription",
-                timeout=15, bearer=token,
+                "GET",
+                "https://image.novelai.net/user/subscription",
+                timeout=15,
+                bearer=token,
             )
             if isinstance(data, dict):
                 tier_val = data.get("tier", 0)

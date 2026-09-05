@@ -13,8 +13,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, NamedTuple
 
-from PyQt5.QtCore import QMetaObject, QObject, Qt, QUuid, pyqtSignal
-from PyQt5.QtGui import QBrush, QColor, QPainter
+from PyQt5.QtCore import QMetaObject, QObject, Qt, QTimer, QUuid, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QGuiApplication, QPainter
 
 from .. import eventloop, util
 from ..backend import resolution, workflow
@@ -42,7 +42,17 @@ from ..backend.client import (
     is_style_supported,
     resolve_arch,
 )
-from ..backend.nai_workflow import nai_auto_resolution
+from ..backend.nai_focused import (
+    MIN_CONTEXT_DEFAULT,
+    FocusedGeometry,
+    cap_focus_box,
+    resolve_geometry,
+)
+from ..backend.nai_workflow import (
+    nai_auto_resolution,
+    nai_edit_resolution,
+    nai_free_resolution,
+)
 from ..backend.network import NetworkError
 from ..backend.resolution import compute_bounds, compute_relative_bounds
 from ..backend.resources import ControlMode
@@ -144,6 +154,13 @@ class DocumentModel(QObject, ObservableProperties):
     queue_mode = Property(QueueMode.back, persist=True)
     translation_enabled = Property(True, persist=True)
     layer_count = Property(4, persist=True)
+    nai_target_width = Property(1024, persist=True, setter="set_nai_target_width")
+    nai_target_height = Property(1024, persist=True, setter="set_nai_target_height")
+    nai_focused_inpaint = Property(False, persist=True, setter="set_nai_focused_inpaint")
+    nai_min_context = Property(MIN_CONTEXT_DEFAULT, persist=True, setter="set_nai_min_context")
+    # [x, y, width, height] in document pixels, empty when there is no box. Stored
+    # as a list because the persistence layer round-trips plain JSON types only.
+    nai_focus_box_value = Property([], persist=True)
     progress_kind = Property(ProgressKind.generation)
     progress = Property(0.0)
     error = Property(no_error)
@@ -160,6 +177,12 @@ class DocumentModel(QObject, ObservableProperties):
     queue_mode_changed = pyqtSignal(QueueMode)
     translation_enabled_changed = pyqtSignal(bool)
     layer_count_changed = pyqtSignal(int)
+    nai_target_width_changed = pyqtSignal(int)
+    nai_target_height_changed = pyqtSignal(int)
+    nai_focused_inpaint_changed = pyqtSignal(bool)
+    nai_min_context_changed = pyqtSignal(int)
+    nai_focus_box_value_changed = pyqtSignal(list)
+    nai_focus_geometry_changed = pyqtSignal(object)  # FocusedGeometry | None
     progress_kind_changed = pyqtSignal(ProgressKind)
     progress_changed = pyqtSignal(float)
     error_changed = pyqtSignal(Error)
@@ -182,12 +205,177 @@ class DocumentModel(QObject, ObservableProperties):
         self.custom = CustomWorkspace(workflows, self._generate_custom, self.jobs)
         self._style_connection: QMetaObject.Connection | None = None
 
+        # Krita reports nothing when a shape is dragged, so the focus box has to
+        # be read back on a timer. Only runs while focused inpaint is on.
+        self._nai_focus_timer = QTimer(self)
+        self._nai_focus_timer.setInterval(200)
+        self._nai_focus_timer.timeout.connect(self._poll_nai_focus_box)
+
         self.jobs.selection_changed.connect(self.update_preview)
+        self.document_changed.connect(self._on_document_changed_for_nai_target)
+        self._update_nai_target_resolution()
         connection.state_changed.connect(self._init_on_connect)
         connection.error_changed.connect(self._forward_error)
         self.custom.validation_error_changed.connect(self._forward_validation_error)
         Styles.list().changed.connect(self._init_on_connect)
         self._init_on_connect()
+
+    # -- NAI target resolution ------------------------------------------------
+    # The output resolution NAI generates at. Applies to txt2img, img2img and
+    # inpaint alike; an img2img control layer may still override it.
+
+    @property
+    def nai_target_extent(self):
+        return Extent(self.nai_target_width, self.nai_target_height)
+
+    def _set_nai_target_extent(self, extent: Extent):
+        target = nai_edit_resolution(extent)
+        for name, value in (
+            ("nai_target_width", target.width),
+            ("nai_target_height", target.height),
+        ):
+            if value != getattr(self, name):
+                setattr(self, f"_{name}", value)
+                getattr(self, f"{name}_changed").emit(value)
+                self.modified.emit(self, name)
+
+    def set_nai_target_width(self, value: int):
+        self._set_nai_target_extent(Extent(value, self.nai_target_height))
+
+    def set_nai_target_height(self, value: int):
+        self._set_nai_target_extent(Extent(self.nai_target_width, value))
+
+    def set_nai_target_extent(self, extent: Extent):
+        self._set_nai_target_extent(extent)
+
+    def _nai_source_extent(self):
+        # Always the canvas. The img2img control layer follows the selection
+        # because there the selection IS the image being sent; the global target
+        # applies to jobs that send the whole canvas, so tying it to the selection
+        # would stretch the canvas into the selection's shape (and silently
+        # overwrite a manually chosen resolution on every selection change).
+        return self._doc.extent
+
+    def _update_nai_target_resolution(self):
+        """Seed the target from the canvas; manual edits stick after that."""
+        if not self._doc.is_valid:
+            return
+        self.set_nai_target_extent(nai_auto_resolution(self._nai_source_extent()))
+
+    def _on_document_changed_for_nai_target(self, document: Document):
+        self._update_nai_target_resolution()
+
+    def adapt_nai_target_resolution(self):
+        """Keep the longer side, derive the other from the source aspect ratio."""
+        source = self._nai_source_extent()
+        if source.width >= source.height:
+            width = self.nai_target_width
+            height = round(width * source.height / max(source.width, 1))
+        else:
+            height = self.nai_target_height
+            width = round(height * source.width / max(source.height, 1))
+        self.set_nai_target_extent(Extent(width, height))
+
+    def shrink_nai_target_to_free(self):
+        """Largest resolution that still generates for free, same aspect ratio.
+
+        Free means total pixels <= 1024*1024 (with <= 28 steps) — not a per-side
+        limit, so 1920x512 qualifies just as 1024x1024 does.
+        """
+        self.set_nai_target_extent(nai_free_resolution(self.nai_target_extent))
+
+    def set_nai_focused_inpaint(self, enabled: bool):
+        """Turning this on creates the box layer; turning it off deletes it."""
+        if enabled == self.nai_focused_inpaint:
+            return
+        self._nai_focused_inpaint = enabled
+        if enabled:
+            box = self._doc.focus_box_bounds or self.nai_focus_box
+            box = box or self._default_nai_focus_box()
+            if box is not None:
+                self._doc.start_focus_box(box)
+                self.set_nai_focus_box(self._doc.focus_box_bounds or box)
+            self._nai_focus_timer.start()
+        else:
+            self._nai_focus_timer.stop()
+            self._doc.stop_focus_box()
+            self.set_nai_focus_box(None)
+        self.nai_focused_inpaint_changed.emit(enabled)
+        self.modified.emit(self, "nai_focused_inpaint")
+        self.nai_focus_geometry_changed.emit(self.nai_focus_geometry)
+
+    def _poll_nai_focus_box(self):
+        """Follow the box the user drags on canvas, and hold it at the 1 MP cap.
+
+        Krita's shape tool owns the drag and cannot be told to stop, so the box
+        can only be corrected afterwards. Correcting mid-drag is what made it
+        spring back, so wait until no mouse button is down: by then the user has
+        let go, and the correction shortens the other side instead of resetting.
+        """
+        if not self.nai_focused_inpaint or not self._doc.is_valid:
+            return
+        bounds = self._doc.focus_box_bounds
+        if bounds is None:
+            # Deleted (or emptied) in the layer docker — that turns the feature
+            # off, the same way deleting the mask overlay cancels inpainting.
+            self.nai_focused_inpaint = False
+            return
+        if QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            return  # still dragging
+        capped = cap_focus_box(self._doc.extent, bounds, self.nai_focus_box, self.nai_min_context)
+        if capped is not None and capped != bounds:
+            self._doc.set_focus_box_bounds(capped)
+            bounds = capped
+        if bounds != self.nai_focus_box:
+            self.set_nai_focus_box(bounds)
+
+    def set_nai_min_context(self, value: int):
+        """Changing the context margin changes the crop, so the box may no longer fit."""
+        if value == self.nai_min_context:
+            return
+        self._nai_min_context = value
+        if box := self.nai_focus_box:
+            capped = cap_focus_box(self._doc.extent, box, None, value)
+            if capped is not None and capped != box:
+                self._doc.set_focus_box_bounds(capped)
+                self.set_nai_focus_box(capped)
+        self.nai_min_context_changed.emit(value)
+        self.modified.emit(self, "nai_min_context")
+        self.nai_focus_geometry_changed.emit(self.nai_focus_geometry)
+
+    @property
+    def nai_focus_box(self) -> Bounds | None:
+        """The focused-inpaint box in document pixels, or None if there is none."""
+        value = self.nai_focus_box_value
+        return Bounds(*value) if len(value) == 4 else None
+
+    def set_nai_focus_box(self, box: Bounds | None):
+        """Cache what the box layer currently holds; None means there is no box."""
+        self.nai_focus_box_value = list(box) if box is not None else []
+        self.nai_focus_geometry_changed.emit(self.nai_focus_geometry)
+
+    def _default_nai_focus_box(self) -> Bounds | None:
+        """Seed the box from the selection if there is one, else a centred square."""
+        if not self._doc.is_valid:
+            return None
+        extent = self._doc.extent
+        box = self._doc.selection_bounds
+        if box is None:
+            size = Extent(min(extent.width, 1024), min(extent.height, 1024))
+            box = Bounds(
+                (extent.width - size.width) // 2, (extent.height - size.height) // 2, *size
+            )
+        return cap_focus_box(extent, box, None, self.nai_min_context)
+
+    @property
+    def nai_focus_geometry(self) -> FocusedGeometry | None:
+        """Resolved focus-box geometry, or None when focused inpaint is off/unset."""
+        if not self.nai_focused_inpaint or not self._doc.is_valid:
+            return None
+        box = self.nai_focus_box
+        if box is None:
+            return None
+        return resolve_geometry(self._doc.extent, box, self.nai_min_context)
 
     def _init_on_connect(self):
         if self._connection.state is not ConnectionState.connected:
@@ -230,6 +418,10 @@ class DocumentModel(QObject, ObservableProperties):
         jobs = self.enqueue_jobs(
             input, JobKind.diffusion, job_params, cond_orig, self.batch_count, queue_mode
         )
+        # The overlays have done their job for this run: get them out of the way,
+        # but keep them, so the mask and the box still apply to the next one.
+        self._doc.stop_selection_painting()
+        self._doc.hide_focus_box()
         eventloop.run(_report_errors(self, jobs))
 
     def _prepare_workflow(self, dryrun=False):
@@ -362,13 +554,28 @@ class DocumentModel(QObject, ObservableProperties):
             if nai_base is not None:
                 input.nai_target_extent = nai_base.target_extent
             elif image is not None:
+                # Redraw and refine send the whole canvas, and the docker's target
+                # is the resolution it is processed at. The target is seeded from
+                # the canvas (never the selection), so its aspect matches what is
+                # being sent and nothing warps on the round trip.
                 source_extent = image.extent
-                input.nai_target_extent = nai_auto_resolution(source_extent)
+                input.nai_target_extent = self.nai_target_extent
                 if input.images is not None:
                     input.images.extent = ExtentInput(
                         source_extent, source_extent, source_extent, source_extent
                     )
                     input.images.initial_image = image
+                # Focused inpaint: send only the box plus its context margin, at the
+                # resolution the reference implementation picks for it (always <= 1 MP,
+                # so it stays free) rather than the canvas-wide size above. Cropping
+                # first is what lets the masked area keep its detail.
+                if mask is not None and (focus := self.nai_focus_geometry) is not None:
+                    input.nai_focus_crop = focus.context_crop
+                    input.nai_target_extent = focus.request
+            else:
+                # Text to image: no source pixels, so the docker's target really is
+                # the output resolution.
+                input.nai_target_extent = self.nai_target_extent
             # Thread the exact selected style's filename to the NAI backend so it
             # reads the right params. Checkpoint IDs are not unique across styles
             # (e.g. built-in "NAI V4.5" and a user style share the same checkpoint),
@@ -391,20 +598,32 @@ class DocumentModel(QObject, ObservableProperties):
             # then the model-specific quality tags when "Add Quality Tags" is on.
             # The raw per-gen negative box is usually empty because NAI users put the
             # negative in the Style, so show the merged negative_prompt_final.
-            from ..backend.nai_workflow import NaiModel, apply_quality_tags
+            from ..backend.nai_registry import ImageModels, build_prompt_semantics
+            from ..backend.nai_registry import UcPresets as NaiUcPresets
+            from ..backend.nai_workflow import NaiUCPreset
 
             nai_cond = input.conditioning
-            final_prompt = merge_prompt(nai_cond.positive, nai_cond.style) if nai_cond else ""
-            nai_model = next(
-                (m for m in NaiModel if m.value == ensure(input.models).checkpoint),
-                NaiModel.default(),
-            )
-            if self.active_style.nai_quality_toggle:
-                final_prompt = apply_quality_tags(final_prompt, nai_model)
-            job_params.metadata["prompt"] = final_prompt
-            job_params.metadata["negative_prompt"] = prompt_meta.get(
+            merged_prompt = merge_prompt(nai_cond.positive, nai_cond.style) if nai_cond else ""
+            merged_negative = prompt_meta.get(
                 "negative_prompt_final", prompt_meta.get("negative_prompt", "")
             )
+            try:
+                style_uc = NaiUCPreset(self.active_style.nai_uc_preset)
+            except ValueError:
+                style_uc = NaiUCPreset.heavy
+            semantics = build_prompt_semantics(
+                merged_prompt,
+                merged_negative,
+                ImageModels.resolve_base_model(ensure(input.models).checkpoint),
+                quality_toggle=self.active_style.nai_quality_toggle,
+                uc_preset={
+                    NaiUCPreset.heavy: NaiUcPresets.heavy_api_value,
+                    NaiUCPreset.light: NaiUcPresets.light_api_value,
+                    NaiUCPreset.none: NaiUcPresets.none_api_value,
+                }[style_uc],
+            )
+            job_params.metadata["prompt"] = semantics.effective_prompt
+            job_params.metadata["negative_prompt"] = semantics.effective_negative_prompt
         job_params.metadata["loras"] = [{"name": l.name, "weight": l.strength} for l in loras]
         job_params.metadata["strength"] = strength
         return input, job_params, original_conditioning
@@ -696,6 +915,8 @@ class DocumentModel(QObject, ObservableProperties):
             # excluded even when visible, since generating no longer hides it.
             if paint_mask := self._doc.selection_paint_layer:
                 exclude.append(paint_mask)
+            if focus_box := self._doc.focus_box_layer:
+                exclude.append(focus_box)
 
         if not any(l.is_visible and l not in exclude for l in self.layers.images):
             warning = _(
@@ -854,9 +1075,9 @@ class DocumentModel(QObject, ObservableProperties):
             self.document.resize_canvas(*image.extent)
 
         bounds = Bounds(*params.bounds.offset, *image.extent)
-        if self.layers.active is self._doc.selection_paint_layer:
-            # The mask overlay is active while painting; writing the result into it
-            # would destroy the mask. Insert a new layer instead.
+        if self.layers.active in (self._doc.selection_paint_layer, self._doc.focus_box_layer):
+            # An overlay is active while it is being edited; writing the result
+            # into it would destroy it. Insert a new layer instead.
             behavior = ApplyBehavior.layer
         if len(params.regions) == 0 or region_behavior is ApplyRegionBehavior.none:
             if behavior is ApplyBehavior.replace:

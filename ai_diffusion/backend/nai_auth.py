@@ -41,11 +41,7 @@ _TYPE_ID = 2
 # Blake2 round applied to 8 rows, then to 8 columns of the 128-word block.
 _ROW_INDICES = tuple(tuple(range(16 * r, 16 * r + 16)) for r in range(8))
 _COL_INDICES = tuple(
-    tuple(
-        idx
-        for group in range(8)
-        for idx in (2 * c + 16 * group, 2 * c + 16 * group + 1)
-    )
+    tuple(idx for group in range(8) for idx in (2 * c + 16 * group, 2 * c + 16 * group + 1))
     for c in range(8)
 )
 
@@ -110,7 +106,13 @@ def _blake2b_long(out_len: int, data: bytes) -> bytes:
 
 
 def _initial_hash(
-    password: bytes, salt: bytes, time_cost: int, memory_cost: int, lanes: int, tag_len: int, type_: int
+    password: bytes,
+    salt: bytes,
+    time_cost: int,
+    memory_cost: int,
+    lanes: int,
+    tag_len: int,
+    type_: int,
 ) -> bytes:
     h = hashlib.blake2b(digest_size=64)
     for value in (lanes, tag_len, memory_cost, time_cost, _VERSION, type_):
