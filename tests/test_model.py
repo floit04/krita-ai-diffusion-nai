@@ -298,6 +298,7 @@ async def test_nai_img2img_uses_layer_bounds_and_ignores_selection(workflows_dir
         model.style = _make_style(checkpoint)
         control = model.regions.control.emplace()
         control.set_mode(ControlMode.nai_base)
+        control.set_layer_id(model.layers.active.id)  # default source is 选区
 
         job = await _run_generate(model, client)
         work = client.enqueued[0]
@@ -330,14 +331,17 @@ async def test_nai_img2img_target_auto_fill_snap_and_aspect_adapt(workflows_dir:
         model.style = _make_style(checkpoint)
         control = model.regions.control.emplace()
         control.set_mode(ControlMode.nai_base)
+        control.set_layer_id(model.layers.active.id)  # default source is 选区
 
+        # One target, the docker's: the img2img layer seeds it and reads it back.
         assert control.target_extent == Extent(1344, 768)
-        control.set_target_extent(Extent(1599, 1000))
+        assert model.nai_target_extent == Extent(1344, 768)
+        model.set_nai_target_extent(Extent(1599, 1000))
         assert control.target_extent == Extent(1600, 1024)
-        control.adapt_target_resolution()
+        model.adapt_nai_target_resolution()
         assert control.target_extent == Extent(1600, 896)
-        control.set_target_extent(Extent(1792, 2048))
-        assert control.target_extent == Extent(1664, 1856)
+        model.set_nai_target_extent(Extent(1792, 2048))
+        assert control.target_extent == Extent(1600, 1856)
         await asyncio.sleep(0)
 
 
@@ -465,7 +469,7 @@ async def test_nai_img2img_selection_target_follows_replaced_document_wrapper(
 
         replacement_layer = replacement.layers.active
         control.set_layer_id(replacement_layer.id)
-        control.set_target_extent(Extent(1216, 832))
+        model.set_nai_target_extent(Extent(1216, 832))
         replacement_selection = Selection()
         replacement_selection.setPixelData(QByteArray(bytes([0xFF] * 384 * 128)), 10, 15, 384, 128)
         replacement_doc.setSelection(replacement_selection)
@@ -497,7 +501,7 @@ async def test_nai_selection_target_updates_are_coalesced_and_only_subscribed_wh
         assert base._selection_bounds_connection is not None
         assert vibe._selection_bounds_connection is None
         width_changes: list[int] = []
-        base.target_width_changed.connect(width_changes.append)
+        model.nai_target_width_changed.connect(width_changes.append)
 
         for width, height in ((256, 192), (320, 192), (384, 128)):
             selection = Selection()
@@ -523,6 +527,90 @@ async def test_nai_selection_target_updates_are_coalesced_and_only_subscribed_wh
         model.document._poll()  # type: ignore[attr-defined]
         await asyncio.sleep(0.12)
         assert base.target_extent == preserved
+
+
+@qtapp
+async def test_nai_control_layers_default_to_img2img_from_the_selection(workflows_dir: Path):
+    krita_doc = Krita.instance().openDocument("test")
+    selection = Selection()
+    selection.setPixelData(QByteArray(bytes([0xFF] * 192 * 192)), 20, 30, 192, 192)
+    krita_doc.setSelection(selection)
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+
+        changes: list[int] = []
+        model.regions.control.changed.connect(lambda: changes.append(1))
+
+        control = model.regions.control.emplace()
+        assert control.mode is ControlMode.nai_base
+        assert control.is_selection
+        assert len(changes) == 1
+
+        # Adding one is also what re-seeds the target from the selection...
+        assert model.nai_target_extent == Extent(1024, 1024)
+        model.set_nai_target_extent(Extent(1216, 832))
+
+        # ...and removing it hands the target back to the canvas.
+        model.regions.control.remove(control)
+        assert len(changes) == 2
+        assert model.nai_target_extent == Extent(1024, 1024)  # 512x512 canvas
+        await asyncio.sleep(0)
+
+
+@qtapp
+async def test_nai_target_resolution_follows_a_canvas_resize(workflows_dir: Path):
+    krita_doc = Krita.instance().openDocument("test")
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+        seeded = model.nai_target_extent
+
+        krita_doc.setWidth(2560)
+        krita_doc.setHeight(1440)
+        model.document._poll()  # type: ignore[attr-defined]
+
+        assert model.nai_target_extent != seeded
+        assert model.nai_target_extent == Extent(2048, 1152)
+        await asyncio.sleep(0)
+
+
+@qtapp
+async def test_nai_square_canvas_keeps_a_square_target_across_img2img(workflows_dir: Path):
+    """A square canvas must stay square while an img2img layer comes and goes.
+
+    Reported: a 4096x4096 canvas showed 1728x1728, adding an img2img layer
+    turned it into 1728x1792, and removing the layer left it there. Both the
+    add and the remove re-derive the target, so both produced the same wrong
+    number: the reducer could only step one side at a time, which meant the
+    square answer was never a candidate.
+    """
+    krita_doc = Krita.instance().openDocument("test")
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+
+        krita_doc.setWidth(4096)
+        krita_doc.setHeight(4096)
+        model.document._poll()  # type: ignore[attr-defined]
+        assert model.nai_target_extent == Extent(1728, 1728)
+
+        # Adding the img2img layer re-seeds from the same canvas (no selection).
+        control = model.regions.control.emplace()
+        control.set_mode(ControlMode.nai_base)
+        assert control.mode is ControlMode.nai_base
+        assert model.nai_target_extent == Extent(1728, 1728)
+
+        # ...and removing it hands the target back to the canvas, unchanged.
+        model.regions.control.remove(control)
+        assert model.nai_target_extent == Extent(1728, 1728)
+        await asyncio.sleep(0)
 
 
 @qtapp

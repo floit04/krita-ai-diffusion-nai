@@ -9,7 +9,7 @@ from PyQt5.QtCore import QMetaObject, QObject, Qt, QTimer, QUuid, pyqtSignal
 from .. import util
 from ..backend import resources
 from ..backend.api import ControlInput
-from ..backend.nai_workflow import NaiModel, nai_auto_resolution, nai_edit_resolution
+from ..backend.nai_workflow import NaiModel, nai_auto_resolution
 from ..backend.resources import Arch, ControlMode, ResourceKind, resource_id
 from ..document import Document, SelectionModifiers
 from ..image import Bounds, Extent, Image
@@ -39,8 +39,6 @@ class ControlLayer(QObject, ObservableProperties):
     # Secondary parameter for NAI modes, in percent (0-100): vibe "information
     # extracted" (default 70) or precise-reference "fidelity" (default 100).
     param2 = Property(100, persist=True)
-    target_width = Property(1024, persist=True, setter="set_target_width")
-    target_height = Property(1024, persist=True, setter="set_target_height")
     use_custom_strength = Property(False, persist=True, setter="set_use_custom_strength")
     is_supported = Property(True)
     is_pose_vector = Property(False)
@@ -56,8 +54,6 @@ class ControlLayer(QObject, ObservableProperties):
     start_changed = pyqtSignal(float)
     end_changed = pyqtSignal(float)
     param2_changed = pyqtSignal(int)
-    target_width_changed = pyqtSignal(int)
-    target_height_changed = pyqtSignal(int)
     use_custom_strength_changed = pyqtSignal(bool)
     is_supported_changed = pyqtSignal(bool)
     is_pose_vector_changed = pyqtSignal(bool)
@@ -145,24 +141,18 @@ class ControlLayer(QObject, ObservableProperties):
 
     @property
     def target_extent(self):
-        return Extent(self.target_width, self.target_height)
+        """There is one output resolution and it is the docker's.
 
-    def _set_target_extent(self, extent: Extent):
-        target = nai_edit_resolution(extent)
-        for name, value in (("target_width", target.width), ("target_height", target.height)):
-            if value != getattr(self, name):
-                setattr(self, f"_{name}", value)
-                getattr(self, f"{name}_changed").emit(value)
-                self.modified.emit(self, name)
+        An img2img layer used to keep a second, private one: no widget showed
+        it and no edit could reach it, so the number on screen and the number
+        actually sent drifted apart. Now the layer only *seeds* the docker
+        value (see _reset_target_resolution) and reads it back here."""
+        return self._model.nai_target_extent
 
-    def set_target_width(self, value: int):
-        self._set_target_extent(Extent(value, self.target_height))
-
-    def set_target_height(self, value: int):
-        self._set_target_extent(Extent(self.target_width, value))
-
-    def set_target_extent(self, extent: Extent):
-        self._set_target_extent(extent)
+    @property
+    def source_extent(self):
+        """Extent of the pixels this layer sends - what the target follows."""
+        return self._source_extent()
 
     def _source_extent(self):
         if self.is_selection:
@@ -176,12 +166,12 @@ class ControlLayer(QObject, ObservableProperties):
         return bounds.extent if not bounds.is_zero else self._model.document.extent
 
     def _reset_target_resolution(self):
-        self.set_target_extent(nai_auto_resolution(self._source_extent()))
+        self._model.set_nai_target_extent(nai_auto_resolution(self._source_extent()))
 
     def _update_selection_target(self):
         bounds = self._model.document.selection_bounds
         if self.mode is ControlMode.nai_base and self.is_selection and bounds:
-            self.set_target_extent(nai_auto_resolution(bounds.extent))
+            self._model.set_nai_target_extent(nai_auto_resolution(bounds.extent))
 
     def _schedule_selection_target_update(self):
         self._selection_target_timer.start()
@@ -211,16 +201,6 @@ class ControlLayer(QObject, ObservableProperties):
             return bounds
         _, bounds = self._model.document.create_mask_from_selection(SelectionModifiers(multiple=1))
         return bounds
-
-    def adapt_target_resolution(self):
-        source = self._source_extent()
-        if source.width >= source.height:
-            width = self.target_width
-            height = round(width * source.height / max(source.width, 1))
-        else:
-            height = self.target_height
-            width = round(height * source.width / max(source.height, 1))
-        self.set_target_extent(Extent(width, height))
 
     def set_preset_value(self, value: int):
         if value != self.preset_value:
@@ -439,6 +419,10 @@ class ControlLayerList(QObject):
 
     added = pyqtSignal(ControlLayer)
     removed = pyqtSignal(ControlLayer)
+    # Anything that can change what the list *means*: added, removed, or a
+    # layer switching mode. Widgets that gray themselves out for an img2img
+    # layer need all three, and used to see none of them.
+    changed = pyqtSignal()
 
     _model: model.DocumentModel
     _layers: list[ControlLayer]
@@ -459,29 +443,41 @@ class ControlLayerList(QObject):
         if layer is None:  # shouldn't be possible, Krita doesn't allow removing all non-mask layers
             log.warning("Trying to add control layer, but document has no suitable layer")
             return
+        layer_id = layer.id
         if self._model.arch is Arch.nai:
-            mode = self._last_mode if self._last_mode.is_nai else ControlMode.nai_vibe
+            # Always 图生图-选区, not the last mode used: it is where nearly every
+            # NAI job in this fork starts, and the selection is the only source
+            # whose size the docker's target resolution follows.
+            mode = ControlMode.nai_base
+            layer_id = nai_selection_layer_id
         elif self._model.arch.is_edit:
             mode = ControlMode.reference
         elif self._last_mode.is_nai:
             mode = ControlMode.scribble
         else:
             mode = self._last_mode
-        control = ControlLayer(self._model, mode, layer.id, len(self._layers))
+        control = ControlLayer(self._model, mode, layer_id, len(self._layers))
         control.mode_changed.connect(self._update_last_mode)
+        control.mode_changed.connect(self.changed)
         self._layers.append(control)
         self.added.emit(control)
+        self.changed.emit()
 
     def emplace(self):
         self.add()
         return self[-1]
 
     def remove(self, control: ControlLayer):
+        was_base = control.mode is ControlMode.nai_base
         self._layers.remove(control)
         self.removed.emit(control)
+        self.changed.emit()
 
         for i, c in enumerate(self._layers):
             c.index = i
+        if was_base:
+            # The img2img source is gone; the target goes back to the canvas.
+            self._model.reset_nai_target_resolution()
 
     def to_api(self, bounds: Bounds | None = None, time: int | None = None):
         for layer in (c for c in self._layers if not c.is_supported):

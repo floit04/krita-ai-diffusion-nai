@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import QMessageBox
 
 from . import eventloop
 from .backend.api import FillMode, InpaintMode
-from .image import ImageCollection
+from .image import Extent, ImageCollection
 from .localization import translate as _
 from .model.control import ControlLayer, ControlLayerList
 from .model.custom_workflow import CustomWorkspace
@@ -181,6 +181,14 @@ class ModelSync:
             _deserialize(region, region_state)
             for control_state in region_state.get("control", []):
                 _deserialize(region.control.emplace(), control_state)
+
+        # Restoring an img2img control layer re-seeds the target resolution from
+        # its source, so the saved value goes back last: it is the user's, and a
+        # manual resolution has to survive reopening the document.
+        if "nai_target_width" in state and "nai_target_height" in state:
+            model.set_nai_target_extent(
+                Extent(int(state["nai_target_width"]), int(state["nai_target_height"]))
+            )
 
         for result in state.get("history", []):
             item = _HistoryResult.from_dict(result)

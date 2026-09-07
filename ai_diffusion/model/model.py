@@ -212,8 +212,10 @@ class DocumentModel(QObject, ObservableProperties):
         self._nai_focus_timer.timeout.connect(self._poll_nai_focus_box)
 
         self.jobs.selection_changed.connect(self.update_preview)
+        self._nai_extent_connection: QMetaObject.Connection | None = None
         self.document_changed.connect(self._on_document_changed_for_nai_target)
-        self._update_nai_target_resolution()
+        self._connect_nai_target_source()
+        self.reset_nai_target_resolution()
         connection.state_changed.connect(self._init_on_connect)
         connection.error_changed.connect(self._forward_error)
         self.custom.validation_error_changed.connect(self._forward_validation_error)
@@ -248,22 +250,46 @@ class DocumentModel(QObject, ObservableProperties):
     def set_nai_target_extent(self, extent: Extent):
         self._set_nai_target_extent(extent)
 
+    def _nai_base_control(self):
+        """The img2img control layer, if one is active."""
+        return next(
+            (c for c in self.active_regions.control if c.mode is ControlMode.nai_base), None
+        )
+
     def _nai_source_extent(self):
-        # Always the canvas. The img2img control layer follows the selection
-        # because there the selection IS the image being sent; the global target
-        # applies to jobs that send the whole canvas, so tying it to the selection
-        # would stretch the canvas into the selection's shape (and silently
-        # overwrite a manually chosen resolution on every selection change).
+        # Whatever is actually sent decides the target's shape. Normally that is
+        # the canvas -- tying it to the selection would stretch the canvas into
+        # the selection's shape. The one exception is an img2img control layer:
+        # there its source (a layer, the canvas, or the selection) IS the image
+        # being sent, which is why the selection may steer the target only while
+        # such a layer exists.
+        if control := self._nai_base_control():
+            return control.source_extent
         return self._doc.extent
 
-    def _update_nai_target_resolution(self):
-        """Seed the target from the canvas; manual edits stick after that."""
+    def reset_nai_target_resolution(self):
+        """Re-derive the target from whatever is being sent.
+
+        Called for every input that changes the source: opening/switching a
+        document, resizing the canvas, adding or removing an img2img layer and
+        changing its source or selection. Auto always matches the largest legal
+        size for that shape; use the 小 button (or type a number) for less.
+        """
         if not self._doc.is_valid:
             return
         self.set_nai_target_extent(nai_auto_resolution(self._nai_source_extent()))
 
+    def _connect_nai_target_source(self):
+        """Krita signals nothing on canvas resize, so follow the doc poller."""
+        if self._nai_extent_connection is not None:
+            QObject.disconnect(self._nai_extent_connection)
+        self._nai_extent_connection = self._doc.extent_changed.connect(
+            self.reset_nai_target_resolution
+        )
+
     def _on_document_changed_for_nai_target(self, document: Document):
-        self._update_nai_target_resolution()
+        self._connect_nai_target_source()
+        self.reset_nai_target_resolution()
 
     def adapt_nai_target_resolution(self):
         """Keep the longer side, derive the other from the source aspect ratio."""

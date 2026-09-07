@@ -1012,6 +1012,11 @@ class GenerationWidget(QWidget):
                 # Deleting an overlay in the layer docker cancels its mode.
                 model.document.layers.changed.connect(self._update_overlay_buttons),
                 model.regions.active_changed.connect(self.update_generate_options),
+                # Adding, removing or re-moding a control layer decides whether the
+                # strength slider applies at all -- without these the slider stayed
+                # grayed out after an img2img layer was deleted.
+                model.regions.control.changed.connect(self.update_generate_options),
+                model.edit_regions.control.changed.connect(self.update_generate_options),
                 model.region_only_changed.connect(self.update_generate_options),
                 model.style_changed.connect(self.update_generate_options),
                 model.edit_mode_changed.connect(self.update_generate_options),

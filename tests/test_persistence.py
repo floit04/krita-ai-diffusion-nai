@@ -148,7 +148,7 @@ async def test_sync(workflows_dir: Path, monkeypatch: pytest.MonkeyPatch):
     control = model1.regions.control.emplace()
     control.set_mode(ControlMode.nai_base)
     control.set_layer_id(nai_selection_layer_id)
-    control.set_target_extent(Extent(832, 1216))
+    model1.set_nai_target_extent(Extent(832, 1216))
 
     # Create sync and let it flush (it saves immediately on construction and on demand)
     sync1 = ModelSync(model1)

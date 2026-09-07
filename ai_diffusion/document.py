@@ -40,6 +40,7 @@ class Document(QObject):
 
     selection_bounds_changed = pyqtSignal()
     current_time_changed = pyqtSignal()
+    extent_changed = pyqtSignal()
 
     _layers: LayerManager
 
@@ -181,6 +182,7 @@ class KritaDocument(Document):
         self._layers = LayerManager(krita_document)
         self._selection_bounds: Bounds | None = None
         self._current_time: int = 0
+        self._extent = self.extent
 
         self._was_valid = False
         self._poller = QTimer(self)
@@ -699,6 +701,15 @@ class KritaDocument(Document):
             if selection_bounds != self._selection_bounds:
                 self._selection_bounds = selection_bounds
                 self.selection_bounds_changed.emit()
+
+            # Krita reports a canvas resize through no signal at all, so the
+            # poller is the only place it can be noticed. The NAI target
+            # resolution is seeded from the canvas and would otherwise keep the
+            # size the document had when it was opened.
+            extent = self.extent
+            if extent != self._extent:
+                self._extent = extent
+                self.extent_changed.emit()
 
             current_time = self.current_time
             if current_time != self._current_time:

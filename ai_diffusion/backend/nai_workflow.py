@@ -273,6 +273,17 @@ def _reduce_to_pixel_limit(extent: Extent, source: Extent, max_pixels: int) -> E
             candidates.append(Extent(result.width - NAI_RESOLUTION_MULTIPLE, result.height))
         if result.height > NAI_MIN_SIDE:
             candidates.append(Extent(result.width, result.height - NAI_RESOLUTION_MULTIPLE))
+        if result.width > NAI_MIN_SIDE and result.height > NAI_MIN_SIDE:
+            # Shrinking both sides at once is the only move that preserves the
+            # ratio. Without it the loop can step sideways only: a square source
+            # snapped up to 1792x1792 came back as 1728x1792, because the legal
+            # and exactly square 1728x1728 was never a candidate.
+            candidates.append(
+                Extent(
+                    result.width - NAI_RESOLUTION_MULTIPLE,
+                    result.height - NAI_RESOLUTION_MULTIPLE,
+                )
+            )
         if not candidates:
             break
         result = min(

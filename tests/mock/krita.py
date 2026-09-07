@@ -515,6 +515,12 @@ class Document(QObject):
     def height(self) -> int:
         return self._height
 
+    def setWidth(self, width: int) -> None:
+        self._width = width
+
+    def setHeight(self, height: int) -> None:
+        self._height = height
+
     def resolution(self) -> float:
         return self._resolution
 

@@ -221,11 +221,15 @@ def test_nai_resolution_snaps_to_nearest_64_and_auto_scales_by_source_size():
     assert nai_auto_resolution(Extent(1344, 768)) == Extent(1344, 768)
     assert nai_auto_resolution(Extent(1600, 896)) == Extent(1600, 896)
     assert nai_auto_resolution(Extent(2500, 1400)) == Extent(2048, 1152)
-    assert nai_auto_resolution(Extent(3000, 3000)) == Extent(1728, 1792)
+    # A square source must stay square: the reducer has to be able to take
+    # both sides down together, not just one.
+    assert nai_auto_resolution(Extent(3000, 3000)) == Extent(1728, 1728)
+    assert nai_auto_resolution(Extent(4096, 4096)) == Extent(1728, 1728)
+    assert nai_auto_resolution(Extent(2048, 2048)) == Extent(1728, 1728)
 
 
 def test_nai_edit_resolution_never_exceeds_provider_pixel_limit():
-    assert nai_edit_resolution(Extent(1792, 2048)) == Extent(1664, 1856)
+    assert nai_edit_resolution(Extent(1792, 2048)) == Extent(1600, 1856)
 
     sources = [
         Extent(192, 192),
@@ -277,9 +281,9 @@ def test_img2img_request_boundary_clamps_an_oversized_saved_target():
 
     params = convert_workflow(_workflow(base)).request["parameters"]
 
-    assert (params["width"], params["height"]) == (1664, 1856)
+    assert (params["width"], params["height"]) == (1600, 1856)
     assert params["width"] * params["height"] <= NAI_EDIT_MAX_PIXELS
-    assert Image.from_base64(params["image"]).extent == Extent(1664, 1856)
+    assert Image.from_base64(params["image"]).extent == Extent(1600, 1856)
 
 
 def test_img2img_results_are_restored_before_history():
@@ -330,10 +334,10 @@ def test_inpaint_above_provider_pixel_limit_is_reduced_to_a_legal_grid():
     request = converted.request
     params = request["parameters"]
     assert request["action"] == "infill"
-    assert (params["width"], params["height"]) == (1728, 1792)
+    assert (params["width"], params["height"]) == (1728, 1728)
     assert params["width"] * params["height"] <= NAI_EDIT_MAX_PIXELS
-    assert Image.from_base64(params["image"]).extent == Extent(1728, 1792)
-    assert Image.from_base64(params["mask"]).extent == Extent(1728, 1792)
+    assert Image.from_base64(params["image"]).extent == Extent(1728, 1728)
+    assert Image.from_base64(params["mask"]).extent == Extent(1728, 1728)
     # Launcher infill contract: no server-side original blending (the client
     # composites with the soft mask instead), flat strength sent, nested
     # img2img carries color_correct below 100%.

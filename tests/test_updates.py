@@ -89,15 +89,13 @@ async def test_auto_update(tmp_path: Path):
     zip_name = "krita_ai_diffusion-1.52.1-nai9.zip"
     url = "https://example.com/" + zip_name
     archive = build_package(tmp_path / "build", zip_name, '__nai_version__ = "1.52.1-nai9"')
-    net = FakeNetwork(
-        {
-            "https://api.github.com/repos/test/test/releases/latest": release_json(
-                "v1.52.1-nai9", [zip_name, f"{zip_name}.sha256"]
-            ),
-            url: archive,
-            f"{url}.sha256": f"{hashlib.sha256(archive).hexdigest()}  {zip_name}\n".encode(),
-        }
-    )
+    net = FakeNetwork({
+        "https://api.github.com/repos/test/test/releases/latest": release_json(
+            "v1.52.1-nai9", [zip_name, f"{zip_name}.sha256"]
+        ),
+        url: archive,
+        f"{url}.sha256": f"{hashlib.sha256(archive).hexdigest()}  {zip_name}\n".encode(),
+    })
 
     install_dir = tmp_path / "install"
     installed = install_dir / "ai_diffusion" / "__init__.py"
@@ -131,13 +129,11 @@ async def test_auto_update(tmp_path: Path):
 @qtapp
 async def test_auto_update_latest(tmp_path: Path):
     zip_name = "krita_ai_diffusion-1.52.1-nai9.zip"
-    net = FakeNetwork(
-        {
-            "https://api.github.com/repos/test/test/releases/latest": release_json(
-                "v1.52.1-nai9", [zip_name]
-            )
-        }
-    )
+    net = FakeNetwork({
+        "https://api.github.com/repos/test/test/releases/latest": release_json(
+            "v1.52.1-nai9", [zip_name]
+        )
+    })
     updater = AutoUpdate(tmp_path, "1.52.1-nai9", "test/test", net)  # type: ignore[arg-type]
     await updater.check()
     assert updater.state is UpdateState.latest
@@ -159,15 +155,13 @@ async def test_auto_update_corrupt_package(tmp_path: Path):
     zip_name = "krita_ai_diffusion-1.52.1-nai9.zip"
     url = "https://example.com/" + zip_name
     archive = build_package(tmp_path / "build", zip_name, "corrupted")
-    net = FakeNetwork(
-        {
-            "https://api.github.com/repos/test/test/releases/latest": release_json(
-                "v1.52.1-nai9", [zip_name, f"{zip_name}.sha256"]
-            ),
-            url: archive,
-            f"{url}.sha256": b"0" * 64 + b"  " + zip_name.encode(),
-        }
-    )
+    net = FakeNetwork({
+        "https://api.github.com/repos/test/test/releases/latest": release_json(
+            "v1.52.1-nai9", [zip_name, f"{zip_name}.sha256"]
+        ),
+        url: archive,
+        f"{url}.sha256": b"0" * 64 + b"  " + zip_name.encode(),
+    })
     install_dir = tmp_path / "install"
     install_dir.mkdir()
     updater = AutoUpdate(install_dir, "1.52.1-nai8", "test/test", net)  # type: ignore[arg-type]

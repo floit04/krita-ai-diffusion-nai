@@ -98,12 +98,19 @@ class JobParams:
             {
                 "mode": c.mode.text,
                 "strength": c.strength / c.strength_multiplier,
-                # NAI whole-canvas control entries have no layer (layer is None)
-                "image": c.layer.name if c.layer is not None else "整张画布",
+                # NAI control entries may have no layer: the explicit "选区"
+                # source, or whole-canvas (both leave layer None)
+                "image": (
+                    "选区"
+                    if c.is_selection
+                    else c.layer.name
+                    if c.layer is not None
+                    else "整张画布"
+                ),
                 "start": c.start,
                 "end": c.end,
                 "target_resolution": (
-                    f"{c.target_width}x{c.target_height}"
+                    f"{c.target_extent.width}x{c.target_extent.height}"
                     if c.mode is ControlMode.nai_base
                     else None
                 ),

@@ -43,9 +43,7 @@ def test_blake2b_long_produces_requested_length():
     ],
 )
 def test_matches_argon2_cffi(time_cost, memory_cost, parallelism, hash_len, type_):
-    argon2_low_level = pytest.importorskip(
-        "argon2.low_level", reason="argon2-cffi not installed"
-    )
+    argon2_low_level = pytest.importorskip("argon2.low_level", reason="argon2-cffi not installed")
     reference_type = {
         nai_auth._TYPE_D: argon2_low_level.Type.D,
         nai_auth._TYPE_I: argon2_low_level.Type.I,
