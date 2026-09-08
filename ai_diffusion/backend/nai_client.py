@@ -689,17 +689,22 @@ def convert_workflow(
         action = NaiAction.generate
 
     # --- Resolution (from WorkflowInput) ---
-    # Image edits use their explicit or automatically selected 64px-grid target.
-    # Text generation retains the provider's separate API pixel limit.
+    # The docker's target resolution is global: text to image, img2img and inpaint
+    # all render at it. Only when the workflow carries no target at all do the
+    # fallbacks below apply.
     if base_ctrl is not None:
         assert base_ctrl.image is not None
-        target = base_ctrl.target_extent or base_ctrl.image.extent
-        extent = target
+        extent = base_ctrl.target_extent or base_ctrl.image.extent
         log.info(f"NAI img2img resolution: {extent.width}x{extent.height}")
+    elif work.nai_target_extent is not None:
+        # Text generation used to skip this branch and fall through to
+        # extent.desired below - the ComfyUI-style extent, which is capped near
+        # 1 MP - so a 1472x1472 canvas came back as 1024x1024 however the docker
+        # was set.
+        extent = work.nai_target_extent
+        log.info(f"NAI target resolution: {extent.width}x{extent.height}")
     elif action in (NaiAction.img2img, NaiAction.infill):
-        if work.nai_target_extent is not None:
-            extent = work.nai_target_extent
-        elif work.images and work.images.initial_image:
+        if work.images and work.images.initial_image:
             extent = nai_auto_resolution(work.images.initial_image.extent)
         else:
             extent = Extent(1024, 1024)

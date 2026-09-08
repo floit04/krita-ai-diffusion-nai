@@ -321,6 +321,25 @@ def test_redraw_uses_auto_target_and_restores_original_extent():
     assert restored[0].extent == source.extent
 
 
+def test_text_to_image_renders_at_the_docker_target_resolution():
+    """The target resolution is global, so text to image obeys it too.
+
+    Reported: a 1472x1472 canvas kept coming back as 1024x1024. The docker was
+    right and the field was right - convert_workflow simply never read
+    nai_target_extent outside the img2img/infill branch, so generate fell
+    through to images.extent.desired, the ComfyUI-style extent capped near 1 MP.
+    """
+    work = _workflow()
+    work.nai_target_extent = Extent(1472, 1472)
+
+    request = convert_workflow(work).request
+    params = request["parameters"]
+    assert request["action"] == "generate"
+    assert (params["width"], params["height"]) == (1472, 1472)
+    assert work.images is not None
+    assert work.images.extent.desired != Extent(1472, 1472)  # the old source
+
+
 def test_inpaint_above_provider_pixel_limit_is_reduced_to_a_legal_grid():
     source = Image.create(Extent(1800, 1800))
     work = _workflow()
