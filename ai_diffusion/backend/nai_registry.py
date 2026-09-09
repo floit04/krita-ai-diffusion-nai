@@ -355,12 +355,23 @@ class QualityTags:
     def append_suffix(cls, prompt: str, suffix: str | None) -> str:
         if not suffix:
             return prompt
-        trimmed = prompt.strip()
-        if not trimmed:
+        if not prompt.strip():
             return suffix
-        if trimmed.endswith(","):
-            return f"{trimmed} {suffix}"
-        return f"{trimmed}, {suffix}"
+        # Deliberately NOT prompt.strip() first, which is where this parts ways
+        # with the launcher (api_constants.dart:626 appendSuffix). novelai.net
+        # preserves the user's leading and trailing whitespace verbatim before
+        # appending: two of the three captured renders have a base prompt ending
+        # in a literal blank line and one also starts with a newline, and all of
+        # it survives into the echoed prompt. The launcher trims, so on a prompt
+        # with stray whitespace the launcher and the website produce different
+        # text - and different text at a fixed seed is a different image. Copying
+        # the launcher is a means to reproducing the website, so where the two
+        # actually disagree the website wins. Verified safe on this path: the one
+        # place that injects whitespace, merge_prompt's language branch, is not
+        # reachable here (nai_client.py:728 passes no language).
+        if prompt.endswith(","):
+            return f"{prompt} {suffix}"
+        return f"{prompt}, {suffix}"
 
     @classmethod
     def _apply_to_chunk(cls, chunk: str, suffix: str, has_text_section: bool) -> str:

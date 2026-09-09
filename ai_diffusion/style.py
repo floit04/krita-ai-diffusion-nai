@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .backend.api import CheckpointInput, LoraInput
+from .backend.nai_registry import QualityTags
 from .backend.resources import Arch
 from .localization import translate as _
 from .settings import Setting, settings
@@ -129,6 +130,15 @@ class StyleSettings:
         _("Automatically prepend quality tags to the prompt"),
     )
 
+    # The website offers three states (none / standard / light) but the launcher
+    # models them as a toggle plus a tier (image_params.dart:141 and :144), which
+    # is what lets the existing boolean key keep working untouched.
+    nai_quality_tier = Setting(
+        _("Quality Tag Preset"),
+        QualityTags.standard_tier,
+        _("Which quality tag set to prepend (V5 only; other models have one)"),
+    )
+
     nai_variety_boost = Setting(
         _("Variety+"),
         False,
@@ -174,6 +184,7 @@ class Style(QObject):
     # NAI-specific fields (only used when checkpoint is a NAI model)
     nai_uc_preset: int = StyleSettings.nai_uc_preset.default
     nai_quality_toggle: bool = StyleSettings.nai_quality_toggle.default
+    nai_quality_tier: str = StyleSettings.nai_quality_tier.default
     nai_variety_boost: bool = StyleSettings.nai_variety_boost.default
     nai_cfg_rescale: float = StyleSettings.nai_cfg_rescale.default
     nai_noise_schedule: str = StyleSettings.nai_noise_schedule.default

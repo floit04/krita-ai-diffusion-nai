@@ -16,10 +16,12 @@ import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from PyQt5.QtNetwork import QNetworkReply
 
+from .. import util
 from ..image import Bounds, Extent, Image, ImageCollection
 from ..localization import translate as _
 from ..settings import PerformanceSettings, settings
@@ -36,7 +38,7 @@ from .client import (
     DeviceInfo,
 )
 from .nai_mask_utils import InpaintMaskArtifacts, apply_composite_mask
-from .nai_registry import UcPresets
+from .nai_registry import QualityTags, UcPresets
 from .nai_request_builder import (
     ACTION_GENERATE,
     ACTION_IMG2IMG,
@@ -434,6 +436,8 @@ class NaiClient(Client):
                 "NAI request:\n"
                 + json.dumps(_truncate_for_log(nai_request), indent=2, ensure_ascii=False)
             )
+            if settings.debug_dump_workflow:
+                dump_nai_request(nai_request, util.log_dir, f"nai-request-{job.local_id}")
 
             # Send the request
             response_data = await self._post_binary("ai/generate-image", nai_request)
@@ -537,6 +541,58 @@ def _parse_zip_response(data: bytes | Any) -> ImageCollection:
         raise RuntimeError(f"NAI returned invalid ZIP data: {e}") from e
 
     return images
+
+
+# ---------------------------------------------------------------------------
+# Request dump (parameter comparison against novelai.net)
+# ---------------------------------------------------------------------------
+
+_DUMP_MIN_PAYLOAD_CHARS = 256
+
+
+def dump_nai_request(request: dict[str, Any], directory: Path, name: str) -> None:
+    """Write the untruncated request to disk, images alongside it as PNGs.
+
+    Reproducing the website exactly means comparing every field we send against
+    the `Comment` chunk of an image the website produced. Neither end of that
+    comparison was available before: client.log clips every string to 80
+    characters, and Krita re-encodes what it saves, so plugin output carries no
+    NAI metadata at all.
+
+    Base64 payloads become a `<png len=... sha1=...>` fingerprint in the JSON and
+    are decoded to `<name>.<path>.png` next to it, which is what makes "is the
+    source image we sent transparent, or was it filled white?" answerable by eye.
+    """
+    import base64
+    import hashlib
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    saved: list[tuple[str, str]] = []
+
+    def strip(obj, path: str):
+        if isinstance(obj, dict):
+            return {k: strip(v, f"{path}.{k}" if path else k) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [strip(v, f"{path}[{i}]") for i, v in enumerate(obj)]
+        if isinstance(obj, str) and len(obj) > _DUMP_MIN_PAYLOAD_CHARS:
+            digest = hashlib.sha1(obj.encode("ascii", "replace")).hexdigest()[:12]
+            try:
+                raw = base64.b64decode(obj, validate=True)
+            except Exception:
+                return f"<str len={len(obj)} sha1={digest}>"
+            saved.append((path, digest))
+            (directory / f"{name}.{path}.png").write_bytes(raw)
+            return f"<png len={len(obj)} sha1={digest} file={name}.{path}.png>"
+        return obj
+
+    try:
+        stripped = strip(request, "")
+        target = directory / f"{name}.json"
+        target.write_text(json.dumps(stripped, indent=2, ensure_ascii=False), encoding="utf-8")
+        log.info(f"NAI request dumped to {target} ({len(saved)} image(s))")
+    except Exception as e:  # never let debug tooling break a generation
+        log.warning(f"Failed to dump NAI request: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +868,7 @@ def convert_workflow(
         except ValueError:
             uc_preset = NaiUCPreset.heavy
         quality_toggle = style.nai_quality_toggle
+        quality_tier = style.nai_quality_tier
         variety_plus: bool = bool(style.nai_variety_boost)
         # Override noise_schedule from style if explicitly set
         try:
@@ -826,6 +883,9 @@ def convert_workflow(
         except ValueError:
             uc_preset = NaiUCPreset.heavy
         quality_toggle = settings.nai_quality_toggle
+        # No global counterpart: the tier is a style-level choice, and the
+        # builder falls back to standard for any model without light anyway.
+        quality_tier = QualityTags.standard_tier
         variety_plus = bool(settings.nai_variety_boost)
 
     # Seed comes from WorkflowInput (per-generation from UI)
@@ -857,12 +917,15 @@ def convert_workflow(
             src = base_ctrl.image
         elif work.images and work.images.initial_image:
             src = work.images.initial_image
-        if src is not None:
-            if focus_crop is not None:
-                src = Image.crop(src, focus_crop)
-            else:
-                src = Image.copy(src)
-            src.make_opaque()  # NAI requires RGB, strip alpha
+        # The source keeps its alpha. NAI accepts RGBA and the launcher never
+        # strips it (no makeOpaque/removeAlpha anywhere in its pipeline);
+        # filling transparency with white handed the model a different picture
+        # than the canvas held, which is what made img2img drift ~1.7x further
+        # from the source than the website did and come back with white corners
+        # where the website returned transparent ones. The defensive copy went
+        # with it - nothing mutates src in place any more.
+        if src is not None and focus_crop is not None:
+            src = Image.crop(src, focus_crop)
         if action is NaiAction.infill and work.images and work.images.hires_mask:
             mask_img = work.images.hires_mask
             if focus_crop is not None:
@@ -937,13 +1000,27 @@ def convert_workflow(
         scale=cfg_scale,
         sampler=sampler.value,
         steps=steps,
-        n_samples=work.batch_count,
+        # Always 1, never work.batch_count. That field is ComfyUI's local
+        # micro-batching: compute_batch_size packs 2-4 latents into one run when
+        # the extent is small, which is free on your own GPU and meaningless
+        # here - NAI bills per sample. The batch slider already asks for more
+        # images by enqueuing more jobs, so honouring it here multiplied on top
+        # (512px canvas + slider 4 = 16 images charged for one click), and the
+        # extra samples are noised server-side, so none is reproducible at the
+        # requested seed. The launcher forces this in all 10 call sites,
+        # krita_bridge_service.dart:253 and anlas_calculator.dart:139 included.
+        n_samples=1,
         seed=seed,
         uc_preset=uc_preset_api,
         quality_toggle=quality_toggle,
+        quality_tier=quality_tier,
         cfg_rescale=cfg_rescale_val,
         noise_schedule=noise_schedule.value,
         variety_plus=variety_plus,
+        # Account-level on the website and independent of the transparency tag;
+        # sending false made the server return premultiplied alpha, which darkened
+        # every semi-transparent edge pixel by its own alpha.
+        straight_alpha=True,
         source_image=src,
         mask_image=mask_img,
         strength=strength,

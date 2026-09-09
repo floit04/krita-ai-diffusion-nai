@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ..backend.client import filter_supported_styles, resolve_arch
+from ..backend.nai_registry import QualityTags
 from ..backend.nai_workflow import NaiNoiseSchedule, NaiUCPreset
 from ..backend.resources import Arch, ResourceId, ResourceKind, search_paths
 from ..backend.server import Server
@@ -775,6 +776,13 @@ class StylePresets(SettingsTab):
             "nai_quality_toggle", SwitchSetting(StyleSettings.nai_quality_toggle, parent=self)
         )
 
+        # Only V5 has a second tier, so the items are rebuilt per model in
+        # _update_nai_visibility rather than fixed here.
+        self._nai_quality_tier = add(
+            "nai_quality_tier", ComboBoxSetting(StyleSettings.nai_quality_tier, parent=self)
+        )
+        self._nai_quality_tier_items: list[str] = []
+
         self._nai_variety_boost = add(
             "nai_variety_boost", SwitchSetting(StyleSettings.nai_variety_boost, parent=self)
         )
@@ -794,6 +802,7 @@ class StylePresets(SettingsTab):
         self._nai_widgets: list[SettingWidget] = [
             self._nai_uc_preset,
             self._nai_quality_toggle,
+            self._nai_quality_tier,
             self._nai_variety_boost,
             self._nai_cfg_rescale,
             self._nai_noise_schedule,
@@ -936,6 +945,22 @@ class StylePresets(SettingsTab):
         for w in self._nai_widgets:
             w.visible = is_nai
         self._nai_header_widget.setVisible(is_nai)
+
+        # Offer exactly the tiers the model has - tiers_for_model is the same
+        # table the request builder resolves with, so the box can never present
+        # a preset the server would silently downgrade. Rebuilding clears the
+        # combo, and _read_style has already written the value by now, so the
+        # selection is restored here (falling back the way the builder does).
+        tiers = QualityTags.tiers_for_model(style.checkpoints[0] if style.checkpoints else "")
+        if tiers != self._nai_quality_tier_items:
+            self._nai_quality_tier_items = tiers
+            labels = {
+                QualityTags.standard_tier: _("Standard"),
+                QualityTags.light_tier: _("Light"),
+            }
+            self._nai_quality_tier.set_items([(labels.get(t, t), t) for t in tiers])
+        tier = style.nai_quality_tier
+        self._nai_quality_tier.value = tier if tier in tiers else QualityTags.standard_tier
 
         # Local-only widgets (hide when NAI; never shown on the NovelAI page)
         for w in self._local_only_widgets:

@@ -85,6 +85,11 @@ class NaiGenerationParams:
     noise_schedule: str = "karras"
     variety_plus: bool = False
     transparent_background: bool = False
+    # Alpha encoding is an account-level setting on the website, independent of
+    # the transparent-background tag: launcher image_params.dart:174 defaults it
+    # to true, and all three of our official reference renders carry
+    # straight_alpha: true - including the one with transparency switched off.
+    straight_alpha: bool = True
     # img2img / infill
     source_image: Image | None = None
     mask_image: Image | None = None
@@ -165,7 +170,7 @@ def build_base_parameters(
 
     if capabilities.supports_transparent_background:
         # 官网把 Alpha 模式作为账号级设置，只要模型支持透明就随请求下发。
-        p["straight_alpha"] = params.transparent_background
+        p["straight_alpha"] = params.straight_alpha
         if params.transparent_background:
             p["tag_hint_transparent_background"] = True
 
@@ -253,6 +258,28 @@ def build_precise_reference_parameters(p: dict, params: NaiGenerationParams) -> 
     p["director_reference_secondary_strength_values"] = [1.0 - r.fidelity for r in refs]
 
 
+def map_sampler_for_model(sampler: str, model: str) -> str:
+    """Coerce a sampler the model cannot run, the way the launcher does.
+
+    Copied from nai_image_generation_api_service.dart:65-79 (mapSamplerForModel),
+    which the launcher applies at :340 right before build(). novelai.net hides ddim
+    for V4+ entirely, so nothing there can produce such a request.
+
+    We need it because ddim IS reachable here: style.py:522 maps the ComfyUI "DDIM"
+    preset to "ddim" during the legacy style upgrade, and a user-authored
+    samplers.json preset can name it outright. Sent as-is to a V4/V5 model it also
+    flips the uses_brownian gate off, dropping prefer_brownian and
+    deliberate_euler_ancestral_bug that every official V5 render carries.
+    """
+    if sampler in ("ddim", "ddim_v3"):
+        caps = capabilities_of(model)
+        if caps.is_v4_prompt:
+            return "k_euler_ancestral"
+        if "diffusion-3" in model:
+            return "ddim_v3"
+    return sampler
+
+
 def build_request(params: NaiGenerationParams) -> NaiRequestBuildResult:
     assert params.sampler, "Sampler cannot be empty"
     seed = params.seed if params.seed != -1 else random.randint(0, 4294967294)
@@ -275,7 +302,8 @@ def build_request(params: NaiGenerationParams) -> NaiRequestBuildResult:
     effective_prompt = semantics.effective_prompt
     effective_negative = semantics.effective_negative_prompt
 
-    p = build_base_parameters(params, params.sampler, seed, effective_negative)
+    sampler = map_sampler_for_model(params.sampler, params.model)
+    p = build_base_parameters(params, sampler, seed, effective_negative)
     normalized_source: Image | None = None
     mask_artifacts: InpaintMaskArtifacts | None = None
 

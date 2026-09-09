@@ -1,4 +1,7 @@
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+from PyQt5.QtCore import Qt
 
 from ai_diffusion.backend.api import (
     CheckpointInput,
@@ -25,7 +28,7 @@ from ai_diffusion.backend.nai_focused import (
     constrain_focus_bounds,
     resolve_geometry,
 )
-from ai_diffusion.backend.nai_registry import build_prompt_semantics
+from ai_diffusion.backend.nai_registry import QualityTags, build_prompt_semantics
 from ai_diffusion.backend.nai_request_builder import (
     ACTION_INFILL,
     NaiGenerationParams,
@@ -114,7 +117,7 @@ def test_v5_generate_request_uses_launch_contract():
     assert params["tag_hint_uc_preset"] == 0
     assert params["autoSmea"] is False
     assert params["add_original_image"] is True
-    assert params["straight_alpha"] is False
+    assert params["straight_alpha"] is True
     # empty negative goes out as `uc`, not `negative_prompt`
     assert params["uc"] == "" and "negative_prompt" not in params
     # V5 hides Variety+ on the web; the launcher deliberately allows it, and
@@ -152,6 +155,93 @@ def test_v5_img2img_uses_selected_source_and_v5_request_contract():
     assert params["strength"] == 0.55
     assert params["noise"] == 0.15
     assert Image.from_base64(params["image"]).extent == Extent(1344, 768)
+
+
+def test_quality_tier_reaches_the_request_from_the_style():
+    """The tier was modelled but never wired: convert_workflow only passed
+    quality_toggle, so quality_tier stayed pinned at its `standard` default and
+    the website's light preset (tag_hint_qt 3) was unreachable from the plugin.
+
+    Launcher structure copied verbatim: qualityToggle and qualityTier are two
+    independent params (image_params.dart:141 and :144), which is why the
+    existing boolean config key keeps working untouched.
+    """
+    from ai_diffusion.style import Style
+
+    def styled(tier: str, *, toggle: bool = True, checkpoint: str = "nai-diffusion-5-full"):
+        style = Style(Path("test-style.json"))
+        style.checkpoints = [checkpoint]
+        style.nai_quality_toggle = toggle
+        style.nai_quality_tier = tier
+        with patch(
+            "ai_diffusion.backend.nai_client._find_style_for_checkpoint", return_value=style
+        ):
+            return convert_workflow(_workflow(checkpoint=checkpoint)).request
+
+    light = styled(QualityTags.light_tier)
+    assert light["parameters"]["qualityPresetId"] == "light"
+    assert light["parameters"]["tag_hint_qt"] == 3
+    assert light["input"].endswith("very aesthetic, amazing quality, no text")
+
+    standard = styled(QualityTags.standard_tier)
+    assert standard["parameters"]["qualityPresetId"] == "standard"
+    assert standard["parameters"]["tag_hint_qt"] == 1
+    assert standard["input"].endswith("very aesthetic, masterpiece, no text")
+
+    off = styled(QualityTags.light_tier, toggle=False)
+    assert off["parameters"]["qualityPresetId"] == "none"
+    assert off["parameters"]["tag_hint_qt"] == 0
+
+    # V4.5 has a single tier, so light degrades to standard rather than sending
+    # a preset id the server does not know (_resolve_quality_preset_id).
+    v45 = styled(QualityTags.light_tier, checkpoint="nai-diffusion-4-5-full")
+    assert v45["parameters"]["qualityPresetId"] == "standard"
+    assert v45["parameters"]["tag_hint_qt"] == 1
+
+
+def test_alpha_mode_is_sent_independently_of_the_transparency_tag():
+    """Ported from the launcher's own test of the same name.
+
+    (nai_image_request_builder_test.dart, "should send selected alpha mode even
+    with transparency off".) Alpha encoding is an account-level setting on the
+    website; the transparency tag is a prompt tag. We had translated the
+    launcher's block with the two conflated, so every request went out as
+    straight_alpha: false and the server answered with premultiplied alpha -
+    each semi-transparent edge pixel darkened by its own alpha, measured at
+    mean|official x alpha - plugin| = 0.58 across a whole render.
+    """
+    model = "nai-diffusion-5-full"
+    straight = build_request(NaiGenerationParams(model=model)).request_data["parameters"]
+    premultiplied = build_request(
+        NaiGenerationParams(model=model, straight_alpha=False)
+    ).request_data["parameters"]
+
+    assert straight["straight_alpha"] is True
+    assert premultiplied["straight_alpha"] is False
+    # Transparency is off in both, so neither carries the tag hint.
+    assert "tag_hint_transparent_background" not in straight
+    assert "tag_hint_transparent_background" not in premultiplied
+
+
+def test_img2img_source_keeps_its_transparency():
+    """The source used to be flattened onto white before being sent.
+
+    NAI accepts RGBA and the launcher never strips alpha, so filling
+    transparency with white handed the model a picture the canvas never held:
+    img2img drifted ~1.7x further from the source than the website did and came
+    back with opaque white corners.
+    """
+    source = Image.create(Extent(320, 192), Qt.GlobalColor.transparent)
+    base = ControlInput(
+        ControlMode.nai_base, source, strength=0.55, param2=0.0, target_extent=Extent(320, 192)
+    )
+
+    params = convert_workflow(_workflow(base, checkpoint="nai-diffusion-5-full")).request[
+        "parameters"
+    ]
+
+    sent = Image.from_base64(params["image"])
+    assert sent.pixel(0, 0)[3] == 0, "transparent source pixel came back opaque"
 
 
 def test_v5_inpaint_routes_full_natively_and_curated_to_official_fallback():
@@ -657,3 +747,60 @@ def test_capping_a_focus_box_respects_the_minimum_context_setting():
         capped = cap_focus_box(source, Bounds(0, 0, 4096, 256), previous, min_context)
         assert capped is not None
         assert _crop_area(capped, source, min_context) <= MAX_CROP_AREA
+
+
+def test_batch_count_never_becomes_n_samples():
+    """work.batch_count is ComfyUI's local micro-batching, not a NAI sample count.
+
+    resolution.compute_batch_size packs 2-4 latents into one run whenever the
+    extent is small (512px canvas -> 4, 640px -> 2). On a local GPU that is free;
+    on NAI every sample is billed, and the batch slider already asks for more
+    images by enqueuing more jobs, so passing it through multiplied on top.
+
+    The launcher forces nSamples: 1 at all 10 call sites, krita_bridge_service.dart:253
+    (the Krita bridge itself) and anlas_calculator.dart:139 among them, and all three
+    captured novelai.net renders carry n_samples: 1.
+    """
+    for batch_count in (1, 2, 4):
+        work = _workflow()
+        work.batch_count = batch_count
+        request = convert_workflow(work).request
+        assert request["parameters"]["n_samples"] == 1, (
+            f"batch_count={batch_count} leaked into n_samples - that is "
+            f"{batch_count}x the Anlas for one click"
+        )
+
+
+def test_ddim_is_coerced_on_models_that_cannot_run_it():
+    """Copied from the launcher's mapSamplerForModel (nai_image_generation_api_service.dart:65-79).
+
+    novelai.net hides ddim for V4+ so no website request can carry it, but it is
+    reachable here: style.py:522 maps the ComfyUI "DDIM" preset to "ddim" on the
+    legacy style upgrade path. Sent verbatim to V5 it also silently drops
+    prefer_brownian / deliberate_euler_ancestral_bug, which every official V5
+    render carries, because those are gated on the euler_ancestral path.
+    """
+    for model in ("nai-diffusion-5-full", "nai-diffusion-4-5-full"):
+        for sampler in ("ddim", "ddim_v3"):
+            p = build_request(
+                NaiGenerationParams(model=model, sampler=sampler, prompt="test")
+            ).request_data["parameters"]
+            assert p["sampler"] == "k_euler_ancestral", f"{sampler} survived on {model}"
+            assert p["prefer_brownian"] is True
+            assert p["deliberate_euler_ancestral_bug"] is False
+
+    # V3 keeps ddim - it is the one family that can actually run it, and the
+    # launcher maps the plain name onto the v3 variant rather than replacing it.
+    v3 = build_request(
+        NaiGenerationParams(model="nai-diffusion-3", sampler="ddim", prompt="test")
+    ).request_data["parameters"]
+    assert v3["sampler"] == "ddim_v3"
+    assert v3["sm"] is False  # the existing ddim/SMEA interlock still holds
+
+    # Everything else passes through untouched.
+    assert (
+        build_request(
+            NaiGenerationParams(model="nai-diffusion-5-full", sampler="k_dpmpp_2m", prompt="t")
+        ).request_data["parameters"]["sampler"]
+        == "k_dpmpp_2m"
+    )

@@ -1,0 +1,79 @@
+{
+  "_comment": [
+    "Golden samples captured from novelai.net: the PNG `Comment` tEXt chunk the server",
+    "writes into every image it returns. All three were rendered with NAI Diffusion V5",
+    "(model_hash DB276663). `signed_hash` was stripped; nothing else was edited.",
+    "",
+    "The Comment is a FILTERED ECHO of the request, not the request itself. A field",
+    "missing here does not prove the website omitted it, and a field present does not",
+    "prove the client sent it - the server adds its own defaults. So the golden test",
+    "asserts only the intersection, and the two ignore lists below record which fields",
+    "are outside it and why. tools/nai_param_diff.py reads this same file, so the tool",
+    "and the test can never drift apart."
+  ],
+  "ignored_request_only": {
+    "_comment": "Fields the plugin sends that the server never echoes. Absence from Comment is not evidence of a bug.",
+    "qualityPresetId": "UI-state field; the server echoes the resolved tag_hint_qt instead",
+    "ucPresetId": "same, echoed as tag_hint_uc_preset",
+    "image_format": "transport-level, not a generation parameter",
+    "image": "base64 payload, compared by decoding rather than by string",
+    "mask": "base64 payload",
+    "reference_image_multiple": "base64 payloads",
+    "director_reference_images": "base64 payloads"
+  },
+  "ignored_official_only": {
+    "_comment": "Fields present in the Comment that no client sends - server-side or account-side.",
+    "signed_hash": "server signature over the request; stripped from these samples",
+    "request_type": "server-side classification (PromptGenerateRequest / Img2ImgRequest)",
+    "stream": "transport negotiation (msgpack), not a generation parameter",
+    "model_name": "server-side model identity, derived from the top-level `model` field",
+    "model_hash": "server-side weight hash",
+    "version": "metadata schema version of the Comment blob itself",
+    "extra_passthrough_testing": "NovelAI internal debug passthrough; all-null in every sample",
+    "legacy_v3_extend": "V3-only server flag"
+  },
+  "ignored_nested_official_only": {
+    "_comment": [
+      "Keys the server ADDS inside v4_prompt / v4_negative_prompt that no client sends.",
+      "Proof they are server-side, not a plugin omission: the echo carries all four keys in",
+      "both blocks, but v4_prompt.use_order is true while v4_negative_prompt.use_order is",
+      "false. A blanket server default would be false in both. What the echo actually shows",
+      "is exactly the shape the launcher sends (nai_image_request_builder.dart:275-291 puts",
+      "use_coords+use_order only in v4_prompt and legacy_uc only in v4_negative_prompt) with",
+      "every unsent key filled in as false. So novelai.net's own client sends this same",
+      "shape, and matching the echo key-for-key would mean sending MORE than the website."
+    ],
+    "v4_prompt.legacy_uc": "launcher sends legacy_uc at the top level of parameters only; server defaults it to false here",
+    "v4_negative_prompt.use_coords": "launcher sends use_coords in v4_prompt and at the top level, not in the negative block",
+    "v4_negative_prompt.use_order": "same; note the echo's false here vs true in v4_prompt is what proves these are defaults"
+  },
+  "samples": [
+    {
+      "file": "t2i_quality_on.json",
+      "action": "generate",
+      "model": "nai-diffusion-5-full",
+      "quality_toggle": true,
+      "quality_tier": "standard",
+      "transparent_background": true,
+      "note": "Quality tags on and the transparency tag auto-appended by the website. The base prompt ends with a literal \\n\\n which the website preserved before appending `, transparent background, very aesthetic, masterpiece, no text`."
+    },
+    {
+      "file": "t2i_quality_off.json",
+      "action": "generate",
+      "model": "nai-diffusion-5-full",
+      "quality_toggle": false,
+      "quality_tier": "standard",
+      "transparent_background": false,
+      "note": "Quality tags off (tag_hint_qt 0) and no transparency tag. The user typed `transparent_background,` into the prompt by hand instead, which is why the prompt still mentions it."
+    },
+    {
+      "file": "img2img.json",
+      "action": "img2img",
+      "model": "nai-diffusion-5-full",
+      "quality_toggle": true,
+      "quality_tier": "standard",
+      "transparent_background": true,
+      "note": "strength 0.4, noise 0.1, extra_noise_seed 1026 against seed 1027 - the seed relationship is what the img2img test pins down."
+    }
+  ]
+}
