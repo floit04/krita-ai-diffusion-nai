@@ -1,4 +1,5 @@
 """Direct NAI API test - bypasses Qt networking to isolate the issue."""
+
 import json
 import sys
 
@@ -10,6 +11,7 @@ except ImportError:
 
 # Read token from settings
 import os
+
 settings_path = os.path.expanduser(r"~\AppData\Roaming\krita\ai_diffusion\settings.json")
 with open(settings_path, "r") as f:
     settings = json.load(f)
@@ -45,21 +47,15 @@ request_body = {
         "image_format": "png",
         "params_version": 3,
         "v4_prompt": {
-            "caption": {
-                "base_caption": "1girl,",
-                "char_captions": []
-            },
+            "caption": {"base_caption": "1girl,", "char_captions": []},
             "use_coords": False,
-            "use_order": True
+            "use_order": True,
         },
         "v4_negative_prompt": {
-            "caption": {
-                "base_caption": "lowres, bad anatomy",
-                "char_captions": []
-            },
-            "legacy_uc": False
-        }
-    }
+            "caption": {"base_caption": "lowres, bad anatomy", "char_captions": []},
+            "legacy_uc": False,
+        },
+    },
 }
 
 print(f"\nSending to https://image.novelai.net/ai/generate-image")

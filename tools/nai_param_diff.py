@@ -110,11 +110,11 @@ def main(argv: list[str]) -> int:
         plugin["prompt"] = plugin.pop("input")
 
     differing = sorted(
-        k
-        for k in official.keys() & plugin.keys()
-        if normalize(official[k]) != normalize(plugin[k])
+        k for k in official.keys() & plugin.keys() if normalize(official[k]) != normalize(plugin[k])
     )
-    request_only = sorted(k for k in plugin.keys() - official.keys() if k not in IGNORED_REQUEST_ONLY)
+    request_only = sorted(
+        k for k in plugin.keys() - official.keys() if k not in IGNORED_REQUEST_ONLY
+    )
     official_only = sorted(
         k for k in official.keys() - plugin.keys() if k not in IGNORED_OFFICIAL_ONLY
     )
