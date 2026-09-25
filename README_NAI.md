@@ -70,6 +70,23 @@ Krita 的 AI 面板 → 右上角齿轮 → **连接** 页 → 选 **NovelAI** �
 
 规则:有选区时以重绘优先(图生图层被忽略);Vibe 与精准参考同时存在时按官方行为保留精准参考;重绘时 Vibe 自动丢弃(NAI 服务端限制)。
 
+## 手动图层颜色匹配（Windows，nai14）
+
+强度右侧、画笔左侧的调色盘按钮处理当前普通绘画图层，参考下方可见图层同坐标合成画面。再次点击恢复原色，重新开启会重新取参考。绿色对号表示当前会话已匹配。不自动处理生成结果，不改变原有 Color Match。
+
+**不支持原生 Ctrl+Z，请先复制图层。** 恢复状态仅当前会话有效，后续像素或位置变化会拒绝覆盖。原始像素备份留在 `%LOCALAPPDATA%\KritaColorMatch\layer-snapshots`，不会自动删除。支持 RGB/Alpha U8、图层与文档相同 profile；锁定、隐藏、动画和变形蒙版等情况不处理。非 Normal 混合模式不保证视觉匹配效果。
+
+需要独立 Python 3.10 或更高版本，勿更改 Krita 内置 Python。在 PowerShell 中运行一次（以本机已有 3.10 为例）：
+
+```powershell
+py -3.10 -m venv "$env:LOCALAPPDATA\KritaColorMatch\venv"
+& "$env:LOCALAPPDATA\KritaColorMatch\venv\Scripts\python.exe" -m pip install color-matcher==0.6.0 numpy pillow
+$cfg = @{python="$env:LOCALAPPDATA\KritaColorMatch\venv\Scripts\python.exe"; method='hm-mvgd-hm'; backend_ranges=@()} | ConvertTo-Json
+[IO.File]::WriteAllText("$env:LOCALAPPDATA\KritaColorMatch\runtime.json", $cfg, [Text.UTF8Encoding]::new($false))
+```
+
+计算默认使用 CPU，无需 ComfyUI、生图 API 或 GPU。算法沿用交接中的 `ColorMatcher().transfer(method="hm-mvgd-hm")` 调用；可选 GPU 仅加速直方图阶段，失败回退 CPU。不要复制其他机器的 Python 绝对路径、虚拟环境或 GPU 阈值。发布包不含计算依赖、配置或图层备份。
+
 ## 技术备注(与其它第三方实现的差异)
 
 - **重绘强度的真实字段**:NAI 服务端只认嵌套对象 `parameters.img2img = {"strength": …, "color_correct": true}`(逆向官网前端 bundle 所得);常见的扁平字段 `inpaintImg2ImgStrength` 会被服务端忽略。目前所见的社区实现(各类启动器 / ComfyUI 节点 / API 封装库)均只发送扁平字段,其重绘强度实际不生效。

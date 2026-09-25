@@ -82,6 +82,7 @@ from .custom_workflow import (
     get_inpaint_context,
 )
 from .jobs import Job, JobKind, JobParams, JobQueue, JobRegion, JobState
+from .manual_color_match import ManualColorMatch
 from .properties import ObservableProperties, Property
 from .region import Region, RegionLink, RootRegion, get_region_inpaint_mask, process_regions
 
@@ -196,6 +197,7 @@ class DocumentModel(QObject, ObservableProperties):
         self._layer: Layer | None = None
         self.generate_seed()
         self.jobs = JobQueue()
+        self.manual_color_match = ManualColorMatch(self)
         self.regions = RootRegion(self)
         self.edit_regions = RootRegion(self)
         self.inpaint = CustomInpaint()

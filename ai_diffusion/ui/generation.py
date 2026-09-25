@@ -803,6 +803,37 @@ class GenerationWidget(QWidget):
         self.add_control_button = create_wide_tool_button(
             "control-add", _("Add Control Layer"), self
         )
+        self.color_match_button = QToolButton(self)
+        self.color_match_button.setObjectName("manual_color_match_button")
+        self._color_match_icons = (
+            theme.icon("color-match-palette"),
+            theme.icon("color-match-palette-applied"),
+        )
+        applied_icon_path = theme.icon_path / (
+            "color-match-palette-applied-dark.svg"
+            if theme.is_dark
+            else "color-match-palette-applied-light.svg"
+        )
+        for icon_mode in (
+            QIcon.Mode.Normal,
+            QIcon.Mode.Active,
+            QIcon.Mode.Selected,
+            QIcon.Mode.Disabled,
+        ):
+            for icon_state in (QIcon.State.Off, QIcon.State.On):
+                self._color_match_icons[1].addFile(
+                    str(applied_icon_path), QSize(), icon_mode, icon_state
+                )
+        self.color_match_button.setIcon(self._color_match_icons[0])
+        self.color_match_button.setIconSize(QSize(20, 20))
+        self.color_match_button.setCheckable(True)
+        self.color_match_button.setEnabled(False)
+        self.color_match_button.setAccessibleName("手动颜色匹配")
+        self.color_match_button.setToolTip(
+            "处理当前绘画图层，参考下方可见图层；再次点击恢复原色。不支持 Ctrl+Z，请先复制图层。"
+        )
+        self.color_match_button.clicked.connect(self._toggle_manual_color_match)
+
         self.paint_selection_button = QToolButton(self)
         self.paint_selection_button.setCheckable(True)
         try:
@@ -846,6 +877,7 @@ class GenerationWidget(QWidget):
         strength_layout = QHBoxLayout()
         strength_layout.addWidget(self.strength_slider)
         strength_layout.addWidget(self.layer_count_widget)
+        strength_layout.addWidget(self.color_match_button)
         strength_layout.addWidget(self.paint_selection_button)
         strength_layout.addWidget(self.focus_inpaint_button)
         strength_layout.addWidget(self.add_control_button)
@@ -984,6 +1016,18 @@ class GenerationWidget(QWidget):
         self._sync_selection_paint_button(model)
         self._sync_focus_inpaint_button()
 
+    def _toggle_manual_color_match(self, checked=False):
+        self._model.manual_color_match.toggle(checked)
+        self._sync_manual_color_match()
+
+    def _sync_manual_color_match(self):
+        enabled, checked, tip = self._model.manual_color_match.status()
+        with theme.SignalBlocker(self.color_match_button):
+            self.color_match_button.setIcon(self._color_match_icons[1 if checked else 0])
+            self.color_match_button.setChecked(checked)
+            self.color_match_button.setEnabled(enabled)
+            self.color_match_button.setToolTip(tip)
+
     def _sync_selection_paint_button(self, model: DocumentModel):
         """Checked means the layer exists, hidden or not: that is what the next
         click deletes. Generating hides the layer, and leaves it in effect."""
@@ -1005,6 +1049,9 @@ class GenerationWidget(QWidget):
                 bind(model, "layer_count", self.layer_count_widget, "value"),
                 bind(model, "error", self.error_box, "error", Bind.one_way),
                 bind_toggle(model, "region_only", self.region_mask_button),
+                model.manual_color_match.changed.connect(self._sync_manual_color_match),
+                model.document.layers.active_changed.connect(self._sync_manual_color_match),
+                model.document.layers.changed.connect(self._sync_manual_color_match),
                 model.inpaint.mode_changed.connect(self.update_generate_options),
                 model.strength_changed.connect(self.update_generate_options),
                 model.document.selection_bounds_changed.connect(self.update_generate_options),
@@ -1041,6 +1088,7 @@ class GenerationWidget(QWidget):
             self.progress_bar.model = model
             self.strength_slider.model = model
             self.history.model_ = model
+            self._sync_manual_color_match()
             self.update_generate_options()
 
     def apply_result(self, item: QListWidgetItem):
