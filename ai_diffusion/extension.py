@@ -11,6 +11,7 @@ from .model.root import root
 from .settings import settings
 from .ui import actions
 from .ui.diffusion import ImageDiffusionWidget
+from .ui.nai_reference import install_canvas_drop_filter, show_reference_library
 from .ui.settings import SettingsDialog
 from .util import client_logger as log
 
@@ -44,6 +45,7 @@ class AIToolsExtension(Extension):
         eventloop.setup()
         settings.load()
         root.init()
+        self._nai_drop_filter = install_canvas_drop_filter()
         self._settings_dialog = SettingsDialog(root.server)
 
         notifier = Krita.instance().notifier()
@@ -63,6 +65,10 @@ class AIToolsExtension(Extension):
         self._actions[name] = action
 
     def createActions(self, window):
+        reference_action = window.createAction(
+            "ai_diffusion_nai_references", "NAI 素材库…", "tools/scripts"
+        )
+        reference_action.triggered.connect(lambda: show_reference_library(window.qwindow()))
         self._create_action(window, "settings", self._settings_dialog.show)
         self._create_action(window, "generate", actions.generate)
         self._create_action(window, "cancel", actions.cancel_active)

@@ -22,6 +22,7 @@ SELECTION_PAINT_LAYER_NAME = "AI 重绘选区 (涂抹)"
 # Name of the vector layer holding the focused-inpaint box, found again the same
 # way as the mask overlay, so it must not change either.
 FOCUS_BOX_LAYER_NAME = "AI 聚焦框"
+CROP_BOX_LAYER_NAME = "AI 裁切框"
 
 
 class SelectionModifiers(NamedTuple):
@@ -33,6 +34,7 @@ class SelectionModifiers(NamedTuple):
     multiple: int = 8
     square: bool = False
     invert: bool = False
+    keep_full_image: bool = False
 
 
 class Document(QObject):
@@ -99,7 +101,7 @@ class Document(QObject):
     def discard_selection_painting(self):
         """Delete the painted mask overlay (see KritaDocument). No-op by default."""
 
-    def start_focus_box(self, bounds: Bounds):
+    def start_focus_box(self, bounds: Bounds, name: str = FOCUS_BOX_LAYER_NAME):
         """Create/show the focus box overlay (see KritaDocument). No-op by default."""
 
     def hide_focus_box(self):
@@ -477,7 +479,8 @@ class KritaDocument(Document):
             (
                 l
                 for l in layers.all
-                if l.type is LayerType.vector and l.name == FOCUS_BOX_LAYER_NAME
+                if l.type is LayerType.vector
+                and l.name in (FOCUS_BOX_LAYER_NAME, CROP_BOX_LAYER_NAME)
             ),
             None,
         )
@@ -510,7 +513,11 @@ class KritaDocument(Document):
             round(rect.width() * res),
             round(rect.height() * res),
         )
-        bounds = Bounds.clamp(bounds, self.extent)
+        bounds = (
+            Bounds.intersection(bounds, Bounds.from_extent(self.extent))
+            if layer.name == CROP_BOX_LAYER_NAME
+            else Bounds.clamp(bounds, self.extent)
+        )
         return None if bounds.is_zero else bounds
 
     def set_focus_box_bounds(self, bounds: Bounds):
@@ -524,15 +531,16 @@ class KritaDocument(Document):
         node.addShapesFromSvg(self._focus_box_svg(bounds))
         layer.refresh()
 
-    def start_focus_box(self, bounds: Bounds):
+    def start_focus_box(self, bounds: Bounds, name: str = FOCUS_BOX_LAYER_NAME):
         """Show the focus box and hand it to Krita's shape tool to be dragged."""
         from .util import client_logger as log
 
         layer = self.focus_box_layer
         if layer is None:
-            layer = self._layers.create_vector(FOCUS_BOX_LAYER_NAME, self._focus_box_svg(bounds))
+            layer = self._layers.create_vector(name, self._focus_box_svg(bounds))
             self._focus_box_layer_id = layer.id
         else:
+            layer.name = name
             layer.show()
         layer.move_to_top()
         self._doc.setActiveNode(layer.node)
@@ -572,7 +580,7 @@ class KritaDocument(Document):
         if not user_selection:
             return None, None
 
-        if _selection_is_entire_document(user_selection, self.extent):
+        if not mod.keep_full_image and _selection_is_entire_document(user_selection, self.extent):
             return None, None
 
         selection = user_selection.duplicate()

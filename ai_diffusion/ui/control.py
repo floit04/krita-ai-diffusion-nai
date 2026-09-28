@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ..backend.resources import Arch, ControlMode
-from ..image import Extent
+from ..image import Extent, Image
 from ..localization import translate as _
 from ..model.control import ControlLayer, ControlLayerList
 from ..model.control_utils import nai_selection_layer_id
@@ -75,17 +75,57 @@ class ControlWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
 
+        self.enabled_checkbox = QCheckBox(self)
+        self.enabled_checkbox.setAccessibleName("激活控制层")
+
         self.mode_select = QComboBox(self)
         self.mode_select.setStyleSheet(theme.flat_combo_stylesheet)
         self._update_modes()
 
+        self.group_checkbox = QCheckBox(self)
+        self.group_checkbox.setAccessibleName("激活整组控制层")
+        self.group_checkbox.setToolTip("整组开关")
+        self.group_checkbox.hide()
+
+        self.add_related_button = QToolButton(self)
+        self.add_related_button.setIcon(theme.icon("control-add"))
+        self.add_related_button.setAutoRaise(True)
+        self.add_related_button.setToolTip("添加同类参考图")
+        self.add_related_button.setAccessibleName("添加同类控制层")
+        self.add_related_button.clicked.connect(self._add_related)
+        self.add_related_button.setVisible(control_list is not None)
+
+        self.group_expand_button = QToolButton(self)
+        self.group_expand_button.setAutoRaise(True)
+        self.group_expand_button.setCheckable(True)
+        self.group_expand_button.setArrowType(Qt.ArrowType.DownArrow)
+        self.group_expand_button.setAccessibleName("展开或收起同组控制层")
+        self.group_expand_button.setVisible(control_list is not None)
+
+        self.group_header = QWidget(self)
+        header_layout = QHBoxLayout(self.group_header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(2)
+        header_layout.addWidget(self.group_checkbox)
+        header_layout.addWidget(self.mode_select)
+        header_layout.addWidget(self.add_related_button)
+        header_layout.addWidget(self.group_expand_button)
+
         self.layer_select = QComboBox(self)
-        self.layer_select.setMinimumContentsLength(20)
+        self.layer_select.setMinimumContentsLength(12 if control.mode.is_nai else 20)
         self.layer_select.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLength
         )
         self.layer_select.highlighted.connect(self._ensure_layer_tooltip)
         self._update_layers()
+
+        self.reference_button = QToolButton(self)
+        self.reference_button.setIcon(theme.icon("nai-album"))
+        self.reference_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.reference_button.setAccessibleName("NAI 素材库")
+        self.reference_button.setAutoRaise(True)
+        self.reference_button.setToolTip("素材库")
+        self.reference_button.clicked.connect(self._manage_references)
 
         self.preset_slider = QSlider(self)
         self.preset_slider.setOrientation(Qt.Orientation.Horizontal)
@@ -123,8 +163,10 @@ class ControlWidget(QWidget):
         self.expand_button.clicked.connect(self._toggle_extended)
 
         bar_layout = QHBoxLayout()
-        bar_layout.addWidget(self.mode_select)
+        bar_layout.addWidget(self.group_header)
+        bar_layout.addWidget(self.enabled_checkbox)
         bar_layout.addWidget(self.layer_select, 3)
+        bar_layout.addWidget(self.reference_button)
         bar_layout.addWidget(self.generate_tool_button)
         bar_layout.addWidget(self.add_pose_tool_button)
         bar_layout.addWidget(self.preset_slider, 1)
@@ -226,8 +268,15 @@ class ControlWidget(QWidget):
         self._update_range()
         self._update_param2()
         self._update_custom_values()
+        self._update_enabled()
 
         self._connections = [
+            control.layer_id_changed.connect(self._update_layers),
+            bind_toggle(control, "enabled", self.enabled_checkbox),
+            bind_toggle(control, "group_enabled", self.group_checkbox),
+            bind_toggle(control, "group_expanded", self.group_expand_button),
+            control.enabled_changed.connect(self._update_enabled),
+            control.group_enabled_changed.connect(self._update_enabled),
             bind_combo(control, "mode", self.mode_select),
             bind_combo(control, "layer_id", self.layer_select),
             bind_toggle(control, "use_custom_strength", self.custom_checkbox),
@@ -249,6 +298,7 @@ class ControlWidget(QWidget):
             control.mode_changed.connect(self._update_custom_values),
             control.is_pose_vector_changed.connect(self._update_pose_utils),
             self._model.layers.changed.connect(self._update_layers),
+            self._model.nai_references.changed.connect(self._update_layers),
             self._model.style_changed.connect(self._update_visibility),
             self._model.style_changed.connect(self._update_modes),
         ]
@@ -256,9 +306,46 @@ class ControlWidget(QWidget):
     def disconnect_all(self):
         Binding.disconnect_all(self._connections)
 
+    def _add_related(self):
+        if self._control_list is not None:
+            self._control_list.add_related(self._control)
+
+    def update_group(self, leader: ControlLayer, count: int):
+        is_leader = self._control is leader
+        self.group_checkbox.setVisible(is_leader and not leader.group_id.isNull())
+        self.mode_select.setVisible(is_leader)
+        self.add_related_button.setVisible(is_leader)
+        self.add_related_button.setEnabled(leader.mode is not ControlMode.nai_base)
+        self.add_related_button.setToolTip(
+            "图生图仅使用一个输入来源" if leader.mode is ControlMode.nai_base else "添加同类参考图"
+        )
+        self.group_expand_button.setVisible(is_leader)
+        self.group_expand_button.setEnabled(count > 1)
+        self.group_expand_button.setArrowType(
+            Qt.ArrowType.DownArrow if leader.group_expanded else Qt.ArrowType.RightArrow
+        )
+        self.group_expand_button.setToolTip("收起同组" if leader.group_expanded else "展开同组")
+        self.setVisible(is_leader or leader.group_expanded)
+        self._update_modes()
+        self._update_enabled()
+
+    def _manage_references(self):
+        from .nai_reference import NaiReferenceDialog
+
+        dialog = NaiReferenceDialog(self._model, self.window(), self._control.layer_id)
+        if (
+            dialog.exec()
+            and dialog.selected_id is not None
+            and (self._control_list is None or self._control in self._control_list)
+        ):
+            self._control.layer_id = dialog.selected_id
+        dialog.deleteLater()
+
     def _update_modes(self):
         is_nai = self._model.arch is Arch.nai
         modes = [m for m in ControlMode if not m.is_internal and m.is_nai == is_nai]
+        if self._control_list and len(self._control_list.group_members(self._control)) > 1:
+            modes = [mode for mode in modes if mode is not ControlMode.nai_base]
         if self._control.mode not in modes:
             modes.insert(0, self._control.mode)  # keep showing the stored mode
         with SignalBlocker(self.mode_select):
@@ -294,7 +381,14 @@ class ControlWidget(QWidget):
             entries.append(("canvas", "整张画布", QUuid()))
         if self._control.mode is ControlMode.nai_base:
             entries.append(("selection", "选区", nai_selection_layer_id))
+        if is_nai_mode and (reference := self._control.reference) is not None:
+            name = f"{reference.name}（缺失）" if reference.deleted else reference.name
+            entries.append(("reference", name, reference.id))
         entries.extend(("layer", layer.name, layer.id) for layer in layers)
+        if is_nai_mode and not any(
+            layer_id == self._control.layer_id for _, _, layer_id in entries
+        ):
+            entries.insert(0, ("missing", "素材缺失", self._control.layer_id))
         return entries
 
     def _insert_layer_item(self, item: int, kind: str, name: str, layer_id: QUuid):
@@ -302,6 +396,10 @@ class ControlWidget(QWidget):
             self.layer_select.insertItem(item, theme.icon("workspace-generation"), name, layer_id)
         elif kind == "selection":
             self.layer_select.insertItem(item, theme.icon("generate-region"), name, layer_id)
+        elif kind == "reference":
+            self.layer_select.insertItem(item, theme.icon("nai-album"), name, layer_id)
+        elif kind == "missing":
+            self.layer_select.insertItem(item, theme.icon("warning"), name, layer_id)
         else:
             self.layer_select.insertItem(item, name, layer_id)
         self.layer_select.setItemData(item, kind, _layer_kind_role)
@@ -312,17 +410,29 @@ class ControlWidget(QWidget):
         if index < 0 or index >= self.layer_select.count():
             return
         kind = self.layer_select.itemData(index, _layer_kind_role)
-        if kind == "selection":
+        if kind in ("selection", "missing"):
             return
         layer_id: QUuid = self.layer_select.itemData(index)
         key = (kind, layer_id.toString())
         if key in self._loaded_tooltips:
             return
         if key not in self._thumbnail_cache:
-            layer = (
-                self._model.layers.root if kind == "canvas" else self._model.layers.find(layer_id)
-            )
-            self._thumbnail_cache[key] = self._layer_thumbnail(layer) if layer else None
+            if kind == "reference":
+                try:
+                    image = self._model.nai_references.image(layer_id)
+                    self._thumbnail_cache[key] = Image.scale_to_fit(
+                        image, _thumbnail_extent
+                    )._qimage
+                except Exception as error:
+                    self.layer_select.setItemData(index, str(error), Qt.ItemDataRole.ToolTipRole)
+                    return
+            else:
+                layer = (
+                    self._model.layers.root
+                    if kind == "canvas"
+                    else self._model.layers.find(layer_id)
+                )
+                self._thumbnail_cache[key] = self._layer_thumbnail(layer) if layer else None
         title = self.layer_select.itemText(index)
         tooltip = _thumbnail_tooltip(self._thumbnail_cache[key], title)
         self.layer_select.setItemData(index, tooltip, Qt.ItemDataRole.ToolTipRole)
@@ -404,6 +514,7 @@ class ControlWidget(QWidget):
         has_param2 = is_nai
 
         def controls():
+            self.reference_button.setVisible(is_nai)
             self.layer_select.setVisible(self._control.is_supported)
             self.preset_slider.setVisible(self._control.is_supported and not is_edit and not is_nai)
             self.expand_button.setVisible(self._control.is_supported and not is_edit)
@@ -454,17 +565,32 @@ class ControlWidget(QWidget):
         )
 
     def _update_job_active(self):
-        enabled = not self._control.has_active_job
+        enabled = self._control.is_active and not self._control.has_active_job
         self.generate_button.setEnabled(enabled)
         self.generate_tool_button.setEnabled(enabled)
         self.layer_select.setEnabled(enabled)
+
+    def _update_enabled(self):
+        enabled = self._control.is_active
+        self.enabled_checkbox.setToolTip("激活" if enabled else "未激活")
+        self.enabled_checkbox.setEnabled(self._control.group_enabled)
+        self.mode_select.setEnabled(
+            enabled if self._control.group_id.isNull() else self._control.group_enabled
+        )
+        for widget in (self.reference_button, self.error_text, self.extended_widget):
+            widget.setEnabled(enabled)
+        self._update_job_active()
+        self._update_custom_values()
+        self._update_pose_utils()
 
     def _update_param2(self):
         self.param2_label.setText(f"{self._control.param2 / 100:.2f}")
 
     def _update_custom_values(self):
         is_nai = self._control.mode.is_nai  # NAI modes always use direct values
-        self.preset_slider.setEnabled(not self._control.use_custom_strength)
+        self.preset_slider.setEnabled(
+            self._control.is_active and not self._control.use_custom_strength
+        )
         self.strength_slider.setEnabled(self._control.use_custom_strength or is_nai)
         self.range_slider.setEnabled(self._control.use_custom_strength)
         # NAI strength is 0..1 (img2img effectively 0.01..0.99); ControlNet allows 1.5.
@@ -474,7 +600,7 @@ class ControlWidget(QWidget):
 
     def _update_pose_utils(self):
         for button in (self.add_pose_button, self.add_pose_tool_button):
-            button.setEnabled(self._control.is_pose_vector)
+            button.setEnabled(self._control.is_active and self._control.is_pose_vector)
             button.setToolTip(
                 _("Add new character pose to selected layer")
                 if self._control.is_pose_vector
@@ -526,6 +652,16 @@ class ControlListWidget(QWidget):
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(self._layout)
+        self._connect_model()
+
+    def _connect_model(self):
+        for control in self._model:
+            self._add_widget(control)
+        self._model_connections = [
+            self._model.added.connect(self._add_widget),
+            self._model.removed.connect(self._remove_widget),
+            self._model.changed.connect(self._refresh_groups),
+        ]
 
     @property
     def model(self):
@@ -538,21 +674,41 @@ class ControlListWidget(QWidget):
             self._model = model
             while len(self._widgets) > 0:
                 self._remove_widget(self._widgets[0])
-            for control in self._model:
-                self._add_widget(control)
-            self._model_connections = [
-                model.added.connect(self._add_widget),
-                model.removed.connect(self._remove_widget),
-            ]
+            self._connect_model()
 
     def _add_widget(self, control: ControlLayer):
         widget = ControlWidget(self._model, control, self)
         self._widgets.append(widget)
         self._layout.addWidget(widget)
+        self._refresh_groups()
+
+    def _refresh_groups(self):
+        widgets = {widget._control: widget for widget in self._widgets}
+        visited: set[ControlLayer] = set()
+        position = 0
+        header_width = 0
+        for control in self._model:
+            if control in visited or control not in widgets:
+                continue
+            members = [member for member in self._model.group_members(control) if member in widgets]
+            leader = members[0]
+            for member in members:
+                widgets[member].update_group(leader, len(members))
+            header_width = max(header_width, widgets[leader].group_header.sizeHint().width())
+            for member in members:
+                widget = widgets[member]
+                self._layout.insertWidget(position, widget)
+                visited.add(member)
+                position += 1
+        for widget in self._widgets:
+            widget.group_header.setFixedWidth(header_width)
+        self.changed.emit()
 
     def _remove_widget(self, widget: ControlWidget | ControlLayer):
         if isinstance(widget, ControlLayer):
             widget = next(w for w in self._widgets if w._control == widget)
         self._widgets.remove(widget)
+        self._layout.removeWidget(widget)
+        widget.hide()
         widget.disconnect_all()
         widget.deleteLater()

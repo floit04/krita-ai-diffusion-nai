@@ -116,6 +116,7 @@ class JobParams:
                 ),
             }
             for c in control
+            if c.is_active
         ]
 
     @property

@@ -85,6 +85,49 @@ async def _model_env(
             plugin_root._connection = previous_connection
 
 
+@qtapp
+async def test_nai_group_switch_preserves_individual_enable_state(workflows_dir: Path):
+    krita_doc = Krita.instance().openDocument("test")
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        await asyncio.sleep(0)
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+        controls = model.regions.control
+        first = controls.emplace()
+        first.set_mode(ControlMode.nai_vibe)
+        second = controls.add_related(first)
+        assert second is not None
+        second.enabled = False
+
+        first.group_enabled = False
+        assert not first.is_active and not second.is_active
+        assert first.enabled and not second.enabled
+        first.group_enabled = True
+        assert first.is_active and not second.is_active
+        first.group_expanded = False
+        assert not second.group_expanded
+        assert first.is_active
+        controls.remove(first)
+        assert controls.group_members(second) == [second]
+        assert not second.enabled
+
+
+@qtapp
+async def test_nai_img2img_does_not_allow_group_duplicates(workflows_dir: Path):
+    krita_doc = Krita.instance().openDocument("test")
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        await asyncio.sleep(0)
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+        controls = model.regions.control
+        base = controls.emplace()
+        base.set_mode(ControlMode.nai_base)
+        assert controls.add_related(base) is None
+        assert len(controls) == 1
+
+
 async def _wait_for_enqueue(
     client: MockClient, count: int = 1, timeout: int = 200
 ) -> list[WorkflowInput]:

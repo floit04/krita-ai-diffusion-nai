@@ -31,6 +31,10 @@ class ControlLayer(QObject, ObservableProperties):
     clip_vision_extent = Extent(224, 224)
 
     mode = Property(ControlMode.reference, persist=True, setter="set_mode")
+    enabled = Property(True, persist=True)
+    group_id = Property(QUuid(), persist=True)
+    group_enabled = Property(True, persist=True)
+    group_expanded = Property(True, persist=True)
     layer_id = Property(QUuid(), persist=True, setter="set_layer_id")
     preset_value = Property(2, persist=True, setter="set_preset_value")
     strength = Property(50, persist=True)
@@ -48,6 +52,10 @@ class ControlLayer(QObject, ObservableProperties):
     error_text = Property("")
 
     mode_changed = pyqtSignal(ControlMode)
+    enabled_changed = pyqtSignal(bool)
+    group_id_changed = pyqtSignal(QUuid)
+    group_enabled_changed = pyqtSignal(bool)
+    group_expanded_changed = pyqtSignal(bool)
     layer_id_changed = pyqtSignal(QUuid)
     preset_value_changed = pyqtSignal(int)
     strength_changed = pyqtSignal(int)
@@ -80,6 +88,9 @@ class ControlLayer(QObject, ObservableProperties):
         self._update_is_supported()
 
         self.mode_changed.connect(self._update_is_supported)
+        self.enabled_changed.connect(self._update_enabled)
+        self.group_enabled_changed.connect(self._update_enabled)
+        model.nai_cropped_inpaint_changed.connect(self._sync_selection_bounds_connection)
         model.style_changed.connect(self._update_is_supported)
         model.edit_mode_changed.connect(self._update_is_supported)
         root.connection.state_changed.connect(self._update_is_supported)
@@ -93,6 +104,10 @@ class ControlLayer(QObject, ObservableProperties):
         return self._model
 
     @property
+    def is_active(self):
+        return self.enabled and self.group_enabled
+
+    @property
     def is_whole_canvas(self):
         """NAI modes may target the whole canvas instead of a single layer."""
         return self.layer_id.isNull()
@@ -102,15 +117,20 @@ class ControlLayer(QObject, ObservableProperties):
         return self.layer_id == nai_selection_layer_id
 
     @property
+    def reference(self):
+        return self._model.nai_references.find(self.layer_id)
+
+    @property
     def layer(self):
-        if self.layer_id.isNull() or self.is_selection:
+        if self.layer_id.isNull() or self.is_selection or self.reference is not None:
             return None
         layer = self._model.layers.find(self.layer_id)
-        assert layer is not None, "Control layer has been deleted"
         return layer
 
     def set_mode(self, mode: ControlMode):
         if mode != self.mode:
+            if not mode.is_nai and self.reference is not None:
+                self.layer_id = self._model.layers.active.id
             if mode is not ControlMode.nai_base and self.is_selection:
                 self.layer_id = QUuid()
             self._mode = mode
@@ -129,6 +149,7 @@ class ControlLayer(QObject, ObservableProperties):
                     self.param2 = 100
             if not self.use_custom_strength:
                 self._set_values_from_preset()
+            self.modified.emit(self, "mode")
 
     def set_layer_id(self, layer_id: QUuid):
         if layer_id != self.layer_id:
@@ -155,6 +176,8 @@ class ControlLayer(QObject, ObservableProperties):
         return self._source_extent()
 
     def _source_extent(self):
+        if reference := self.reference:
+            return reference.extent
         if self.is_selection:
             if bounds := self.selection_bounds:
                 return bounds.extent
@@ -166,11 +189,23 @@ class ControlLayer(QObject, ObservableProperties):
         return bounds.extent if not bounds.is_zero else self._model.document.extent
 
     def _reset_target_resolution(self):
-        self._model.set_nai_target_extent(nai_auto_resolution(self._source_extent()))
+        if self.is_active and not self._model.nai_cropped_inpaint:
+            self._model.set_nai_target_extent(nai_auto_resolution(self._source_extent()))
+
+    def _update_enabled(self):
+        self._sync_selection_bounds_connection()
+        if self.mode is ControlMode.nai_base and not self._model.nai_cropped_inpaint:
+            self._model.reset_nai_target_resolution()
 
     def _update_selection_target(self):
         bounds = self._model.document.selection_bounds
-        if self.mode is ControlMode.nai_base and self.is_selection and bounds:
+        if (
+            self.is_active
+            and self.mode is ControlMode.nai_base
+            and self.is_selection
+            and not self._model.nai_cropped_inpaint
+            and bounds
+        ):
             self._model.set_nai_target_extent(nai_auto_resolution(bounds.extent))
 
     def _schedule_selection_target_update(self):
@@ -180,7 +215,12 @@ class ControlLayer(QObject, ObservableProperties):
         if self._selection_bounds_connection is not None:
             QObject.disconnect(self._selection_bounds_connection)
             self._selection_bounds_connection = None
-        if self.mode is ControlMode.nai_base and self.is_selection:
+        if (
+            self.is_active
+            and self.mode is ControlMode.nai_base
+            and self.is_selection
+            and not self._model.nai_cropped_inpaint
+        ):
             self._selection_bounds_connection = (
                 self._model.document.selection_bounds_changed.connect(
                     self._schedule_selection_target_update
@@ -245,8 +285,20 @@ class ControlLayer(QObject, ObservableProperties):
 
     def to_api(self, bounds: Bounds | None = None, time: int | None = None):
         layer = self.layer
+        reference = self.reference
+        if (
+            layer is None
+            and reference is None
+            and not self.is_whole_canvas
+            and not self.is_selection
+        ):
+            raise PluginError("图像来源不存在，请迁移本机素材库或重新选择素材/图层")
         layer_name = (
-            _("Selection") if self.is_selection else layer.name if layer else _("Whole canvas")
+            reference.name
+            if reference
+            else (
+                _("Selection") if self.is_selection else layer.name if layer else _("Whole canvas")
+            )
         )
         if not self.is_supported:
             raise PluginError(f"Can't use '{layer_name}' as control layer: {self.error_text}")
@@ -256,7 +308,9 @@ class ControlLayer(QObject, ObservableProperties):
             # no line/stencil preprocessing. Whole-canvas (null layer_id) uses the
             # flattened document projection minus control/preview layers.
             doc_bounds = Bounds(0, 0, *self._model.document.extent)
-            if self.is_selection:
+            if reference is not None:
+                image = self._model.nai_references.image(reference.id)
+            elif self.is_selection:
                 selection_bounds = self.selection_bounds
                 if selection_bounds is None:
                     raise PluginError(_("There is no active selection for img2img"))
@@ -432,7 +486,10 @@ class ControlLayerList(QObject):
         super().__init__()
         self._model = model
         self._layers = []
+        self._control_connections: dict[ControlLayer, list[QMetaObject.Connection]] = {}
+        self._syncing_group = False
         self._model.layers.removed.connect(self._remove_layer)
+        self._model.nai_references.removing.connect(self._remove_reference)
 
     def add(self):
         layer = self._model.layers.active
@@ -456,40 +513,110 @@ class ControlLayerList(QObject):
             mode = ControlMode.scribble
         else:
             mode = self._last_mode
-        control = ControlLayer(self._model, mode, layer_id, len(self._layers))
-        control.mode_changed.connect(self._update_last_mode)
-        control.mode_changed.connect(self.changed)
+        index = sum(layer.is_active for layer in self._layers)
+        control = ControlLayer(self._model, mode, layer_id, index)
+        self._connect_control(control)
         self._layers.append(control)
         self.added.emit(control)
         self.changed.emit()
+
+    def group_members(self, control: ControlLayer):
+        if control.group_id.isNull():
+            return [control]
+        return [layer for layer in self._layers if layer.group_id == control.group_id]
+
+    def add_related(self, control: ControlLayer):
+        if control not in self._layers or control.mode is ControlMode.nai_base:
+            return None
+        if control.group_id.isNull():
+            control.group_id = QUuid.createUuid()
+        members = self.group_members(control)
+        index = self._layers.index(members[-1]) + 1
+        related = ControlLayer(self._model, control.mode, control.layer_id, index)
+        for name in (
+            "group_id",
+            "group_enabled",
+            "use_custom_strength",
+            "preset_value",
+            "strength",
+            "start",
+            "end",
+            "param2",
+        ):
+            setattr(related, name, getattr(control, name))
+        control.group_expanded = True
+        self._connect_control(related)
+        self._layers.insert(index, related)
+        self.added.emit(related)
+        self._update_enabled()
+        return related
+
+    def _connect_control(self, control: ControlLayer):
+        self._control_connections[control] = [
+            control.mode_changed.connect(self._update_last_mode),
+            control.mode_changed.connect(lambda: self._sync_group(control, "mode")),
+            control.enabled_changed.connect(self._update_enabled),
+            control.group_id_changed.connect(self.changed),
+            control.group_enabled_changed.connect(
+                lambda: self._sync_group(control, "group_enabled")
+            ),
+            control.group_expanded_changed.connect(
+                lambda: self._sync_group(control, "group_expanded")
+            ),
+        ]
+
+    def _sync_group(self, control: ControlLayer, name: str):
+        if self._syncing_group:
+            return
+        self._syncing_group = True
+        try:
+            for member in self.group_members(control):
+                if member is not control:
+                    setattr(member, name, getattr(control, name))
+        finally:
+            self._syncing_group = False
+        self._update_enabled()
 
     def emplace(self):
         self.add()
         return self[-1]
 
     def remove(self, control: ControlLayer):
-        was_base = control.mode is ControlMode.nai_base
+        was_base = control.is_active and control.mode is ControlMode.nai_base
         self._layers.remove(control)
+        for connection in self._control_connections.pop(control):
+            QObject.disconnect(connection)
         self.removed.emit(control)
-        self.changed.emit()
-
-        for i, c in enumerate(self._layers):
-            c.index = i
-        if was_base:
+        self._update_enabled()
+        if was_base and not self._model.nai_cropped_inpaint:
             # The img2img source is gone; the target goes back to the canvas.
             self._model.reset_nai_target_resolution()
 
     def to_api(self, bounds: Bounds | None = None, time: int | None = None):
-        for layer in (c for c in self._layers if not c.is_supported):
+        for layer in (c for c in self._layers if c.is_active and not c.is_supported):
             log.warning(f"Trying to use control layer {layer.mode.name}: {layer.error_text}")
-        return [c.to_api(bounds, time) for c in self._layers if c.is_supported]
+        return [c.to_api(bounds, time) for c in self._layers if c.is_active and c.is_supported]
+
+    def _update_enabled(self):
+        index = 0
+        for control in self._layers:
+            control.index = index
+            if control.is_active:
+                index += 1
+        self.changed.emit()
 
     def _update_last_mode(self, mode: ControlMode):
         self._last_mode = mode
 
     def _remove_layer(self, layer: Layer):
-        if control := next((c for c in self._layers if c.layer_id == layer.id), None):
-            self.remove(control)
+        for control in list(self._layers):
+            if control.layer_id == layer.id:
+                self.remove(control)
+
+    def _remove_reference(self, reference_id: QUuid):
+        for control in list(self._layers):
+            if control.layer_id == reference_id:
+                self.remove(control)
 
     def __len__(self):
         return len(self._layers)

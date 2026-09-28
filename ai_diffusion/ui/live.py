@@ -196,7 +196,9 @@ class LiveWidget(QWidget):
         params_layout.addWidget(self.edit_toggle)
         layout.addLayout(params_layout)
 
-        self.control_list = ControlListWidget(self)
+        self.control_list = ControlListWidget(
+            self.model.active_regions.active_or_root.control, parent=self
+        )
         self.add_control_button = create_wide_tool_button(
             "control-add", _("Add Control Layer"), self
         )

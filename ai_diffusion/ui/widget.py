@@ -559,14 +559,22 @@ class TextPromptWidget(QPlainTextEdit):
 
     def keyPressEvent(self, e: QKeyEvent | None):
         assert e is not None
-        if self._completer.is_active and e.key() in PromptAutoComplete.action_keys:
+        modifiers = e.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        is_enter = e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+        if (
+            self._completer.is_active
+            and e.key() in PromptAutoComplete.action_keys
+            and not (is_enter and modifiers == Qt.KeyboardModifier.ShiftModifier)
+        ):
             e.ignore()
             return
 
         self.handle_weight_adjustment(e)
 
-        if e.key() == Qt.Key.Key_Return and e.modifiers() == Qt.KeyboardModifier.ShiftModifier:
-            self.activated.emit()
+        if is_enter and not modifiers:
+            e.accept()
+            if not e.isAutoRepeat():
+                self.activated.emit()
         else:
             super().keyPressEvent(e)
 

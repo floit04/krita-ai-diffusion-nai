@@ -779,9 +779,7 @@ class GenerationWidget(QWidget):
             spinbox.editingFinished.connect(self._commit_target_resolution)
         self.target_resolution_adapt = QToolButton(self.target_resolution_row)
         self.target_resolution_adapt.setText("自动")
-        self.target_resolution_adapt.setToolTip(
-            "按当前选区(没有选区时按画布)的原始比例自动适配分辨率"
-        )
+        self.target_resolution_adapt.setToolTip("按当前图像来源的比例适配目标分辨率")
         self.target_resolution_free = QToolButton(self.target_resolution_row)
         self.target_resolution_free.setText("小")
         self.target_resolution_free.setToolTip(
@@ -874,12 +872,23 @@ class GenerationWidget(QWidget):
         )
         self.focus_inpaint_button.toggled.connect(self._toggle_focus_inpaint)
 
+        self.crop_inpaint_button = QToolButton(self)
+        self.crop_inpaint_button.setCheckable(True)
+        self.crop_inpaint_button.setAutoRaise(True)
+        self.crop_inpaint_button.setIcon(theme.icon("nai-crop-inpaint"))
+        self.crop_inpaint_button.setAccessibleName("裁切重绘")
+        self.crop_inpaint_button.setToolTip(
+            "裁切重绘：框内画面按目标分辨率重绘，仅贴回选区或涂抹区域"
+        )
+        self.crop_inpaint_button.toggled.connect(self._toggle_crop_inpaint)
+
         strength_layout = QHBoxLayout()
         strength_layout.addWidget(self.strength_slider)
         strength_layout.addWidget(self.layer_count_widget)
         strength_layout.addWidget(self.color_match_button)
         strength_layout.addWidget(self.paint_selection_button)
         strength_layout.addWidget(self.focus_inpaint_button)
+        strength_layout.addWidget(self.crop_inpaint_button)
         strength_layout.addWidget(self.add_control_button)
         strength_layout.addWidget(self.add_region_button)
         layout.addLayout(strength_layout)
@@ -971,6 +980,8 @@ class GenerationWidget(QWidget):
         self._update_target_resolution()
 
     def _update_target_resolution(self):
+        source = "裁切框" if self.model.nai_cropped_inpaint else "当前图像来源"
+        self.target_resolution_adapt.setToolTip(f"按{source}的比例适配目标分辨率")
         # The model normalizes to the 64px grid, so echo back what it actually took.
         blocked = (
             theme.SignalBlocker(self.target_width_input),
@@ -983,11 +994,17 @@ class GenerationWidget(QWidget):
     def _toggle_focus_inpaint(self, checked: bool):
         self.model.nai_focused_inpaint = checked
 
+    def _toggle_crop_inpaint(self, checked: bool):
+        self.model.nai_cropped_inpaint = checked
+
     def _sync_focus_inpaint_button(self):
         enabled = self.model.nai_focused_inpaint
         with theme.SignalBlocker(self.focus_inpaint_button):
             self.focus_inpaint_button.setChecked(enabled)
+        with theme.SignalBlocker(self.crop_inpaint_button):
+            self.crop_inpaint_button.setChecked(self.model.nai_cropped_inpaint)
         self.focus_options.setVisible(enabled)
+        self._update_target_resolution()
         self._update_focus_options()
 
     def _update_focus_options(self):
@@ -1013,6 +1030,8 @@ class GenerationWidget(QWidget):
         model = self._model
         if model.nai_focused_inpaint and model.document.focus_box_layer is None:
             model.nai_focused_inpaint = False
+        if model.nai_cropped_inpaint and model.document.focus_box_layer is None:
+            model.nai_cropped_inpaint = False
         self._sync_selection_paint_button(model)
         self._sync_focus_inpaint_button()
 
@@ -1071,6 +1090,8 @@ class GenerationWidget(QWidget):
                 model.nai_target_width_changed.connect(self._update_target_resolution),
                 model.nai_target_height_changed.connect(self._update_target_resolution),
                 model.nai_focused_inpaint_changed.connect(self._sync_focus_inpaint_button),
+                model.nai_cropped_inpaint_changed.connect(self._sync_focus_inpaint_button),
+                model.nai_cropped_inpaint_changed.connect(self.update_generate_options),
                 model.nai_focus_geometry_changed.connect(self._update_focus_options),
                 model.nai_min_context_changed.connect(self._update_focus_options),
                 self.target_resolution_adapt.clicked.connect(model.adapt_nai_target_resolution),
@@ -1225,12 +1246,16 @@ class GenerationWidget(QWidget):
             return
 
         arch = self.model.arch
+        self.crop_inpaint_button.setVisible(arch is Arch.nai)
         self.strength_slider.setVisible(arch is not Arch.qwen_l)
         self.layer_count_widget.setVisible(arch is Arch.qwen_l)
 
         # An img2img control layer is an independent job with its own strength and
         # noise knobs; the main slider is ignored for it (see nai_client), so say so.
-        is_img2img = any(c.mode is ControlMode.nai_base for c in self.model.active_regions.control)
+        is_img2img = any(
+            control.is_active and control.mode is ControlMode.nai_base
+            for control in self.model.active_regions.control
+        )
         self.strength_slider.setEnabled(not is_img2img)
 
         regions = self.model.active_regions
@@ -1292,6 +1317,8 @@ class GenerationWidget(QWidget):
 
         if is_img2img:
             text = "图生图"
+        elif arch is Arch.nai and self.model.nai_cropped_inpaint:
+            text = "裁切重绘"
         self.generate_button.operation = text
         self.generate_button.setIcon(theme.icon(icon))
 
