@@ -157,7 +157,27 @@ else {
         # Copy from a clean export so local __pycache__ and any editor scratch
         # files never reach Krita - stale .pyc next to changed .py is a whole
         # afternoon of debugging a fix that is already installed.
-        Run 'git archive / tar' { git archive HEAD ai_diffusion | tar -x -C $pykrita }
+        #
+        # Two traps this has already fallen into:
+        #  - piping `git archive | tar` in PowerShell 5.1 sends the bytes through
+        #    the text pipeline, which corrupts them ("Unrecognized archive
+        #    format"). Write a zip file instead and let tar read that.
+        #  - `git archive` skips submodules, so websockets and debugpy arrived as
+        #    empty folders. Each one is exported from its own repository.
+        $zip = Join-Path $env:TEMP 'ai_diffusion-ship.zip'
+        Run 'git archive' { git archive --format=zip -o $zip HEAD ai_diffusion }
+        Run 'tar extract' { tar -xf $zip -C $pykrita }
+        Remove-Item $zip
+        foreach ($name in @('websockets', 'debugpy')) {
+            $subZip = Join-Path $env:TEMP "ai_diffusion-$name.zip"
+            Run "git archive $name" {
+                git -C (Join-Path $repo "ai_diffusion\$name") archive --format=zip -o $subZip HEAD
+            }
+            $subTarget = Join-Path $target $name
+            New-Item -ItemType Directory -Force -Path $subTarget | Out-Null
+            Run "tar extract $name" { tar -xf $subZip -C $subTarget }
+            Remove-Item $subZip
+        }
 
         # A syntax error here means Krita silently fails to load the plugin and
         # shows no docker at all, so catch it now rather than in the UI.
@@ -167,4 +187,5 @@ else {
 }
 
 Step 'done'
-git log --oneline -1Write-Host 'Restart Krita for the installed copy to take effect.' -ForegroundColor Yellow
+git log --oneline -1
+Write-Host 'Restart Krita for the installed copy to take effect.' -ForegroundColor Yellow
