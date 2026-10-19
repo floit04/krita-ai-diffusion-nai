@@ -45,6 +45,7 @@ from ai_diffusion.backend.nai_workflow import (
 )
 from ai_diffusion.backend.resources import Arch, ControlMode
 from ai_diffusion.image import Bounds, Extent, Image, ImageCollection
+from ai_diffusion.settings import NaiAutoSize
 from ai_diffusion.ui.control import _layer_list_change
 
 from .conftest import qtapp
@@ -316,6 +317,22 @@ def test_nai_resolution_snaps_to_nearest_64_and_auto_scales_by_source_size():
     assert nai_auto_resolution(Extent(3000, 3000)) == Extent(1728, 1728)
     assert nai_auto_resolution(Extent(4096, 4096)) == Extent(1728, 1728)
     assert nai_auto_resolution(Extent(2048, 2048)) == Extent(1728, 1728)
+
+
+def test_nai_auto_resolution_small_keeps_the_request_inside_the_1mp_tier():
+    # Below 1 MP the two policies agree: NAI output that small is not worth it.
+    assert nai_auto_resolution(Extent(512, 768), NaiAutoSize.small) == Extent(832, 1216)
+    assert nai_auto_resolution(Extent(640, 360), NaiAutoSize.small) == Extent(1344, 768)
+    # Above it, small caps the pixel count instead of matching the canvas.
+    assert nai_auto_resolution(Extent(3000, 3000), NaiAutoSize.small) == Extent(1024, 1024)
+    assert nai_auto_resolution(Extent(1600, 896), NaiAutoSize.small) == Extent(1344, 768)
+    # The 2048 per-side cap still wins for extreme ratios, as it does for the
+    # docker's 小 button (which is the same computation).
+    assert nai_auto_resolution(Extent(8000, 1200), NaiAutoSize.small) == Extent(2048, 384)
+    for source in [Extent(1024, 1024), Extent(2500, 1400), Extent(4096, 4096)]:
+        target = nai_auto_resolution(source, NaiAutoSize.small)
+        assert target.pixel_count <= 1024 * 1024
+        assert target.width % 64 == 0 and target.height % 64 == 0
 
 
 def test_nai_edit_resolution_never_exceeds_provider_pixel_limit():

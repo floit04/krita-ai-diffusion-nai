@@ -50,6 +50,28 @@ Set-Location $repo
 function Step($text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
 function Fail($text) { Write-Host "FAILED: $text" -ForegroundColor Red; exit 1 }
 
+# Windows PowerShell 5.1 turns ANY native stderr output into a terminating error
+# while $ErrorActionPreference is 'Stop', and git sends its progress and its
+# line-ending warnings there. Those are not failures, so native commands run
+# through Run, which captures both streams and judges them by $LASTEXITCODE.
+function Run($text, [scriptblock]$command) {
+    # 'Continue' inside: with 'Stop', PS 5.1 aborts on the ErrorRecord that the
+    # 2>&1 merge produces, before Out-String can collect it.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $command 2>&1 | Out-String
+    }
+    finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host $output
+        Fail $text
+    }
+    Write-Host $output.TrimEnd()
+}
+
 # PYTHONUTF8 is not optional here: the tests carry Chinese comments and the
 # golden samples carry Japanese tags, and the default Windows codepage mangles
 # both into a UnicodeDecodeError that looks like a test failure.
@@ -95,10 +117,8 @@ if ($dirty) {
     if (-not $Message) {
         Fail 'working tree is dirty but no commit message was given'
     }
-    git add -A
-    if ($LASTEXITCODE -ne 0) { Fail 'git add' }
-    git commit -m $Message
-    if ($LASTEXITCODE -ne 0) { Fail 'git commit' }
+    Run 'git add' { git add -A }
+    Run 'git commit' { git commit -m $Message }
 }
 else {
     Write-Host "`nworking tree clean, nothing to commit" -ForegroundColor DarkGray
@@ -110,8 +130,7 @@ if ($NoPush) {
 }
 else {
     Step "git push origin $branch"
-    git push origin $branch
-    if ($LASTEXITCODE -ne 0) { Fail 'git push' }
+    Run 'git push' { git push origin $branch }
 }
 
 # --- 4. Install into Krita ------------------------------------------------
@@ -138,17 +157,14 @@ else {
         # Copy from a clean export so local __pycache__ and any editor scratch
         # files never reach Krita - stale .pyc next to changed .py is a whole
         # afternoon of debugging a fix that is already installed.
-        git archive HEAD ai_diffusion | tar -x -C $pykrita
-        if ($LASTEXITCODE -ne 0) { Fail 'git archive / tar' }
+        Run 'git archive / tar' { git archive HEAD ai_diffusion | tar -x -C $pykrita }
 
         # A syntax error here means Krita silently fails to load the plugin and
         # shows no docker at all, so catch it now rather than in the UI.
-        python -m compileall -q $target > $null
-        if ($LASTEXITCODE -ne 0) { Fail 'py_compile on the installed copy' }
+        Run 'py_compile on the installed copy' { python -m compileall -q $target }
         Write-Host 'installed and compiles' -ForegroundColor Green
     }
 }
 
 Step 'done'
-git log --oneline -1
-Write-Host 'Restart Krita for the installed copy to take effect.' -ForegroundColor Yellow
+git log --oneline -1Write-Host 'Restart Krita for the installed copy to take effect.' -ForegroundColor Yellow

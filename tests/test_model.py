@@ -24,7 +24,7 @@ from ai_diffusion.model.control_utils import nai_selection_layer_id
 from ai_diffusion.model.custom_workflow import WorkflowCollection
 from ai_diffusion.model.jobs import Job, JobKind, JobParams, JobRegion, JobState
 from ai_diffusion.model.model import DocumentModel, ErrorKind, ProgressKind, no_error
-from ai_diffusion.settings import ApplyBehavior, ApplyRegionBehavior
+from ai_diffusion.settings import ApplyBehavior, ApplyRegionBehavior, NaiAutoSize, settings
 from ai_diffusion.style import Style
 from ai_diffusion.util import PluginError
 
@@ -619,6 +619,32 @@ async def test_nai_target_resolution_follows_a_canvas_resize(workflows_dir: Path
 
         assert model.nai_target_extent != seeded
         assert model.nai_target_extent == Extent(2048, 1152)
+        await asyncio.sleep(0)
+
+
+@qtapp
+async def test_nai_auto_size_setting_drives_the_target_resolution(workflows_dir: Path):
+    """The settings page option, not a hidden constant, decides how auto sizes."""
+    krita_doc = Krita.instance().openDocument("test")
+
+    async with _model_env(krita_doc, workflows_dir) as (model, client):
+        checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[checkpoint] = CheckpointInfo(checkpoint, Arch.nai)
+        model.style = _make_style(checkpoint)
+
+        krita_doc.setWidth(4096)
+        krita_doc.setHeight(4096)
+        model.document._poll()  # type: ignore[attr-defined]
+        assert model.nai_target_extent == Extent(1728, 1728)
+
+        try:
+            # Switching the policy applies to the open document right away.
+            settings.nai_auto_size = NaiAutoSize.small
+            assert model.nai_target_extent == Extent(1024, 1024)
+            settings.nai_auto_size = NaiAutoSize.best_match
+            assert model.nai_target_extent == Extent(1728, 1728)
+        finally:
+            settings.nai_auto_size = NaiAutoSize.best_match
         await asyncio.sleep(0)
 
 

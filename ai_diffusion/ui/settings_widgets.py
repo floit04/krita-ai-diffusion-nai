@@ -6,6 +6,7 @@ from typing import Any
 from PyQt5.QtCore import QAbstractItemModel, QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QFontMetrics, QIcon
 from PyQt5.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -345,6 +346,48 @@ class ComboBoxSetting(SettingWidget):
             v = v.name
         index = self._combo.findData(v, Qt.ItemDataRole.UserRole)
         self._combo.setCurrentIndex(index)
+
+
+class ButtonChoiceSetting(SettingWidget):
+    """Exclusive buttons instead of a dropdown, for small enum settings where every
+    option should stay visible (e.g. a two-way mode switch)."""
+
+    def __init__(self, setting: Setting, parent=None):
+        super().__init__(setting, parent)
+        assert isinstance(setting.default, Enum)
+        self._default = setting.default
+        self._enum_type = type(setting.default)
+        self._buttons: dict[str, QToolButton] = {}
+
+        button_widget = QWidget(self)
+        button_layout = QHBoxLayout()
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(0)
+        button_widget.setLayout(button_layout)
+
+        self._group = QButtonGroup(self)
+        for option in self._enum_type:
+            button = QToolButton(button_widget)
+            button.setText(option.value)
+            button.setCheckable(True)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            button.setMinimumHeight(24)
+            button.clicked.connect(self._notify_value_changed)
+            self._group.addButton(button)
+            button_layout.addWidget(button)
+            self._buttons[option.name] = button
+        self.set_widget(button_widget)
+
+    @property
+    def value(self):
+        for option in self._enum_type:
+            if self._buttons[option.name].isChecked():
+                return option
+        return self._default
+
+    @value.setter
+    def value(self, v):
+        self._buttons[v.name].setChecked(True)
 
 
 class TextSetting(SettingWidget):

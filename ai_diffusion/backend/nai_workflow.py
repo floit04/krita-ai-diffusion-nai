@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 
 from ..image import Extent, Image
-from ..settings import ImageFileFormat
+from ..settings import ImageFileFormat, NaiAutoSize
 
 # ---------------------------------------------------------------------------
 # NAI model identifiers
@@ -308,8 +308,16 @@ def nai_free_resolution(extent: Extent) -> Extent:
     return _reduce_to_pixel_limit(nai_resolution(target), source, NAI_FREE_PIXELS)
 
 
-def nai_auto_resolution(extent: Extent) -> Extent:
-    """Choose an edit resolution from the source size while preserving its ratio."""
+def nai_auto_resolution(extent: Extent, size: NaiAutoSize = NaiAutoSize.best_match) -> Extent:
+    """Choose an edit resolution from the source size while preserving its ratio.
+
+    `size` is the user's policy: `small` keeps the request inside NAI's 1 MP tier
+    (the free-tier cap, same as the docker's 小 button), `best_match` picks the
+    largest legal size for that ratio. Below 1 MP both agree, since NAI output
+    smaller than that is not worth generating.
+    """
+    if size is NaiAutoSize.small:
+        return nai_free_resolution(extent)
     source = Extent(max(extent.width, 1), max(extent.height, 1))
     scale = 1.0
     pixel_limit = NAI_EDIT_MAX_PIXELS

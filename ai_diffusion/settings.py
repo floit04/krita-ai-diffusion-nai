@@ -124,6 +124,13 @@ class ImageFileFormat(Enum):
         return self
 
 
+class NaiAutoSize(Enum):
+    """How the 1MP/3MP trade-off is made when the target resolution is picked automatically."""
+
+    small = _("小图 (1 MP)")
+    best_match = _("最佳匹配")
+
+
 class PerformancePresetSettings(NamedTuple):
     batch_size: int = 4
     resolution_multiplier: float = 1.0
@@ -281,6 +288,17 @@ class Settings(QObject):
         _("Quality Tags"),
         True,
         _("Automatically prepend quality tags to the prompt (Curated models)"),
+    )
+
+    nai_auto_size: NaiAutoSize
+    _nai_auto_size = Setting(
+        _("自动生图尺寸"),
+        NaiAutoSize.best_match,
+        _(
+            "画布、选区或 img2img 图层变化时自动重算目标分辨率的策略。"
+            "小图取 NAI 的 1 MP 档(1024x1024，也是免费档上限)；"
+            "最佳匹配按源比例取最大合法尺寸，最高 3.1 MP。"
+        ),
     )
 
     server_path: str

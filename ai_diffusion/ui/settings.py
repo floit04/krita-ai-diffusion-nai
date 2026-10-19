@@ -36,7 +36,6 @@ from .. import __display_version__, eventloop, util
 from ..backend import resources
 from ..backend.client import Client, MissingResources, User
 from ..backend.cloud_client import CloudClient
-from ..backend.nai_client import NaiClient
 from ..backend.resources import Arch, ResourceId
 from ..backend.server import Server, ServerState
 from ..localization import Localization
@@ -49,6 +48,7 @@ from ..settings import ImageFileFormat, PerformancePreset, ServerMode, Settings,
 from ..style import Style, is_nai_style
 from .server import ServerWidget
 from .settings_widgets import (
+    ButtonChoiceSetting,
     ComboBoxSetting,
     FileListSetting,
     SettingsTab,
@@ -885,6 +885,10 @@ class NovelAISettings(SettingsTab):
         btn_layout.addWidget(self._delete_btn)
         btn_layout.addStretch()
         self._layout.addLayout(btn_layout)
+
+        # --- Auto generation size ---
+        self._layout.addSpacing(12)
+        self.add("nai_auto_size", ButtonChoiceSetting(Settings._nai_auto_size, self))
 
         self._layout.addStretch()
 

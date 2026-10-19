@@ -15,6 +15,7 @@ from ..document import Document, SelectionModifiers
 from ..image import Bounds, Extent, Image
 from ..layer import Layer, LayerType
 from ..localization import translate as _
+from ..settings import settings
 from ..util import PluginError
 from ..util import client_logger as log
 from . import jobs
@@ -190,7 +191,9 @@ class ControlLayer(QObject, ObservableProperties):
 
     def _reset_target_resolution(self):
         if self.is_active and not self._model.nai_cropped_inpaint:
-            self._model.set_nai_target_extent(nai_auto_resolution(self._source_extent()))
+            self._model.set_nai_target_extent(
+                nai_auto_resolution(self._source_extent(), settings.nai_auto_size)
+            )
 
     def _update_enabled(self):
         self._sync_selection_bounds_connection()
@@ -206,7 +209,9 @@ class ControlLayer(QObject, ObservableProperties):
             and not self._model.nai_cropped_inpaint
             and bounds
         ):
-            self._model.set_nai_target_extent(nai_auto_resolution(bounds.extent))
+            self._model.set_nai_target_extent(
+                nai_auto_resolution(bounds.extent, settings.nai_auto_size)
+            )
 
     def _schedule_selection_target_update(self):
         self._selection_target_timer.start()

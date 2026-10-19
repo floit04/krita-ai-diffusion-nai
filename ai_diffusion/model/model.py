@@ -229,6 +229,7 @@ class DocumentModel(QObject, ObservableProperties):
         self.document_changed.connect(self._on_document_changed_for_nai_target)
         self._connect_nai_target_source()
         self.reset_nai_target_resolution()
+        settings.changed.connect(self._on_setting_changed_for_nai_target)
         connection.state_changed.connect(self._init_on_connect)
         connection.error_changed.connect(self._forward_error)
         self.custom.validation_error_changed.connect(self._forward_validation_error)
@@ -295,14 +296,21 @@ class DocumentModel(QObject, ObservableProperties):
 
         Called for every input that changes the source: opening/switching a
         document, resizing the canvas, adding or removing an img2img layer and
-        changing its source or selection. Auto always matches the largest legal
-        size for that shape; use the 小 button (or type a number) for less.
+        changing its source or selection. The size policy comes from the
+        settings page (小图 / 最佳匹配); the docker's 小 button (or typing a
+        number) overrides it for the moment.
         """
         if not self._doc.is_valid:
             return
         source = self._nai_source_extent()
         if min(source) > 0:
-            self.set_nai_target_extent(nai_auto_resolution(source))
+            self.set_nai_target_extent(nai_auto_resolution(source, settings.nai_auto_size))
+
+    def _on_setting_changed_for_nai_target(self, name: str, value: Any):
+        # Switching the policy is expected to show up immediately, not only after
+        # the next canvas resize.
+        if name == "nai_auto_size":
+            self.reset_nai_target_resolution()
 
     def _connect_nai_target_source(self):
         """Krita signals nothing on canvas resize, so follow the doc poller."""
