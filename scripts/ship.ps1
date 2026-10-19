@@ -170,8 +170,12 @@ else {
         Remove-Item $zip
         foreach ($name in @('websockets', 'debugpy')) {
             $subZip = Join-Path $env:TEMP "ai_diffusion-$name.zip"
+            # Only src/ is imported: ai_diffusion/__init__.py looks for
+            # .websockets.src, and extension.py puts debugpy/src on sys.path. The
+            # rest of both repos is docs and examples, which are full of symlinks
+            # that Windows tar refuses to create - those made this step fail.
             Run "git archive $name" {
-                git -C (Join-Path $repo "ai_diffusion\$name") archive --format=zip -o $subZip HEAD
+                git -C (Join-Path $repo "ai_diffusion\$name") archive --format=zip -o $subZip HEAD src
             }
             $subTarget = Join-Path $target $name
             New-Item -ItemType Directory -Force -Path $subTarget | Out-Null
@@ -180,8 +184,13 @@ else {
         }
 
         # A syntax error here means Krita silently fails to load the plugin and
-        # shows no docker at all, so catch it now rather than in the UI.
-        Run 'py_compile on the installed copy' { python -m compileall -q $target }
+        # shows no docker at all, so catch it now rather than in the UI. The
+        # submodules are skipped: debugpy ships files whose whole purpose is to
+        # be unparseable (tests_python/resources), so including them would fail
+        # this step on purpose-built bad syntax.
+        Run 'py_compile on the installed copy' {
+            python -m compileall -q -x '(debugpy|websockets)' $target
+        }
         Write-Host 'installed and compiles' -ForegroundColor Green
     }
 }
