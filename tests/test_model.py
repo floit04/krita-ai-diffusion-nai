@@ -919,6 +919,11 @@ def _paint_layers(model: DocumentModel) -> list[Layer]:
     return [l for l in model.layers.updated().images if l.type is LayerType.paint]
 
 
+def _preview_layers(model: DocumentModel) -> list[Layer]:
+    """Paint layers created by show_preview - named "[Preview] <job name>"."""
+    return [l for l in _paint_layers(model) if l.name.startswith("[Preview]")]
+
+
 def _layer_matches(layer: Layer, expected: Image, bounds: Bounds) -> bool:
     """True when *layer*'s pixel content at *bounds* is nearly identical to *expected*.
 
@@ -937,7 +942,7 @@ def _layer_matches(layer: Layer, expected: Image, bounds: Bounds) -> bool:
 
 @qtapp
 async def test_show_preview(workflows_dir: Path):
-    """show_preview creates a locked layer the first time; the second call reuses it."""
+    """show_preview creates a layer the first time; the second call reuses it."""
     krita_doc = Krita.instance().openDocument("test")
     async with _model_env(krita_doc, workflows_dir) as (model, _client):
         await asyncio.sleep(0)  # let _handle_messages task start before disconnect
@@ -948,12 +953,13 @@ async def test_show_preview(workflows_dir: Path):
         # ── first call: a brand-new layer should be created ───────────────
         model.show_preview(job.id, 0)
 
-        # Identify the preview layer from the document tree: it is the one locked layer.
         all_layers = _paint_layers(model)
         assert len(all_layers) == 2, "expected Background + 1 preview layer"
-        preview_layers = [l for l in all_layers if l.is_locked]
-        assert len(preview_layers) == 1, "expected exactly one locked (preview) layer"
+        preview_layers = _preview_layers(model)
+        assert len(preview_layers) == 1, "expected exactly one preview layer"
         preview_layer = preview_layers[0]
+        # The preview used to be locked; it is a normal editable layer now.
+        assert not preview_layer.is_locked
 
         # Layer content must match the job result image.
         assert _layer_matches(preview_layer, result, _DOC_BOUNDS)
@@ -963,8 +969,8 @@ async def test_show_preview(workflows_dir: Path):
 
         all_layers_after = _paint_layers(model)
         assert len(all_layers_after) == 2, "second call must not add another layer"
-        # The locked layer's identity (id) must be unchanged.
-        preview_layers_after = [l for l in all_layers_after if l.is_locked]
+        # The preview layer's identity (id) must be unchanged.
+        preview_layers_after = _preview_layers(model)
         assert len(preview_layers_after) == 1
         assert preview_layers_after[0].id == preview_layer.id, (
             "second show_preview must reuse the existing layer"
@@ -1008,11 +1014,10 @@ async def test_apply_preview(workflows_dir: Path):
         job = _make_finished_job(model, [result])
         assert job.id is not None
 
-        # Show preview → a locked layer appears in the document tree.
+        # Show preview → a preview layer appears in the document tree.
         model.show_preview(job.id, 0)
-        layers_with_preview = _paint_layers(model)
-        preview_layers = [l for l in layers_with_preview if l.is_locked]
-        assert len(preview_layers) == 1, "expected exactly one locked (preview) layer"
+        preview_layers = _preview_layers(model)
+        assert len(preview_layers) == 1, "expected exactly one preview layer"
         preview_layer_id = preview_layers[0].id
 
         # Apply the result → preview layer must be removed synchronously.

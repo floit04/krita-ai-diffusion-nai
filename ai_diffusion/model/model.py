@@ -1183,7 +1183,9 @@ class DocumentModel(QObject, ObservableProperties):
             self._layer.move_to_top()
         else:
             self._layer = self.layers.create(name, image, bounds, make_active=False)
-            self._layer.is_locked = True
+            # Deliberately not locked: the preview is just a regular paint layer, so
+            # it can be painted over or moved. The next preview overwrites it and
+            # apply removes it, as before.
 
     def hide_preview(self, delete_layer=False):
         if self._layer is not None:
