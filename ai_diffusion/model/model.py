@@ -1164,7 +1164,9 @@ class DocumentModel(QObject, ObservableProperties):
         if selection := self.jobs.selection:
             self.show_preview(selection[0].job, selection[0].image)
         else:
-            self.hide_preview()
+            # Turning the preview off removes the layer. Hiding it left an invisible
+            # [Preview] layer behind on every toggle, piling up in the layer stack.
+            self.remove_preview()
 
     def show_preview(self, job_id: str, index: int, name_prefix="Preview"):
         job = self.jobs.find(job_id)
@@ -1187,13 +1189,11 @@ class DocumentModel(QObject, ObservableProperties):
             # it can be painted over or moved. The next preview overwrites it and
             # apply removes it, as before.
 
-    def hide_preview(self, delete_layer=False):
+    def remove_preview(self):
+        """Remove the preview layer; showing the image again recreates it from the job."""
         if self._layer is not None:
-            if delete_layer:
-                self._layer.remove()
-                self._layer = None
-            else:
-                self._layer.hide()
+            self._layer.remove()
+            self._layer = None
 
     def apply_result(
         self,
@@ -1310,9 +1310,7 @@ class DocumentModel(QObject, ObservableProperties):
                 settings.apply_region_behavior,
                 "[Generated] ",
             )
-        if self._layer:
-            self._layer.remove()
-            self._layer = None
+        self.remove_preview()
         self.jobs.selection = []
         self.jobs.notify_used(job_id, index)
 

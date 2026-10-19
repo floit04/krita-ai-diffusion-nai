@@ -978,6 +978,34 @@ async def test_show_preview(workflows_dir: Path):
 
 
 @qtapp
+async def test_turning_the_preview_off_deletes_the_layer(workflows_dir: Path):
+    """Toggling the preview off removes the layer instead of leaving it hidden."""
+    krita_doc = Krita.instance().openDocument("test")
+    async with _model_env(krita_doc, workflows_dir) as (model, _client):
+        await asyncio.sleep(0)  # let _handle_messages task start before disconnect
+        result = Image.create(_DOC_EXTENT, fill=_RED)
+        job = _make_finished_job(model, [result])
+        assert job.id is not None
+
+        model.jobs.select(job.id, 0)
+        preview_layers = _preview_layers(model)
+        assert len(preview_layers) == 1
+        preview_id = preview_layers[0].id
+
+        # What the history widget does when the selected thumbnail is clicked again.
+        model.jobs.selection = []
+
+        assert model.layers.updated().find(preview_id) is None, (
+            "preview layer must be removed, not merely hidden"
+        )
+        assert _preview_layers(model) == []
+
+        # Selecting the image again brings the preview back as a fresh layer.
+        model.jobs.select(job.id, 0)
+        assert len(_preview_layers(model)) == 1
+
+
+@qtapp
 @pytest.mark.parametrize(
     "behavior",
     [ApplyBehavior.layer, ApplyBehavior.layer_active, ApplyBehavior.replace],
