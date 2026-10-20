@@ -822,7 +822,9 @@ class GenerationWidget(QWidget):
         self.color_match_button.setEnabled(False)
         self.color_match_button.setAccessibleName("手动颜色匹配")
         self.color_match_button.setToolTip(
-            "处理当前绘画图层，参考下方可见图层；再次点击恢复原色。不支持 Ctrl+Z，请先复制图层。"
+            "处理当前绘画图层，参考下方可见图层。\n"
+            "结果放在它正上方的新图层（克隆原图层，保留蒙版/混合模式/不透明度），原图层不改动。\n"
+            "Ctrl+Z 撤销、Ctrl+Y 重做，都不用重新计算；再次点击此按钮移除匹配图层。"
         )
         self.color_match_button.clicked.connect(self._toggle_manual_color_match)
 

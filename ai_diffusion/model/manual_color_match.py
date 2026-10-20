@@ -1,23 +1,22 @@
 """Match the active paint layer to the composite underneath it.
 
-No generation history or automatic processing. Raw backups are kept on disk;
-Node.setPixelData does not create a native Krita undo command.
-Adapted from the user-provided 2026-09-25 handoff.
+The result goes into a new layer directly above the source: a duplicate of it
+(same blend mode, opacity, masks) with its pixels replaced. Cloning is what makes
+the operation part of Krita's own undo history - ``Node.addChildNode`` and
+``Node.remove`` issue ``KisImageLayerAddCommand`` / ``KisImageLayerRemoveCommand``,
+while ``Node.setPixelData`` writes straight into the paint device and records
+nothing (see ``libs/libkis/Node.cpp``). So Ctrl+Z removes the matched layer,
+Ctrl+Y puts it back without recomputing anything, and the source layer is never
+touched.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
-import os
-import uuid
 import weakref
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
 
-from PyQt5.QtCore import QByteArray, QObject, QTimer, pyqtSignal
+from PyQt5.QtCore import QByteArray, QObject, QTimer, QUuid, pyqtSignal
 
 from .. import eventloop
 from ..backend.local_color_match import match_nai_images
@@ -25,6 +24,8 @@ from ..image import Bounds, Image, ImageCollection
 from ..util import client_logger as log
 
 MAX_PIXELS = 32 * 1024 * 1024
+
+MATCH_LAYER_SUFFIX = " [色彩匹配]"
 
 
 def uid(node):
@@ -77,10 +78,6 @@ def raw_pixels(node, bounds):
     if len(data) != bounds.width * bounds.height * 4:
         raise ValueError("当前图层像素读取失败。")
     return data
-
-
-def digest(data):
-    return hashlib.sha256(data).hexdigest()
 
 
 def geometry(node):
@@ -142,13 +139,8 @@ def eligibility(document, node):
 
 
 @dataclass
-class RestorePoint:
-    bounds: Bounds
-    geometry: tuple
-    original_path: Path
-    original_hash: str
-    corrected_hash: str
-    document_size: tuple
+class MatchLayer:
+    layer_id: QUuid
 
 
 class ManualColorMatch(QObject):
@@ -157,7 +149,7 @@ class ManualColorMatch(QObject):
     def __init__(self, model):
         super().__init__(model)
         self._model = weakref.ref(model)
-        self._states: dict[str, RestorePoint] = {}
+        self._states: dict[str, MatchLayer] = {}
         self._task = None
         self._busy = False
         self._last_status = None
@@ -178,29 +170,42 @@ class ManualColorMatch(QObject):
             return None
         return model, wrapper, doc, doc.activeNode()
 
+    def _match_layer(self, model, node):
+        point = self._states.get(uid(node)) if node is not None else None
+        if point is None:
+            return None
+        # updated() drops wrappers for layers Krita removed (e.g. after Ctrl+Z).
+        return model.document.layers.updated().find(point.layer_id)
+
     def status(self):
         try:
             ctx = self._context()
             if ctx is None:
                 return False, False, "请先打开并选中要处理的 Krita 文档。"
-            _model, _wrapper, doc, node = ctx
-            point = self._states.get(uid(node)) if node is not None else None
-            applied = point is not None and point.geometry == geometry(node)
+            model, _wrapper, doc, node = ctx
+            layer = self._match_layer(model, node)
+            applied = layer is not None
             if self._busy:
-                return False, applied, "正在匹配当前图层；切换目标会取消写回。"
+                return False, applied, "正在匹配当前图层；切换目标会取消。"
             reason = eligibility(doc, node)
             if reason:
                 return False, applied, reason
-            if applied:
+            if layer is not None:
                 return (
                     True,
                     True,
-                    "已匹配，点击恢复原色。修改过像素会拒绝覆盖并保留备份；不支持 Ctrl+Z。",
+                    (
+                        f"已匹配为「{layer.name()}」。Ctrl+Z 撤销，Ctrl+Y 重做，都不需要重新计算；"
+                        "再次点击此按钮移除该图层。"
+                    ),
                 )
             return (
                 True,
                 False,
-                "匹配当前绘画图层，参考下方同位置；再次点击恢复原色。不支持 Ctrl+Z，请先复制图层。",
+                (
+                    "在上方新建一层匹配结果，参考下方可见图层，原图层不改动。\n"
+                    "新图层是 Krita 普通图层，Ctrl+Z 撤销、Ctrl+Y 重做。"
+                ),
             )
         except (RuntimeError, AttributeError):
             return False, False, "当前图层暂不可用。"
@@ -223,14 +228,18 @@ class ManualColorMatch(QObject):
             ctx = self._context()
             if ctx is None:
                 return
-            _model, wrapper, doc, node = ctx
+            model, wrapper, doc, node = ctx
             reason = eligibility(doc, node)
             if reason:
                 self._error(reason)
                 return
-            key = uid(node)
-            if key in self._states:
-                self._restore(doc, node, self._states[key])
+            if layer := self._match_layer(model, node):
+                # A native remove command, so this step is undoable as well. The
+                # state is kept: undoing the removal brings the same node back and
+                # the button returns to "applied" without a new match.
+                layer.remove()
+                doc.refreshProjection()
+                doc.setModified(True)
                 return
             self._busy = True
             self.changed.emit()
@@ -254,43 +263,30 @@ class ManualColorMatch(QObject):
         except (RuntimeError, AttributeError):
             return None
 
-    def _snapshot(self, node, bounds, data, source, doc):
-        folder = Path(os.environ["LOCALAPPDATA"]) / "KritaColorMatch" / "layer-snapshots"
-        folder /= datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]
-        folder.mkdir(parents=True, exist_ok=False)
-        path = folder / "original.bgra"
-        path.write_bytes(data)
-        (folder / "original.png").write_bytes(bytes(source.to_bytes()))
-        metadata = {
-            "node_id": uid(node),
-            "node_name": node.name(),
-            "bounds": list(bounds),
-            "document": doc.fileName(),
-            "format": "BGRA U8 straight alpha",
-            "profile": node.colorProfile(),
-            "sha256": digest(data),
-            "note": "PNG is a viewable copy; BGRA is the exact restore source.",
-        }
-        (folder / "metadata.json").write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        return path
-
-    def _write(self, doc, node, bounds, output, rollback):
+    def _add_match_layer(self, wrapper, doc, node, bounds, output):
+        """Clone the source layer so masks, blend mode and opacity come along, then
+        swap in the matched pixels before it enters the layer stack."""
+        duplicate = node.duplicate()
+        if duplicate is None:
+            raise RuntimeError("无法复制目标图层。")
         try:
-            if not node.setPixelData(QByteArray(output), *bounds):
-                raise RuntimeError("Krita 拒绝写入图层像素。")
-            doc.refreshProjection()
-            doc.waitForDone()
-            if raw_pixels(node, bounds) != output:
-                raise RuntimeError("写回校验失败。")
-            doc.setModified(True)
+            if not duplicate.setPixelData(QByteArray(output), *bounds):
+                raise RuntimeError("Krita 拒绝写入匹配结果。")
+            duplicate.setName(node.name() + MATCH_LAYER_SUFFIX)
+            parent = node.parentNode()
+            if parent is None:
+                raise RuntimeError("找不到目标图层的父级。")
+            # This is the undo command; the pixels are already in the node, so
+            # redo re-inserts the finished layer instead of recomputing it.
+            parent.addChildNode(duplicate, node)
         except Exception:
-            if not node.setPixelData(QByteArray(rollback), *bounds):
-                log.error("Automatic rollback failed; source snapshot retained")
-            doc.refreshProjection()
-            doc.setModified(True)
+            duplicate.remove()  # detached, so this is a no-op, but keeps it tidy
             raise
+        doc.refreshProjection()
+        doc.waitForDone()
+        wrapper.layers.update()
+        doc.setModified(True)
+        return duplicate
 
     async def _compute(self, wrapper, doc, initial_node):
         key = uid(initial_node)
@@ -320,7 +316,6 @@ class ManualColorMatch(QObject):
             reference = lower_projection(doc, key, bounds)
             if not any(bytes(reference.data)[3::4]):
                 raise ValueError("当前图层下方同位置没有可见像素。")
-            backup = self._snapshot(node, bounds, original, source, doc)
             images = await match_nai_images(
                 ImageCollection([source]),
                 reference.to_base64(),
@@ -335,58 +330,32 @@ class ManualColorMatch(QObject):
                 doc.height(),
                 doc.currentTime(),
             ):
-                raise RuntimeError("计算期间图层位置、尺寸或画布发生变化，已取消写回。")
+                raise RuntimeError("计算期间图层位置、尺寸或画布发生变化，已取消。")
             if topology(doc) != baseline_tree or raw_pixels(node, bounds) != original:
-                raise RuntimeError("计算期间图层内容或结构发生变化，已保留新修改，不写回。")
+                raise RuntimeError("计算期间图层内容或结构发生变化，已取消。")
             if len(images) != 1 or images[0] is source:
-                raise RuntimeError("颜色匹配失败，当前图层未改动，详情见插件日志。")
+                raise RuntimeError("颜色匹配失败，详情见插件日志。")
             corrected = images[0]
             if corrected.extent != source.extent:
-                raise RuntimeError("匹配结果尺寸异常，当前图层未改动。")
+                raise RuntimeError("匹配结果尺寸异常，未改动图层。")
             output = bytes(corrected.data)
             if len(output) != len(original) or output[3::4] != original[3::4]:
-                raise RuntimeError("匹配结果透明度异常，当前图层未改动。")
+                raise RuntimeError("匹配结果透明度异常，未改动图层。")
             patched = bytearray(output)
             for offset, alpha in enumerate(original[3::4]):
                 if alpha == 0:
                     start = offset * 4
                     patched[start : start + 4] = original[start : start + 4]
             output = bytes(patched)
-            self._write(doc, node, bounds, output, original)
-            self._states[key] = RestorePoint(
-                bounds, geometry(node), backup, digest(original), digest(output), size
-            )
-            log.info("Matched paint layer; source backup %s", backup)
+            layer = self._add_match_layer(wrapper, doc, node, bounds, output)
+            self._states[key] = MatchLayer(layer.uniqueId())
+            log.info("Matched paint layer into %s", layer.name())
         except asyncio.CancelledError:
             pass
         except Exception as error:
-            log.exception("Current-layer color match failed or cancelled; source snapshot retained")
+            log.exception("Current-layer color match failed or cancelled")
             self._error(str(error))
         finally:
             self._busy = False
             self._task = None
             self.changed.emit()
-
-    def _restore(self, doc, node, point):
-        key = uid(node)
-        doc.waitForDone()
-        if (
-            geometry(node) != point.geometry
-            or (doc.width(), doc.height(), doc.currentTime()) != point.document_size
-        ):
-            self._states.pop(key, None)
-            raise RuntimeError(
-                "图层已移动或变换，不覆盖后续修改。原始备份：" + str(point.original_path.parent)
-            )
-        current = raw_pixels(node, point.bounds)
-        if digest(current) != point.corrected_hash:
-            self._states.pop(key, None)
-            raise RuntimeError(
-                "图层像素已修改，不用旧原图覆盖。原始备份：" + str(point.original_path.parent)
-            )
-        original = point.original_path.read_bytes()
-        if digest(original) != point.original_hash:
-            raise RuntimeError("原始备份校验失败，未改动图层。")
-        self._write(doc, node, point.bounds, original, current)
-        self._states.pop(key, None)
-        self.changed.emit()

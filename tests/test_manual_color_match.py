@@ -1,4 +1,3 @@
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -6,11 +5,10 @@ from PyQt5.QtCore import QObject, QPoint, QRect, QUuid
 
 from ai_diffusion.image import Bounds
 from ai_diffusion.model.manual_color_match import (
+    MATCH_LAYER_SUFFIX,
     ManualColorMatch,
-    RestorePoint,
-    digest,
+    MatchLayer,
     eligibility,
-    geometry,
     path_to,
 )
 
@@ -128,30 +126,78 @@ def test_supported_layer_and_path():
     assert path_to(node, "missing") is None
 
 
-@pytest.mark.parametrize("change", ["none", "pixels", "position", "backup"])
-def test_restore_protects_later_changes(tmp_path: Path, change):
-    model, node, doc = Model(), Node(), Doc()
+def test_match_layer_is_looked_up_by_id():
+    model = Model()
+    layer = object()
+    match_id = QUuid.createUuid()
+    finder = SimpleNamespace(find=lambda i: layer if i == match_id else None)
+    finder.updated = lambda: finder
+    model.document = SimpleNamespace(layers=finder)
     controller = ManualColorMatch(model)
     controller._timer.stop()
-    original = bytes([1, 2, 3, 255])
-    path = tmp_path / "original.bgra"
-    path.write_bytes(original)
-    point = RestorePoint(
-        Bounds(0, 0, 1, 1), geometry(node), path, digest(original), digest(node.data), (1, 1, 0)
-    )
-    controller._states[node.id.toString()] = point
-    if change == "pixels":
-        node.data = bytes([9, 9, 9, 255])
-    elif change == "position":
-        node.pos = QPoint(1, 0)
-    elif change == "backup":
-        path.write_bytes(b"corrupt")
-    before = node.data
-    if change == "none":
-        controller._restore(doc, node, point)
-        assert node.data == original
-        assert not controller._states
-    else:
-        with pytest.raises(RuntimeError):
-            controller._restore(doc, node, point)
-        assert node.data == before
+
+    node = Node()
+    controller._states[node.uniqueId().toString()] = MatchLayer(match_id)
+
+    assert controller._match_layer(model, node) is layer
+    assert controller._match_layer(model, Node()) is None
+
+
+class CloneNode:
+    """Just enough of a krita.Node for the match layer insertion."""
+
+    def __init__(self, name="ink", parent=None, data=bytes([20, 30, 40, 255])):
+        self._name = name
+        self._parent = parent
+        self.data = data
+        self.children: list[CloneNode] = []
+
+    def name(self):
+        return self._name
+
+    def setName(self, value):
+        self._name = value
+
+    def duplicate(self):
+        copy = CloneNode(self._name, self._parent, self.data)
+        return copy
+
+    def setPixelData(self, data, *args):
+        self.data = bytes(data)
+        return True
+
+    def parentNode(self):
+        return self._parent
+
+    def addChildNode(self, child, above):
+        child._parent = self
+        self.children.insert(self.children.index(above) + 1, child)
+        return True
+
+    def remove(self):
+        if self._parent is not None:
+            self._parent.children.remove(self)
+            return True
+        return False
+
+
+def test_add_match_layer_clones_the_source_and_sets_the_pixels():
+    model = Model()
+    controller = ManualColorMatch(model)
+    controller._timer.stop()
+
+    parent = CloneNode("root")
+    source = CloneNode("ink", parent)
+    parent.children.append(source)
+    wrapper = SimpleNamespace(layers=SimpleNamespace(update=lambda: None))
+    doc = Doc()
+
+    output = bytes([1, 2, 3, 255])
+    layer = controller._add_match_layer(wrapper, doc, source, Bounds(0, 0, 1, 1), output)
+
+    # Inserted directly above the source, named after it, carrying the new pixels.
+    assert parent.children == [source, layer]
+    assert layer.name() == "ink" + MATCH_LAYER_SUFFIX
+    assert layer.data == output
+    # The source is untouched, which is what makes Ctrl+Z a pure layer removal.
+    assert source.data == bytes([20, 30, 40, 255])
