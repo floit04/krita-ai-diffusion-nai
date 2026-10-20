@@ -21,6 +21,7 @@ from ..model.properties import Bind, Binding, bind, bind_combo, bind_toggle
 from ..model.root import root
 from . import theme
 from .settings_widgets import WarningIcon
+from .slider import Slider
 from .switch import SwitchWidget
 from .theme import SignalBlocker, set_text_clipped
 from .widget import (
@@ -40,13 +41,12 @@ class FactorWidget(QWidget):
         super().__init__(parent)
         self._value = 1.0
 
-        self.slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.slider = Slider(Qt.Orientation.Horizontal, self)
         self.slider.setMinimum(100)
         self.slider.setMaximum(400)
         self.slider.setTickInterval(50)
         self.slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.slider.setSingleStep(50)
-        self.slider.setPageStep(50)
         self.slider.valueChanged.connect(self.change_factor_slider)
 
         self.input = QDoubleSpinBox(self)

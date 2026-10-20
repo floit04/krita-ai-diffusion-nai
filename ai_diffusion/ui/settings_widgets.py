@@ -15,7 +15,6 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QScrollArea,
     QSizePolicy,
-    QSlider,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
@@ -24,6 +23,7 @@ from PyQt5.QtWidgets import (
 
 from ..localization import translate as _
 from ..settings import Setting, settings
+from .slider import Slider
 from .switch import SwitchWidget
 from .theme import add_header, icon
 
@@ -250,7 +250,7 @@ class SliderSetting(SettingWidget):
         slider_widget = QWidget(self)
         slider_layout = QHBoxLayout()
         slider_widget.setLayout(slider_layout)
-        self._slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._slider = Slider(Qt.Orientation.Horizontal, self)
         self._slider.setMinimumWidth(200)
         self._slider.setMaximumWidth(300)
         self._slider.setMinimum(round(minimum * self.multiplier))

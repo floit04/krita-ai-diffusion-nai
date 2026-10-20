@@ -38,7 +38,6 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
-    QSlider,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
@@ -62,6 +61,7 @@ from ..style import Styles
 from ..util import ensure, flatten, sequence_equal
 from . import theme
 from .region import RegionPromptWidget
+from .slider import Slider
 from .widget import (
     ErrorBox,
     GenerateButton,
@@ -898,10 +898,9 @@ class GenerationWidget(QWidget):
         focus_layout.setContentsMargins(0, 0, 0, 0)
         focus_layout.setSpacing(4)
         focus_layout.addWidget(QLabel("最小上下文:", self.focus_options))
-        self.min_context_slider = QSlider(Qt.Orientation.Horizontal, self.focus_options)
+        self.min_context_slider = Slider(Qt.Orientation.Horizontal, self.focus_options)
         self.min_context_slider.setRange(MIN_CONTEXT_MIN, MIN_CONTEXT_MAX)
         self.min_context_slider.setSingleStep(8)
-        self.min_context_slider.setPageStep(16)
         self.min_context_slider.setToolTip(
             "框的四周额外附带多少像素的画面作为上下文,让重绘结果能接上周围的内容。"
         )

@@ -23,6 +23,7 @@ from ..model.control_utils import nai_selection_layer_id
 from ..model.properties import Binding, bind, bind_combo, bind_toggle
 from . import theme
 from .interval_slider import IntervalSlider
+from .slider import Slider
 from .theme import SignalBlocker
 
 _thumbnail_extent = Extent(192, 192)
@@ -127,13 +128,12 @@ class ControlWidget(QWidget):
         self.reference_button.setToolTip("素材库")
         self.reference_button.clicked.connect(self._manage_references)
 
-        self.preset_slider = QSlider(self)
+        self.preset_slider = Slider(self)
         self.preset_slider.setOrientation(Qt.Orientation.Horizontal)
         self.preset_slider.setMinimumWidth(40)
         self.preset_slider.setRange(0, control.max_preset_value)
         self.preset_slider.setValue(control.preset_value)
         self.preset_slider.setSingleStep(1)
-        self.preset_slider.setPageStep(2)
         self.preset_slider.setTickInterval(2)
         self.preset_slider.setTickPosition(QSlider.TickPosition.TicksBothSides)
         self.preset_slider.setToolTip(_("Control strength: how much the layer affects the image"))
@@ -221,12 +221,11 @@ class ControlWidget(QWidget):
         actions_layout.addWidget(self.add_pose_button)
         extended_layout.addLayout(actions_layout)
 
-        self.strength_slider = QSlider(self.extended_widget)
+        self.strength_slider = Slider(self.extended_widget)
         self.strength_slider.setOrientation(Qt.Orientation.Horizontal)
         self.strength_slider.setRange(0, 75)
         self.strength_slider.setValue(control.strength)
         self.strength_slider.setSingleStep(1)
-        self.strength_slider.setPageStep(10)
         self.strength_label = QLabel("1.0", self.extended_widget)
 
         self.range_label = QLabel(_("Range") + ":", self.extended_widget)
@@ -240,12 +239,11 @@ class ControlWidget(QWidget):
         # Secondary parameter for NAI modes (vibe: information extracted,
         # precise reference: fidelity), hidden otherwise.
         self.param2_name_label = QLabel("", self.extended_widget)
-        self.param2_slider = QSlider(self.extended_widget)
+        self.param2_slider = Slider(self.extended_widget)
         self.param2_slider.setOrientation(Qt.Orientation.Horizontal)
         self.param2_slider.setRange(0, 100)
         self.param2_slider.setValue(control.param2)
         self.param2_slider.setSingleStep(1)
-        self.param2_slider.setPageStep(10)
         self.param2_label = QLabel("1.00", self.extended_widget)
 
         slider_layout = QGridLayout()

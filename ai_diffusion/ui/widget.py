@@ -38,7 +38,6 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QScrollBar,
     QSizePolicy,
-    QSlider,
     QSpinBox,
     QStyle,
     QStyleOption,
@@ -81,6 +80,7 @@ from ..text import (
 from ..util import ensure
 from . import actions, theme
 from .autocomplete import PromptAutoComplete
+from .slider import Slider
 from .theme import SignalBlocker
 
 
@@ -125,11 +125,10 @@ class QueuePopup(QMenu):
         batch_label.setVisible(supports_batch)
         self._layout.addWidget(batch_label, 1, 0)
         batch_layout = QHBoxLayout()
-        self._batch_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._batch_slider = Slider(Qt.Orientation.Horizontal, self)
         self._batch_slider.setMinimum(1)
         self._batch_slider.setMaximum(10)
         self._batch_slider.setSingleStep(1)
-        self._batch_slider.setPageStep(1)
         self._batch_slider.setVisible(supports_batch)
         self._batch_slider.setToolTip(_("Number of jobs to enqueue at once"))
         self._batch_label = QLabel("1", self)
@@ -161,11 +160,10 @@ class QueuePopup(QMenu):
         self._layout.addLayout(seed_layout, 2, 1)
 
         resolution_multiplier_label = QLabel(_("Resolution"), self)
-        self._resolution_multiplier_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._resolution_multiplier_slider = Slider(Qt.Orientation.Horizontal, self)
         self._resolution_multiplier_slider.setRange(3, 15)
         self._resolution_multiplier_slider.setValue(10)
         self._resolution_multiplier_slider.setSingleStep(1)
-        self._resolution_multiplier_slider.setPageStep(1)
         self._resolution_multiplier_slider.setToolTip(Settings._resolution_multiplier.desc)
         self._resolution_multiplier_slider.valueChanged.connect(self._set_resolution_multiplier)
         self._resolution_multiplier_display = QLabel("1.0 x", self)
@@ -763,7 +761,7 @@ class StrengthWidget(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(self._layout)
 
-        self._slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._slider = Slider(Qt.Orientation.Horizontal, self)
         self._slider.setMinimum(slider_range[0])
         self._slider.setMaximum(slider_range[1])
         self._slider.setValue(self._value)
@@ -849,7 +847,7 @@ class LayerCountWidget(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(self._layout)
 
-        self._slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._slider = Slider(Qt.Orientation.Horizontal, self)
         self._slider.setMinimum(1)
         self._slider.setMaximum(10)
         self._slider.setValue(self._value)

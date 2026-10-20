@@ -21,7 +21,6 @@ from PyQt5.QtWidgets import (
     QMenu,
     QMessageBox,
     QScrollArea,
-    QSlider,
     QSpinBox,
     QSplitter,
     QTextEdit,
@@ -51,6 +50,7 @@ from .generation import GenerateButton, HistoryWidget, ProgressBar, QueueButton
 from .live import LivePreviewArea
 from .region import ActiveRegionWidget, PromptHeader
 from .settings_widgets import ExpanderButton
+from .slider import Slider
 from .switch import SwitchWidget
 from .theme import SignalBlocker
 from .widget import ErrorBox, StyleSelectWidget, TextPromptWidget, WorkspaceSelectWidget
@@ -121,10 +121,10 @@ class IntParamWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
 
-        self._slider: QSlider | None = None
+        self._slider: Slider | None = None
         assert param.min is not None and param.max is not None and param.default is not None
         if param.max - param.min <= 200:
-            self._slider = QSlider(Qt.Orientation.Horizontal, parent)
+            self._slider = Slider(Qt.Orientation.Horizontal, parent)
             self._slider.setMinimumHeight(self._slider.minimumSizeHint().height() + 4)
             self._slider.valueChanged.connect(self._slider_changed)
             self._widget = QSpinBox(parent)
@@ -185,15 +185,14 @@ class FloatParamWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
 
-        self._slider: QSlider | None = None
+        self._slider: Slider | None = None
         assert param.min is not None and param.max is not None and param.default is not None
         delta = abs(param.max - param.min)
         step = round(delta / 20, math.ceil(-math.log10(delta / 20)))
         if 0.1 <= delta <= 100:
-            self._slider = QSlider(Qt.Orientation.Horizontal, parent)
+            self._slider = Slider(Qt.Orientation.Horizontal, parent)
             self._slider.setRange(round(param.min * 100), round(param.max * 100))
             self._slider.setSingleStep(round(step * 50))
-            self._slider.setPageStep(round(step * 200))
             self._slider.setMinimumHeight(self._slider.minimumSizeHint().height() + 4)
             self._slider.valueChanged.connect(self._slider_changed)
             self._widget = QDoubleSpinBox(parent)
