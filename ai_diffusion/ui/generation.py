@@ -865,6 +865,10 @@ class GenerationWidget(QWidget):
             "重绘区域仍然以画布选区(优先)或涂抹图层为准,框只决定发送范围。"
         )
         self.focus_inpaint_button.toggled.connect(self._toggle_focus_inpaint)
+        # Hidden from the docker on request. The feature still works at the model
+        # level (and 裁切重绘 shares its box layer), so this is UI only: put the
+        # button back into the layout below to restore it.
+        self.focus_inpaint_button.setVisible(False)
 
         self.crop_inpaint_button = QToolButton(self)
         self.crop_inpaint_button.setCheckable(True)
@@ -881,7 +885,6 @@ class GenerationWidget(QWidget):
         strength_layout.addWidget(self.layer_count_widget)
         strength_layout.addWidget(self.color_match_button)
         strength_layout.addWidget(self.paint_selection_button)
-        strength_layout.addWidget(self.focus_inpaint_button)
         strength_layout.addWidget(self.crop_inpaint_button)
         strength_layout.addWidget(self.add_control_button)
         strength_layout.addWidget(self.add_region_button)
@@ -910,7 +913,6 @@ class GenerationWidget(QWidget):
         focus_layout.addWidget(self.min_context_slider, 1)
         focus_layout.addWidget(self.min_context_label)
         focus_layout.addWidget(self.focus_request_label)
-        layout.addWidget(self.focus_options)
 
         self.custom_inpaint = CustomInpaintWidget(self)
         layout.addWidget(self.custom_inpaint)
@@ -992,12 +994,18 @@ class GenerationWidget(QWidget):
         self.model.nai_cropped_inpaint = checked
 
     def _sync_focus_inpaint_button(self):
+        # The button is hidden, so focus mode must not be left on in a document
+        # that has it saved: it would crop every request with nothing on screen to
+        # turn it off. 裁切重绘 owns the same box layer, so leave the flag alone
+        # while that is on.
+        if self.model.nai_focused_inpaint and not self.model.nai_cropped_inpaint:
+            self.model.nai_focused_inpaint = False
         enabled = self.model.nai_focused_inpaint
         with theme.SignalBlocker(self.focus_inpaint_button):
             self.focus_inpaint_button.setChecked(enabled)
         with theme.SignalBlocker(self.crop_inpaint_button):
             self.crop_inpaint_button.setChecked(self.model.nai_cropped_inpaint)
-        self.focus_options.setVisible(enabled)
+        self.focus_options.setVisible(False)
         self._update_target_resolution()
         self._update_focus_options()
 
