@@ -347,9 +347,6 @@ class HistoryWidget(QListWidget):
     def select_item(self):
         self._model.jobs.selection = [self._item_data(i) for i in self.selectedItems()]
 
-    def _toggle_selection(self):
-        self._model.jobs.toggle_selection()
-
     def _activate_selection(self):
         items = self.selectedItems()
         if len(items) > 0:
@@ -405,9 +402,6 @@ class HistoryWidget(QListWidget):
             assert isinstance(e, QKeyEvent)
             if e.matches(QKeySequence.StandardKey.Delete):
                 self._discard_image(confirm=False)
-                e.accept()
-            elif e.key() == Qt.Key.Key_Space:
-                self._toggle_selection()
                 e.accept()
         return super().event(e)
 
