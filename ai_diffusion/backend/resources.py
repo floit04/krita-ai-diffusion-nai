@@ -343,6 +343,8 @@ class ControlMode(Enum):
     nai_precise_character = 22  # Precise (director) reference: character
     nai_precise_style = 23  # Precise (director) reference: style
     nai_precise_character_style = 24  # Precise (director) reference: character & style
+    nai_tiled_img2img = 25  # Tiled img2img across full canvas (for large canvases)
+    nai_precise_outfit = 26  # Precise (director) reference: outfit / costume
 
     @property
     def is_nai(self):
@@ -352,6 +354,8 @@ class ControlMode(Enum):
             ControlMode.nai_precise_character,
             ControlMode.nai_precise_style,
             ControlMode.nai_precise_character_style,
+            ControlMode.nai_tiled_img2img,
+            ControlMode.nai_precise_outfit,
         ]
 
     @property
@@ -360,7 +364,12 @@ class ControlMode(Enum):
             ControlMode.nai_precise_character,
             ControlMode.nai_precise_style,
             ControlMode.nai_precise_character_style,
+            ControlMode.nai_precise_outfit,
         ]
+
+    @property
+    def supports_prefer_same_outfit(self):
+        return self in (ControlMode.nai_precise_character, ControlMode.nai_precise_character_style)
 
     @property
     def nai_precise_caption(self):
@@ -369,7 +378,27 @@ class ControlMode(Enum):
             ControlMode.nai_precise_character: "character",
             ControlMode.nai_precise_style: "style",
             ControlMode.nai_precise_character_style: "character&style",
+            ControlMode.nai_precise_outfit: "costume",
         }[self]
+
+    def resolve_nai_precise_caption(
+        self, prefer_same_outfit: bool | None = None, *, supports_outfit_reference: bool = True
+    ) -> str:
+        if self is ControlMode.nai_precise_outfit:
+            return "costume"
+        if self is ControlMode.nai_precise_style:
+            return "style"
+        if self is ControlMode.nai_precise_character:
+            same = bool(prefer_same_outfit)
+            return "character_mainoutfit" if (same and supports_outfit_reference) else "character"
+        if self is ControlMode.nai_precise_character_style:
+            same = True if prefer_same_outfit is None else prefer_same_outfit
+            return (
+                "character&style"
+                if (same or not supports_outfit_reference)
+                else "character&style_anyoutfit"
+            )
+        return self.nai_precise_caption
 
     @property
     def is_lines(self):

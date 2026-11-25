@@ -403,14 +403,27 @@ async def test_nai_v5_marks_unavailable_reference_controls_as_unsupported(
         vibe.set_mode(ControlMode.nai_vibe)
         precise = model.regions.control.emplace()
         precise.set_mode(ControlMode.nai_precise_character)
+        outfit = model.regions.control.emplace()
+        outfit.set_mode(ControlMode.nai_precise_outfit)
+        char_style = model.regions.control.emplace()
+        char_style.set_mode(ControlMode.nai_precise_character_style)
         base = model.regions.control.emplace()
         base.set_mode(ControlMode.nai_base)
 
         assert not vibe.is_supported
         assert "Vibe Transfer" in vibe.error_text
-        assert not precise.is_supported
-        assert "Precise Reference" in precise.error_text
+        assert precise.is_supported
+        assert not precise.prefer_same_outfit
+        assert outfit.is_supported
+        assert char_style.is_supported
+        assert char_style.prefer_same_outfit
         assert base.is_supported
+
+        v45_checkpoint = "nai-diffusion-4-5-full"
+        client.models.checkpoints[v45_checkpoint] = CheckpointInfo(v45_checkpoint, Arch.nai)
+        model.style = _make_style(v45_checkpoint)
+        assert precise.is_supported
+        assert not outfit.is_supported
         await asyncio.sleep(0)
 
 

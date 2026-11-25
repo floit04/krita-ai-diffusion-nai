@@ -25,7 +25,9 @@ async def match_nai_images(images, reference_base64, cancelled=lambda: False):
         worker = Path(__file__).with_name("color_match_worker.py")
         if not python.is_file() or not worker.is_file():
             raise FileNotFoundError("Local color matching runtime is missing")
-        with tempfile.TemporaryDirectory(prefix="krita-colormatch-") as folder:
+        with tempfile.TemporaryDirectory(
+            prefix="krita-colormatch-", ignore_cleanup_errors=True
+        ) as folder:
             temp = Path(folder)
             reference = temp / "reference.png"
             reference.write_bytes(base64.b64decode(reference_base64, validate=True))

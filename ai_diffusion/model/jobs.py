@@ -83,8 +83,22 @@ class JobParams:
     def equal_ignore_seed(cls, a: JobParams | None, b: JobParams | None):
         if a is None or b is None:
             return a is b
-        field_names = (f.name for f in fields(cls) if f.name != "seed")
-        return all(getattr(a, name) == getattr(b, name) for name in field_names)
+        same_tiled_group = a.metadata.get("tiled_group") is not None and a.metadata.get(
+            "tiled_group"
+        ) == b.metadata.get("tiled_group")
+        ignored = ("seed", "bounds") if same_tiled_group else ("seed",)
+        field_names = (f.name for f in fields(cls) if f.name not in ignored)
+        if not all(getattr(a, name) == getattr(b, name) for name in field_names):
+            return False
+        if same_tiled_group:
+            a_meta = {
+                k: v for k, v in a.metadata.items() if k not in ("tile_index", "tile_overlap")
+            }
+            b_meta = {
+                k: v for k, v in b.metadata.items() if k not in ("tile_index", "tile_overlap")
+            }
+            return a_meta == b_meta
+        return True
 
     def set_style(self, style: Style, checkpoint: str):
         self.metadata["style"] = style.filename

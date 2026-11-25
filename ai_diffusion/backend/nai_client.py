@@ -625,6 +625,21 @@ def _find_nai_base_control(work: WorkflowInput):
     return None
 
 
+def _find_nai_tiled_control(work: WorkflowInput):
+    from .resources import ControlMode
+
+    if cond := work.conditioning:
+        return next(
+            (
+                ctrl
+                for ctrl in cond.control
+                if ctrl.mode is ControlMode.nai_tiled_img2img and ctrl.image is not None
+            ),
+            None,
+        )
+    return None
+
+
 def restore_nai_results(work: WorkflowInput, images: ImageCollection) -> ImageCollection:
     """Stretch provider-sized edit results back to their exact source extent."""
     base_ctrl = _find_nai_base_control(work)
@@ -797,8 +812,22 @@ def convert_workflow(
 
     # Server-side compatibility rules (mirrors the launcher):
     if precise_ctrls and not model.supports_precise_reference:
-        log.warning("NAI Precise Reference requires a V4.5 model, dropping references")
+        log.warning("NAI Precise Reference requires a V4.5 or V5 model, dropping references")
         precise_ctrls = []
+    if (
+        precise_ctrls
+        and action is NaiAction.infill
+        and not model.supports_precise_reference_inpainting
+    ):
+        log.warning(
+            "NAI V5 does not support Precise Reference with inpainting, dropping references"
+        )
+        precise_ctrls = []
+    if precise_ctrls and not model.supports_outfit_reference:
+        filtered = [c for c in precise_ctrls if c.mode is not ControlMode.nai_precise_outfit]
+        if len(filtered) != len(precise_ctrls):
+            log.warning("Outfit precise reference requires a V5 model, dropping outfit references")
+            precise_ctrls = filtered
     if vibe_ctrls and not model.supports_vibe:
         log.warning("NAI V5 does not support Vibe Transfer yet, dropping vibes")
         vibe_ctrls = []
@@ -973,14 +1002,21 @@ def convert_workflow(
             continue
         vibes.append(VibeReference(encoding, ctrl.strength, ctrl.param2))
 
-    # --- Precise (director) reference — V4.5 only ---
+    # --- Precise (director) reference — V4.5 & V5 ---
     precise_refs = [
         PreciseReference(
-            image_b64=image_to_base64(prepare_nai_precise_reference_image(ctrl.image)),
-            type_caption=ctrl.mode.nai_precise_caption,
-            strength=ctrl.strength,
+            image_b64=image_to_base64(
+                prepare_nai_precise_reference_image(
+                    ctrl.image, bucket=model.bucket_precise_reference
+                )
+            ),
+            type_caption=ctrl.mode.resolve_nai_precise_caption(
+                ctrl.prefer_same_outfit,
+                supports_outfit_reference=model.supports_outfit_reference,
+            ),
+            strength=min(max(ctrl.strength, 0.0), model.precise_reference_strength_max),
             # Launcher: secondary strength = 1.0 - fidelity; the builder inverts.
-            fidelity=ctrl.param2,
+            fidelity=ctrl.param2 if model.supports_precise_reference_fidelity else 1.0,
         )
         for ctrl in precise_ctrls
     ]

@@ -16,7 +16,7 @@ import asyncio
 import weakref
 from dataclasses import dataclass
 
-from PyQt5.QtCore import QByteArray, QObject, QTimer, QUuid, pyqtSignal
+from PyQt5.QtCore import QByteArray, QObject, QTimer, pyqtSignal
 
 from .. import eventloop
 from ..backend.local_color_match import match_nai_images
@@ -25,7 +25,7 @@ from ..util import client_logger as log
 
 MAX_PIXELS = 32 * 1024 * 1024
 
-MATCH_LAYER_SUFFIX = " [色彩匹配]"
+MATCH_LAYER_PREFIX = "【颜色匹配】"
 
 
 def uid(node):
@@ -139,8 +139,10 @@ def eligibility(document, node):
 
 
 @dataclass
-class MatchLayer:
-    layer_id: QUuid
+class MatchSnapshot:
+    bounds: Bounds
+    original: bytes
+    original_name: str
 
 
 class ManualColorMatch(QObject):
@@ -149,7 +151,7 @@ class ManualColorMatch(QObject):
     def __init__(self, model):
         super().__init__(model)
         self._model = weakref.ref(model)
-        self._states: dict[str, MatchLayer] = {}
+        self._states: dict[str, MatchSnapshot] = {}
         self._task = None
         self._busy = False
         self._last_status = None
@@ -170,44 +172,40 @@ class ManualColorMatch(QObject):
             return None
         return model, wrapper, doc, doc.activeNode()
 
-    def _match_layer(self, model, node):
-        point = self._states.get(uid(node)) if node is not None else None
-        if point is None:
-            return None
-        # updated() drops wrappers for layers Krita removed (e.g. after Ctrl+Z).
-        return model.document.layers.updated().find(point.layer_id)
+    def _match_snapshot(self, node):
+        return self._states.get(uid(node)) if node is not None else None
 
     def status(self):
         try:
             ctx = self._context()
             if ctx is None:
                 return False, False, "请先打开并选中要处理的 Krita 文档。"
-            model, _wrapper, doc, node = ctx
-            layer = self._match_layer(model, node)
-            applied = layer is not None
+            _model, _wrapper, doc, node = ctx
+            snap = self._match_snapshot(node)
+            applied = snap is not None
             if self._busy:
                 return False, applied, "正在匹配当前图层；切换目标会取消。"
             reason = eligibility(doc, node)
             if reason:
                 return False, applied, reason
-            if layer is not None:
+            if snap is not None and node is not None:
                 return (
                     True,
                     True,
                     (
-                        f"已匹配为「{layer.name()}」。Ctrl+Z 撤销，Ctrl+Y 重做，都不需要重新计算；"
-                        "再次点击此按钮移除该图层。"
+                        f"已应用「{node.name()}」。再次点击此按钮可撤销颜色匹配并还原原图层名称；"
+                        "也可按 2 次 Ctrl+Z 撤销。"
                     ),
                 )
             return (
                 True,
                 False,
                 (
-                    "在上方新建一层匹配结果，参考下方可见图层，原图层不改动。\n"
-                    "新图层是 Krita 普通图层，Ctrl+Z 撤销、Ctrl+Y 重做。"
+                    f"处理当前绘画图层，参考下方可见图层，结果直接应用到当前图层并加上「{MATCH_LAYER_PREFIX}」前缀。\n"
+                    "再次点击此按钮可撤销颜色匹配；也可按 2 次 Ctrl+Z 撤销。"
                 ),
             )
-        except (RuntimeError, AttributeError):
+        except (RuntimeError, AttributeError, TypeError):
             return False, False, "当前图层暂不可用。"
 
     def _poll(self):
@@ -228,18 +226,16 @@ class ManualColorMatch(QObject):
             ctx = self._context()
             if ctx is None:
                 return
-            model, wrapper, doc, node = ctx
+            _model, wrapper, doc, node = ctx
             reason = eligibility(doc, node)
             if reason:
                 self._error(reason)
                 return
-            if layer := self._match_layer(model, node):
-                # A native remove command, so this step is undoable as well. The
-                # state is kept: undoing the removal brings the same node back and
-                # the button returns to "applied" without a new match.
-                layer.remove()
-                doc.refreshProjection()
-                doc.setModified(True)
+            if snap := self._match_snapshot(node):
+                self._replace_layer(
+                    wrapper, doc, node, snap.bounds, snap.original, snap.original_name
+                )
+                self._states.pop(uid(node), None)
                 return
             self._busy = True
             self.changed.emit()
@@ -263,24 +259,24 @@ class ManualColorMatch(QObject):
         except (RuntimeError, AttributeError):
             return None
 
-    def _add_match_layer(self, wrapper, doc, node, bounds, output):
-        """Clone the source layer so masks, blend mode and opacity come along, then
-        swap in the matched pixels before it enters the layer stack."""
+    def _replace_layer(self, wrapper, doc, node, bounds, output, target_name: str):
+        """Replace the active layer via duplicate + remove so it stays a single layer
+        while remaining in Krita's native undo history (2x Ctrl+Z to undo)."""
         duplicate = node.duplicate()
         if duplicate is None:
             raise RuntimeError("无法复制目标图层。")
         try:
             if not duplicate.setPixelData(QByteArray(output), *bounds):
                 raise RuntimeError("Krita 拒绝写入匹配结果。")
-            duplicate.setName(node.name() + MATCH_LAYER_SUFFIX)
+            duplicate.setName(target_name)
             parent = node.parentNode()
             if parent is None:
                 raise RuntimeError("找不到目标图层的父级。")
-            # This is the undo command; the pixels are already in the node, so
-            # redo re-inserts the finished layer instead of recomputing it.
             parent.addChildNode(duplicate, node)
+            node.remove()
+            doc.setActiveNode(duplicate)
         except Exception:
-            duplicate.remove()  # detached, so this is a no-op, but keeps it tidy
+            duplicate.remove()
             raise
         doc.refreshProjection()
         doc.waitForDone()
@@ -347,9 +343,17 @@ class ManualColorMatch(QObject):
                     start = offset * 4
                     patched[start : start + 4] = original[start : start + 4]
             output = bytes(patched)
-            layer = self._add_match_layer(wrapper, doc, node, bounds, output)
-            self._states[key] = MatchLayer(layer.uniqueId())
-            log.info("Matched paint layer into %s", layer.name())
+            original_name = node.name()
+            new_name = (
+                original_name
+                if original_name.startswith(MATCH_LAYER_PREFIX)
+                else f"{MATCH_LAYER_PREFIX}{original_name}"
+            )
+            layer = self._replace_layer(wrapper, doc, node, bounds, output, new_name)
+            self._states[uid(layer)] = MatchSnapshot(
+                bounds=bounds, original=original, original_name=original_name
+            )
+            log.info("Matched paint layer in-place: %s", layer.name())
         except asyncio.CancelledError:
             pass
         except Exception as error:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from textwrap import wrap as wrap_text
 from typing import ClassVar, cast
 
@@ -46,6 +47,7 @@ from PyQt5.QtWidgets import (
 
 from ..backend.api import InpaintContext
 from ..backend.nai_focused import MIN_CONTEXT_MAX, MIN_CONTEXT_MIN
+from ..backend.nai_workflow import compute_nai_tile_layout
 from ..backend.resources import Arch, ControlMode
 from ..backend.workflow import FillMode, InpaintMode
 from ..document import FOCUS_BOX_LAYER_NAME, SELECTION_PAINT_LAYER_NAME
@@ -72,6 +74,15 @@ from .widget import (
     WorkspaceSelectWidget,
     create_wide_tool_button,
 )
+
+
+@dataclass
+class _TiledGroupUI:
+    bar_item: QListWidgetItem
+    toggle_button: QPushButton
+    total: int
+    collapsed: bool = True
+    thumb_items: list[QListWidgetItem] = field(default_factory=list)
 
 
 class HistoryWidget(QListWidget):
@@ -102,6 +113,7 @@ class HistoryWidget(QListWidget):
         super().__init__(parent)
         self._model = root.active_model
         self._connections = []
+        self._tiled_groups: dict[str, _TiledGroupUI] = {}
 
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setResizeMode(QListView.Adjust)
@@ -162,6 +174,10 @@ class HistoryWidget(QListWidget):
         scrollbar = self.verticalScrollBar()
         scroll_to_bottom = scrollbar and scrollbar.value() >= scrollbar.maximum() - 4
 
+        if tiled_group := job.params.metadata.get("tiled_group"):
+            self._add_tiled_job(job, tiled_group, scroll_to_bottom)
+            return
+
         if not JobParams.equal_ignore_seed(self._last_job_params, job.params):
             self._last_job_params = job.params
             prompt = job.params.name if job.params.name != "" else "<no prompt>"
@@ -191,6 +207,77 @@ class HistoryWidget(QListWidget):
 
         if scroll_to_bottom:
             self.scrollToBottom()
+
+    def _add_tiled_job(self, job: Job, tiled_group: str, scroll_to_bottom: bool):
+        group = self._tiled_groups.get(tiled_group)
+        if group is None:
+            self._last_job_params = job.params
+            total = int(job.params.metadata.get("tile_count", 1))
+            vp = self.viewport()
+            bar_width = max((vp.width() if vp else 260) - 8, 220)
+            bar_item = QListWidgetItem()
+            bar_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            bar_item.setSizeHint(QSize(bar_width, 28))
+
+            bar = QWidget(self)
+            bar_layout = QHBoxLayout(bar)
+            bar_layout.setContentsMargins(2, 2, 2, 2)
+            bar_layout.setSpacing(4)
+
+            toggle_btn = QPushButton(f"▶ 分块 ({0}/{total})", bar)
+            toggle_btn.setFlat(True)
+            toggle_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            toggle_btn.setStyleSheet("text-align: left; padding: 2px 4px;")
+            apply_btn = QPushButton("一键应用", bar)
+            apply_btn.setToolTip("把已完成的分块无缝合并为 1 个完整图层")
+            match_btn = QPushButton("应用+匹配", bar)
+            match_btn.setToolTip("合并应用后，自动对当前图层执行一次颜色匹配")
+
+            bar_layout.addWidget(toggle_btn, 1)
+            bar_layout.addWidget(apply_btn)
+            bar_layout.addWidget(match_btn)
+
+            self.addItem(bar_item)
+            self.setItemWidget(bar_item, bar)
+
+            group = _TiledGroupUI(bar_item=bar_item, toggle_button=toggle_btn, total=total)
+            self._tiled_groups[tiled_group] = group
+
+            toggle_btn.clicked.connect(lambda: self._toggle_tiled_group(tiled_group))
+            apply_btn.clicked.connect(
+                lambda: self._model.apply_tiled_group(tiled_group, color_match=False)
+            )
+            match_btn.clicked.connect(
+                lambda: self._model.apply_tiled_group(tiled_group, color_match=True)
+            )
+
+        insert_anchor = group.thumb_items[-1] if group.thumb_items else group.bar_item
+        insert_row = self.row(insert_anchor) + 1
+        for i, _img in enumerate(job.results):
+            item = QListWidgetItem(self._image_thumbnail(job, i), None)
+            item.setData(Qt.ItemDataRole.UserRole, job.id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, i)
+            item.setData(Qt.ItemDataRole.ToolTipRole, self._job_info(job.params))
+            self.insertItem(insert_row, item)
+            item.setHidden(group.collapsed)
+            group.thumb_items.append(item)
+            insert_row += 1
+
+        arrow = "▶" if group.collapsed else "▼"
+        group.toggle_button.setText(f"{arrow} 分块图生图 ({len(group.thumb_items)}/{group.total})")
+        if scroll_to_bottom:
+            self.scrollToBottom()
+
+    def _toggle_tiled_group(self, tiled_group: str):
+        group = self._tiled_groups.get(tiled_group)
+        if group is None:
+            return
+        group.collapsed = not group.collapsed
+        for item in group.thumb_items:
+            item.setHidden(group.collapsed)
+        arrow = "▶" if group.collapsed else "▼"
+        group.toggle_button.setText(f"{arrow} 分块图生图 ({len(group.thumb_items)}/{group.total})")
+        self.doItemsLayout()
 
     def _add_item(self, job: Job, item: QListWidgetItem, index=0):
         item.setData(Qt.ItemDataRole.UserRole, job.id)
@@ -357,6 +444,7 @@ class HistoryWidget(QListWidget):
 
     def rebuild(self):
         self.clear()
+        self._tiled_groups.clear()
         for job in filter(self.is_finished, self._model.jobs):
             self.add(job)
         self.scrollToBottom()
@@ -394,6 +482,10 @@ class HistoryWidget(QListWidget):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.update_apply_button()
+        if vp := self.viewport():
+            bar_width = max(vp.width() - 8, 220)
+            for group in self._tiled_groups.values():
+                group.bar_item.setSizeHint(QSize(bar_width, 28))
 
     def event(self, e: QEvent | None):
         assert e is not None
@@ -892,6 +984,22 @@ class GenerationWidget(QWidget):
         strength_layout.addWidget(self.add_region_button)
         layout.addLayout(strength_layout)
 
+        self.auto_crop_row = QWidget(self)
+        self.auto_crop_row.setVisible(False)
+        auto_crop_layout = QHBoxLayout(self.auto_crop_row)
+        auto_crop_layout.setContentsMargins(2, 0, 2, 0)
+        auto_crop_layout.setSpacing(6)
+        self.auto_crop_checkbox = QCheckBox("自动裁切重绘", self.auto_crop_row)
+        self.auto_crop_checkbox.setToolTip(
+            "画布大于 NAI 免费范围时，自动以涂抹蒙版为中心创建最大免费裁切框（居中且按比例调整）。\n"
+            "关闭后将像之前一样整图按目标分辨率缩放再局部重绘。"
+        )
+        self.auto_crop_hint = QLabel("画布大于免费范围，自动居中裁切", self.auto_crop_row)
+        self.auto_crop_hint.setStyleSheet(f"color: {theme.grey};")
+        auto_crop_layout.addWidget(self.auto_crop_checkbox)
+        auto_crop_layout.addWidget(self.auto_crop_hint, 1)
+        layout.addWidget(self.auto_crop_row)
+
         # Revealed by the focus button: how much surrounding context is included in
         # the crop, plus a readout of the resolution the crop will be sent at.
         self.focus_options = QWidget(self)
@@ -977,7 +1085,10 @@ class GenerationWidget(QWidget):
         self._update_target_resolution()
 
     def _update_target_resolution(self):
-        source = "裁切框" if self.model.nai_cropped_inpaint else "当前图像来源"
+        use_crop = self.model.nai_cropped_inpaint or (
+            self.model.is_auto_crop_active and self.model.nai_auto_crop_bounds is not None
+        )
+        source = "裁切框" if use_crop else "当前图像来源"
         self.target_resolution_adapt.setToolTip(f"按{source}的比例适配目标分辨率")
         # The model normalizes to the 64px grid, so echo back what it actually took.
         blocked = (
@@ -1025,6 +1136,8 @@ class GenerationWidget(QWidget):
             doc.start_selection_painting()
         else:
             doc.discard_selection_painting()
+        self._model.sync_auto_crop_box(force=True)
+        self.update_generate_options()
 
     def _update_overlay_buttons(self):
         """Both overlays are owned by their layer, so deleting a layer in the
@@ -1035,8 +1148,10 @@ class GenerationWidget(QWidget):
             model.nai_focused_inpaint = False
         if model.nai_cropped_inpaint and model.document.focus_box_layer is None:
             model.nai_cropped_inpaint = False
+        model.sync_auto_crop_box()
         self._sync_selection_paint_button(model)
         self._sync_focus_inpaint_button()
+        self.update_generate_options()
 
     def _toggle_manual_color_match(self, checked=False):
         self._model.manual_color_match.toggle(checked)
@@ -1090,11 +1205,16 @@ class GenerationWidget(QWidget):
                 model.style_changed.connect(self.update_generate_options),
                 model.edit_mode_changed.connect(self.update_generate_options),
                 bind(model, "nai_min_context", self.min_context_slider, "value"),
+                bind_toggle(model, "nai_auto_crop_inpaint", self.auto_crop_checkbox),
                 model.nai_target_width_changed.connect(self._update_target_resolution),
                 model.nai_target_height_changed.connect(self._update_target_resolution),
                 model.nai_focused_inpaint_changed.connect(self._sync_focus_inpaint_button),
                 model.nai_cropped_inpaint_changed.connect(self._sync_focus_inpaint_button),
                 model.nai_cropped_inpaint_changed.connect(self.update_generate_options),
+                model.nai_auto_crop_inpaint_changed.connect(self.update_generate_options),
+                model.nai_auto_crop_bounds_changed.connect(self.update_generate_options),
+                model.nai_auto_crop_bounds_changed.connect(self._update_target_resolution),
+                model.document.extent_changed.connect(self.update_generate_options),
                 model.nai_focus_geometry_changed.connect(self._update_focus_options),
                 model.nai_min_context_changed.connect(self._update_focus_options),
                 self.target_resolution_adapt.clicked.connect(model.adapt_nai_target_resolution),
@@ -1259,7 +1379,13 @@ class GenerationWidget(QWidget):
             control.is_active and control.mode is ControlMode.nai_base
             for control in self.model.active_regions.control
         )
-        self.strength_slider.setEnabled(not is_img2img)
+        is_tiled_img2img = arch is Arch.nai and any(
+            control.is_active and control.mode is ControlMode.nai_tiled_img2img
+            for control in self.model.active_regions.control
+        )
+        self.strength_slider.setEnabled(not is_img2img and not is_tiled_img2img)
+        self.target_resolution_row.setEnabled(not is_tiled_img2img)
+        self.auto_crop_row.setVisible(self.model.is_auto_crop_eligible)
 
         regions = self.model.active_regions
         self.region_prompt.regions = regions
@@ -1320,7 +1446,13 @@ class GenerationWidget(QWidget):
 
         if is_img2img:
             text = "图生图"
-        elif arch is Arch.nai and self.model.nai_cropped_inpaint:
+        elif is_tiled_img2img:
+            tile_count = len(compute_nai_tile_layout(self.model.document.extent))
+            text = f"分块图生图 ({tile_count}块)"
+        elif arch is Arch.nai and (
+            self.model.nai_cropped_inpaint
+            or (self.model.is_auto_crop_active and self.model.nai_auto_crop_bounds is not None)
+        ):
             text = "裁切重绘"
         self.generate_button.operation = text
         self.generate_button.setIcon(theme.icon(icon))

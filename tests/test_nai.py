@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from PyQt5.QtCore import Qt
 
 from ai_diffusion.backend.api import (
@@ -42,6 +43,7 @@ from ai_diffusion.backend.nai_workflow import (
     nai_auto_resolution,
     nai_edit_resolution,
     nai_resolution,
+    prepare_nai_precise_reference_image,
 )
 from ai_diffusion.backend.resources import Arch, ControlMode
 from ai_diffusion.image import Bounds, Extent, Image, ImageCollection
@@ -264,7 +266,7 @@ def test_v5_quality_tags_match_the_launch_preset():
         assert semantics.effective_prompt == expected
 
 
-def test_v5_request_boundary_drops_vibe_and_precise_reference_fields():
+def test_v5_request_boundary_drops_vibe_and_sends_precise_reference_fields():
     request = build_request(
         NaiGenerationParams(
             model="nai-diffusion-5-full",
@@ -272,7 +274,7 @@ def test_v5_request_boundary_drops_vibe_and_precise_reference_fields():
             height=1216,
             prompt="test",
             vibes=[VibeReference("encoded-vibe", 0.6, 0.7)],
-            precise_references=[PreciseReference("reference", "character", 0.8, 0.75)],
+            precise_references=[PreciseReference("reference", "character_mainoutfit", 2.5, 0.4)],
         )
     ).request_data
     params = request["parameters"]
@@ -280,8 +282,17 @@ def test_v5_request_boundary_drops_vibe_and_precise_reference_fields():
     assert "reference_image_multiple" not in params
     assert "reference_strength_multiple" not in params
     assert "reference_information_extracted_multiple" not in params
-    assert "director_reference_images" not in params
-    assert "director_reference_descriptions" not in params
+    assert params["director_reference_images"] == ["reference"]
+    assert params["director_reference_descriptions"] == [
+        {
+            "caption": {"base_caption": "character_mainoutfit", "char_captions": []},
+            "legacy_uc": False,
+        }
+    ]
+    assert params["director_reference_information_extracted"] == [1]
+    assert params["director_reference_strength_values"] == [2.5]
+    # V5 does not expose fidelity and forces fidelity=1.0 -> secondary strength 0.0
+    assert params["director_reference_secondary_strength_values"] == [0.0]
 
 
 @qtapp
@@ -529,6 +540,116 @@ def test_precise_reference_is_dropped_for_v4_and_drops_vibe_when_active():
     assert "director_reference_images" not in v4_params
     assert "director_reference_images" in mixed_params
     assert "reference_image_multiple" not in mixed_params
+
+
+def test_precise_reference_v5_modes_strength_and_bucketing():
+    ref = Image.create(Extent(320, 512))
+    ctrls = [
+        ControlInput(
+            ControlMode.nai_precise_character, ref, strength=1.0, prefer_same_outfit=False
+        ),
+        ControlInput(ControlMode.nai_precise_character, ref, strength=2.5, prefer_same_outfit=True),
+        ControlInput(
+            ControlMode.nai_precise_character_style,
+            ref,
+            strength=6.0,
+            param2=0.25,
+            prefer_same_outfit=True,
+        ),
+        ControlInput(
+            ControlMode.nai_precise_character_style, ref, strength=0.8, prefer_same_outfit=False
+        ),
+        ControlInput(ControlMode.nai_precise_outfit, ref, strength=1.5),
+    ]
+
+    params = convert_workflow(_workflow(*ctrls, checkpoint="nai-diffusion-5-full")).request[
+        "parameters"
+    ]
+
+    assert [d["caption"]["base_caption"] for d in params["director_reference_descriptions"]] == [
+        "character",
+        "character_mainoutfit",
+        "character&style",
+        "character&style_anyoutfit",
+        "costume",
+    ]
+    assert params["director_reference_strength_values"] == [1.0, 2.5, 5.0, 0.8, 1.5]
+    assert params["director_reference_secondary_strength_values"] == [0.0] * 5
+    # 320x512 picks log-closest V5 bucket 768x1280 rather than V4.5's 1024x1536 black-padded canvas
+    assert Image.from_base64(params["director_reference_images"][0]).extent == Extent(768, 1280)
+    assert prepare_nai_precise_reference_image(
+        Image.create(Extent(500, 500)), bucket=True
+    ).extent == Extent(1024, 1024)
+    bucketed_exact = Image.create(Extent(1024, 1024))
+    assert prepare_nai_precise_reference_image(bucketed_exact, bucket=True) is bucketed_exact
+
+    # Serialization round-trip preserves False vs True vs None on prefer_same_outfit
+    work = _workflow(*ctrls, checkpoint="nai-diffusion-5-full")
+    roundtrip = WorkflowInput.from_dict(work.to_dict())
+    assert [c.prefer_same_outfit for c in roundtrip.conditioning.control] == [  # type: ignore[union-attr]
+        False,
+        True,
+        True,
+        False,
+        None,
+    ]
+
+
+def test_precise_reference_v5_inpaint_and_v45_downgrades():
+    ref = Image.create(Extent(320, 512))
+    source = Image.create(Extent(1024, 1024))
+
+    # V5 drops precise references on inpaint (charRefInpainting=False)
+    v5_inpaint = _workflow(
+        ControlInput(ControlMode.nai_precise_outfit, ref, strength=1.5),
+        checkpoint="nai-diffusion-5-full",
+    )
+    v5_inpaint.kind = WorkflowKind.inpaint
+    v5_inpaint.images = ImageInput.from_extent(source.extent)
+    v5_inpaint.images.initial_image = source
+    v5_inpaint.images.hires_mask = Image.create(source.extent)
+    v5_inpaint_params = convert_workflow(v5_inpaint).request["parameters"]
+    assert "director_reference_images" not in v5_inpaint_params
+
+    # V4.5 keeps inpaint, drops outfit, downgrades *_mainoutfit/*_anyoutfit, and clamps strength <= 1.0
+    v45_inpaint = _workflow(
+        ControlInput(ControlMode.nai_precise_outfit, ref, strength=1.5),
+        ControlInput(
+            ControlMode.nai_precise_character,
+            ref,
+            strength=2.0,
+            param2=0.6,
+            prefer_same_outfit=True,
+        ),
+        ControlInput(
+            ControlMode.nai_precise_character_style,
+            ref,
+            strength=0.7,
+            param2=0.8,
+            prefer_same_outfit=False,
+        ),
+        checkpoint="nai-diffusion-4-5-full",
+    )
+    v45_inpaint.kind = WorkflowKind.inpaint
+    v45_inpaint.images = ImageInput.from_extent(source.extent)
+    v45_inpaint.images.initial_image = source
+    v45_inpaint.images.hires_mask = Image.create(source.extent)
+    v45_params = convert_workflow(v45_inpaint).request["parameters"]
+
+    assert [
+        d["caption"]["base_caption"] for d in v45_params["director_reference_descriptions"]
+    ] == [
+        "character",
+        "character&style",
+    ]
+    assert v45_params["director_reference_strength_values"] == [1.0, 0.7]
+    assert v45_params["director_reference_secondary_strength_values"] == [
+        pytest.approx(0.4),
+        pytest.approx(0.2),
+    ]
+    assert Image.from_base64(v45_params["director_reference_images"][0]).extent == Extent(
+        1024, 1536
+    )
 
 
 def test_vibe_request_fields_when_precise_reference_is_absent():
@@ -821,3 +942,88 @@ def test_ddim_is_coerced_on_models_that_cannot_run_it():
         ).request_data["parameters"]["sampler"]
         == "k_dpmpp_2m"
     )
+
+
+def test_compute_auto_crop_bounds_centered_and_proportional():
+    from ai_diffusion.backend.nai_workflow import (
+        NAI_FREE_PIXELS,
+        compute_auto_crop_bounds,
+    )
+
+    canvas = Extent(4096, 2390)
+
+    # Square-ish painted mask -> 1024x1024 crop box, mask centered inside
+    sq_mask = Bounds(800, 400, 500, 500)
+    sq_box = compute_auto_crop_bounds(canvas, sq_mask)
+    assert sq_box.width == 1024 and sq_box.height == 1024
+    assert sq_box.width * sq_box.height <= NAI_FREE_PIXELS
+    left_margin = sq_mask.x - sq_box.x
+    right_margin = (sq_box.x + sq_box.width) - (sq_mask.x + sq_mask.width)
+    top_margin = sq_mask.y - sq_box.y
+    bottom_margin = (sq_box.y + sq_box.height) - (sq_mask.y + sq_mask.height)
+    assert abs(left_margin - right_margin) <= 1
+    assert abs(top_margin - bottom_margin) <= 1
+
+    # Wide mask -> landscape crop box within free pixel limit
+    wide_mask = Bounds(1200, 1000, 900, 300)
+    wide_box = compute_auto_crop_bounds(canvas, wide_mask)
+    assert wide_box.width > wide_box.height
+    assert wide_box.width * wide_box.height <= NAI_FREE_PIXELS
+    assert (
+        wide_box.x <= wide_mask.x and wide_box.x + wide_box.width >= wide_mask.x + wide_mask.width
+    )
+
+    # Tall mask -> portrait crop box within free pixel limit
+    tall_mask = Bounds(1500, 600, 300, 900)
+    tall_box = compute_auto_crop_bounds(canvas, tall_mask)
+    assert tall_box.height > tall_box.width
+    assert tall_box.width * tall_box.height <= NAI_FREE_PIXELS
+    assert (
+        tall_box.y <= tall_mask.y and tall_box.y + tall_box.height >= tall_mask.y + tall_mask.height
+    )
+
+
+def test_compute_nai_tile_layout_and_blend():
+    from PyQt5.QtGui import QColor
+
+    from ai_diffusion.backend.nai_workflow import (
+        NAI_FREE_PIXELS,
+        blend_nai_tiles,
+        compute_nai_tile_layout,
+    )
+
+    # Small canvas fits in 1 tile
+    small = compute_nai_tile_layout(Extent(1024, 1024))
+    assert len(small) == 1
+    assert small[0].bounds == Bounds(0, 0, 1024, 1024)
+
+    # Large canvas: minimal evenly-sized tiles with ~10% overlap
+    for canvas in (Extent(2048, 2048), Extent(4096, 2390), Extent(3000, 4000)):
+        tiles = compute_nai_tile_layout(canvas, overlap_ratio=0.10)
+        assert len(tiles) > 1
+        widths = {t.bounds.width for t in tiles}
+        heights = {t.bounds.height for t in tiles}
+        assert len(widths) == 1 and len(heights) == 1
+        for t in tiles:
+            assert t.bounds.width * t.bounds.height <= NAI_FREE_PIXELS
+            assert t.target_extent.pixel_count <= NAI_FREE_PIXELS
+
+        # Verify full canvas coverage and >= ~10% overlap between neighbors
+        xs = sorted({t.bounds.x for t in tiles})
+        ys = sorted({t.bounds.y for t in tiles})
+        assert xs[0] == 0 and xs[-1] + tiles[0].bounds.width == canvas.width
+        assert ys[0] == 0 and ys[-1] + tiles[0].bounds.height == canvas.height
+        for i in range(len(xs) - 1):
+            overlap_x = xs[i] + tiles[0].bounds.width - xs[i + 1]
+            assert overlap_x >= tiles[0].bounds.width * 0.09
+        for i in range(len(ys) - 1):
+            overlap_y = ys[i] + tiles[0].bounds.height - ys[i + 1]
+            assert overlap_y >= tiles[0].bounds.height * 0.09
+
+    # Blend test: solid color tiles produce uniform canvas
+    canvas = Extent(2048, 2048)
+    tiles = compute_nai_tile_layout(canvas)
+    imgs = [Image.create(t.target_extent, QColor(120, 180, 220)) for t in tiles]
+    merged = blend_nai_tiles(canvas, tiles, imgs)
+    assert merged.extent == canvas
+    assert merged.pixel(1024, 1024) == (120, 180, 220, 255)

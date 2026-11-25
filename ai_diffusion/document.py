@@ -101,7 +101,12 @@ class Document(QObject):
     def discard_selection_painting(self):
         """Delete the painted mask overlay (see KritaDocument). No-op by default."""
 
-    def start_focus_box(self, bounds: Bounds, name: str = FOCUS_BOX_LAYER_NAME):
+    def selection_paint_bounds(self) -> Bounds | None:
+        return None
+
+    def start_focus_box(
+        self, bounds: Bounds, name: str = FOCUS_BOX_LAYER_NAME, activate: bool = True
+    ):
         """Create/show the focus box overlay (see KritaDocument). No-op by default."""
 
     def hide_focus_box(self):
@@ -308,6 +313,44 @@ class KritaDocument(Document):
             return None
         alpha = data[3::4]  # BGRA
         return alpha if any(alpha) else None  # painted, then fully erased -> no mask
+
+    def selection_paint_bounds(self) -> Bounds | None:
+        """Exact bounding box of non-transparent pixels on the paint overlay, in canvas coordinates."""
+        from .util import client_logger as log
+
+        layer = self.selection_paint_layer
+        if layer is None or layer.bounds.is_zero:
+            return None
+        lb = Bounds.intersection(layer.bounds, Bounds.from_extent(self.extent))
+        if lb.is_zero:
+            return None
+        try:
+            data = bytes(layer.node.pixelData(lb.x, lb.y, lb.width, lb.height))
+        except Exception as e:
+            log.warning(f"selection paint: failed to read paint bounds: {e}")
+            return None
+        alpha = data[3::4]
+        if not any(alpha):
+            return None
+        w, h = lb.width, lb.height
+        min_x, max_x = w, -1
+        min_y, max_y = h, -1
+        for row in range(h):
+            row_bytes = alpha[row * w : (row + 1) * w]
+            if any(row_bytes):
+                min_y = min(min_y, row)
+                max_y = max(max_y, row)
+                for col, val in enumerate(row_bytes):
+                    if val:
+                        min_x = min(min_x, col)
+                        break
+                for col in range(w - 1, -1, -1):
+                    if row_bytes[col]:
+                        max_x = max(max_x, col)
+                        break
+        if max_x < min_x or max_y < min_y:
+            return None
+        return Bounds(lb.x + min_x, lb.y + min_y, max_x - min_x + 1, max_y - min_y + 1)
 
     def _selection_from_paint_layer(self):
         """Build a Krita selection from the overlay layer's alpha channel."""
@@ -531,26 +574,35 @@ class KritaDocument(Document):
         node.addShapesFromSvg(self._focus_box_svg(bounds))
         layer.refresh()
 
-    def start_focus_box(self, bounds: Bounds, name: str = FOCUS_BOX_LAYER_NAME):
-        """Show the focus box and hand it to Krita's shape tool to be dragged."""
+    def start_focus_box(
+        self, bounds: Bounds, name: str = FOCUS_BOX_LAYER_NAME, activate: bool = True
+    ):
+        """Show the focus box and optionally hand it to Krita's shape tool to be dragged."""
         from .util import client_logger as log
 
+        prev_active = None if activate else self._doc.activeNode()
         layer = self.focus_box_layer
         if layer is None:
             layer = self._layers.create_vector(name, self._focus_box_svg(bounds))
             self._focus_box_layer_id = layer.id
         else:
             layer.name = name
+            self.set_focus_box_bounds(bounds)
             layer.show()
-        layer.move_to_top()
-        self._doc.setActiveNode(layer.node)
-        self._doc.refreshProjection()
-        # The shape tool is what actually moves and scales the box, and it only
-        # acts on the active layer — which is why the box layer is activated here.
-        if tool := Krita.instance().action("InteractionTool"):
-            tool.trigger()
+        if activate:
+            layer.move_to_top()
+            self._doc.setActiveNode(layer.node)
+            self._doc.refreshProjection()
+            # The shape tool is what actually moves and scales the box, and it only
+            # acts on the active layer — which is why the box layer is activated here.
+            if tool := Krita.instance().action("InteractionTool"):
+                tool.trigger()
+            else:
+                log.warning("focus box: shape selection tool not found")
         else:
-            log.warning("focus box: shape selection tool not found")
+            if prev_active is not None:
+                self._doc.setActiveNode(prev_active)
+            self._doc.refreshProjection()
 
     def hide_focus_box(self):
         """Hide the box without deleting it — it stays in effect while hidden."""

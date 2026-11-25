@@ -44,6 +44,7 @@ class ControlLayer(QObject, ObservableProperties):
     # Secondary parameter for NAI modes, in percent (0-100): vibe "information
     # extracted" (default 70) or precise-reference "fidelity" (default 100).
     param2 = Property(100, persist=True)
+    prefer_same_outfit = Property(False, persist=True)
     use_custom_strength = Property(False, persist=True, setter="set_use_custom_strength")
     is_supported = Property(True)
     is_pose_vector = Property(False)
@@ -63,6 +64,7 @@ class ControlLayer(QObject, ObservableProperties):
     start_changed = pyqtSignal(float)
     end_changed = pyqtSignal(float)
     param2_changed = pyqtSignal(int)
+    prefer_same_outfit_changed = pyqtSignal(bool)
     use_custom_strength_changed = pyqtSignal(bool)
     is_supported_changed = pyqtSignal(bool)
     is_pose_vector_changed = pyqtSignal(bool)
@@ -105,6 +107,16 @@ class ControlLayer(QObject, ObservableProperties):
         return self._model
 
     @property
+    def nai_model(self) -> NaiModel | None:
+        style = getattr(self._model, "style", None)
+        checkpoints = style.checkpoints if style else []
+        checkpoint = checkpoints[0] if checkpoints else ""
+        try:
+            return NaiModel(checkpoint)
+        except ValueError:
+            return None
+
+    @property
     def is_active(self):
         return self.enabled and self.group_enabled
 
@@ -134,20 +146,28 @@ class ControlLayer(QObject, ObservableProperties):
                 self.layer_id = self._model.layers.active.id
             if mode is not ControlMode.nai_base and self.is_selection:
                 self.layer_id = QUuid()
+            if mode is ControlMode.nai_tiled_img2img:
+                self.layer_id = QUuid()
             self._mode = mode
             self._sync_selection_bounds_connection()
             self.mode_changed.emit(mode)
             self._update_is_pose_vector()
             if mode.is_nai:
-                # nai_base: param2 = noise (default 0); nai_vibe: information
-                # extracted (default 0.7); precise: fidelity (default 1.0).
+                # nai_base / nai_tiled_img2img: param2 = noise (default 0);
+                # nai_vibe: information extracted (default 0.7); precise: fidelity (default 1.0).
                 if mode is ControlMode.nai_base:
                     self.param2 = 0
                     self._reset_target_resolution()
+                elif mode is ControlMode.nai_tiled_img2img:
+                    self.param2 = 0
                 elif mode is ControlMode.nai_vibe:
                     self.param2 = 70
                 else:
                     self.param2 = 100
+                if mode is ControlMode.nai_precise_character_style:
+                    self.prefer_same_outfit = True
+                elif mode is ControlMode.nai_precise_character:
+                    self.prefer_same_outfit = False
             if not self.use_custom_strength:
                 self._set_values_from_preset()
             self.modified.emit(self, "mode")
@@ -257,7 +277,7 @@ class ControlLayer(QObject, ObservableProperties):
         if self.mode.is_nai:
             # No entries in presets/control.json for NAI modes. Launcher defaults:
             # img2img strength 0.7, vibe strength 0.6, precise-reference 1.0.
-            if self.mode is ControlMode.nai_base:
+            if self.mode in (ControlMode.nai_base, ControlMode.nai_tiled_img2img):
                 default = 0.7
             elif self.mode is ControlMode.nai_vibe:
                 default = 0.6
@@ -313,7 +333,9 @@ class ControlLayer(QObject, ObservableProperties):
             # no line/stencil preprocessing. Whole-canvas (null layer_id) uses the
             # flattened document projection minus control/preview layers.
             doc_bounds = Bounds(0, 0, *self._model.document.extent)
-            if reference is not None:
+            if self.mode is ControlMode.nai_tiled_img2img:
+                image = self._model._get_current_image(doc_bounds)
+            elif reference is not None:
                 image = self._model.nai_references.image(reference.id)
             elif self.is_selection:
                 selection_bounds = self.selection_bounds
@@ -340,10 +362,20 @@ class ControlLayer(QObject, ObservableProperties):
                 if ref_bounds.is_zero:
                     ref_bounds = doc_bounds
                 image = layer.get_pixels(ref_bounds, time)
-            strength = min(self.strength / self.strength_multiplier, 1.0)
+            max_strength = (
+                nai_model.precise_reference_strength_max
+                if (self.mode.is_nai_precise and (nai_model := self.nai_model) is not None)
+                else 1.0
+            )
+            strength = min(self.strength / self.strength_multiplier, max_strength)
             param2 = min(max(self.param2 / 100.0, 0.0), 1.0)
             target = self.target_extent if self.mode is ControlMode.nai_base else None
-            return ControlInput(self.mode, image, strength, (0.0, 1.0), param2, target)
+            prefer_same_outfit = (
+                self.prefer_same_outfit if self.mode.supports_prefer_same_outfit else None
+            )
+            return ControlInput(
+                self.mode, image, strength, (0.0, 1.0), param2, target, prefer_same_outfit
+            )
 
         assert layer is not None, "Control layer has been deleted"
         extent = bounds.extent if bounds else self._model.document.extent
@@ -386,18 +418,19 @@ class ControlLayer(QObject, ObservableProperties):
                     self.error_text = _("Not supported for") + " NovelAI"
                     is_supported = False
                 elif is_nai_arch and self.mode.is_nai:
-                    checkpoints = self._model.style.checkpoints
-                    checkpoint = checkpoints[0] if checkpoints else ""
-                    try:
-                        nai_model = NaiModel(checkpoint)
-                    except ValueError:
-                        nai_model = None
-                    if nai_model is not None and nai_model.is_v5:
-                        if self.mode is ControlMode.nai_vibe:
+                    nai_model = self.nai_model
+                    if nai_model is not None:
+                        if nai_model.is_v5 and self.mode is ControlMode.nai_vibe:
                             self.error_text = _("Vibe Transfer is not available for NAI V5 yet")
                             is_supported = False
-                        elif self.mode.is_nai_precise:
-                            self.error_text = _("Precise Reference is not available for NAI V5 yet")
+                        elif (
+                            self.mode is ControlMode.nai_precise_outfit
+                            and not nai_model.supports_outfit_reference
+                        ):
+                            self.error_text = "服装精准参考仅支持 NAI V5 模型"
+                            is_supported = False
+                        elif self.mode.is_nai_precise and not nai_model.supports_precise_reference:
+                            self.error_text = _("Precise Reference requires NAI V4.5 or V5")
                             is_supported = False
                 if is_supported and self._index >= client.features.max_control_layers:
                     self.error_text = _("Too many control layers")
@@ -531,7 +564,10 @@ class ControlLayerList(QObject):
         return [layer for layer in self._layers if layer.group_id == control.group_id]
 
     def add_related(self, control: ControlLayer):
-        if control not in self._layers or control.mode is ControlMode.nai_base:
+        if control not in self._layers or control.mode in (
+            ControlMode.nai_base,
+            ControlMode.nai_tiled_img2img,
+        ):
             return None
         if control.group_id.isNull():
             control.group_id = QUuid.createUuid()
@@ -547,6 +583,7 @@ class ControlLayerList(QObject):
             "start",
             "end",
             "param2",
+            "prefer_same_outfit",
         ):
             setattr(related, name, getattr(control, name))
         control.group_expanded = True
@@ -765,6 +802,8 @@ control_mode_text = {
     ControlMode.nai_precise_character: "精准参考-角色",
     ControlMode.nai_precise_style: "精准参考-风格",
     ControlMode.nai_precise_character_style: "精准参考-角色&风格",
+    ControlMode.nai_precise_outfit: "精准参考-服装",
+    ControlMode.nai_tiled_img2img: "分块图生图 (大画布)",
 }
 
 

@@ -5,9 +5,9 @@ from PyQt5.QtCore import QObject, QPoint, QRect, QUuid
 
 from ai_diffusion.image import Bounds
 from ai_diffusion.model.manual_color_match import (
-    MATCH_LAYER_SUFFIX,
+    MATCH_LAYER_PREFIX,
     ManualColorMatch,
-    MatchLayer,
+    MatchSnapshot,
     eligibility,
     path_to,
 )
@@ -76,6 +76,9 @@ class Node:
 
 
 class Doc:
+    def __init__(self):
+        self.active = None
+
     def width(self):
         return 1
 
@@ -103,6 +106,9 @@ class Doc:
     def setModified(self, value):
         pass
 
+    def setActiveNode(self, node):
+        self.active = node
+
 
 def test_initialization_without_handoff_placeholder():
     model = Model()
@@ -126,21 +132,17 @@ def test_supported_layer_and_path():
     assert path_to(node, "missing") is None
 
 
-def test_match_layer_is_looked_up_by_id():
+def test_match_snapshot_is_looked_up_by_node_uid():
     model = Model()
-    layer = object()
-    match_id = QUuid.createUuid()
-    finder = SimpleNamespace(find=lambda i: layer if i == match_id else None)
-    finder.updated = lambda: finder
-    model.document = SimpleNamespace(layers=finder)
     controller = ManualColorMatch(model)
     controller._timer.stop()
 
     node = Node()
-    controller._states[node.uniqueId().toString()] = MatchLayer(match_id)
+    snap = MatchSnapshot(Bounds(0, 0, 1, 1), node.data, "ink")
+    controller._states[node.uniqueId().toString()] = snap
 
-    assert controller._match_layer(model, node) is layer
-    assert controller._match_layer(model, Node()) is None
+    assert controller._match_snapshot(node) is snap
+    assert controller._match_snapshot(Node()) is None
 
 
 class CloneNode:
@@ -181,7 +183,7 @@ class CloneNode:
         return False
 
 
-def test_add_match_layer_clones_the_source_and_sets_the_pixels():
+def test_replace_layer_replaces_source_with_prefixed_clone_and_restores():
     model = Model()
     controller = ManualColorMatch(model)
     controller._timer.stop()
@@ -193,11 +195,21 @@ def test_add_match_layer_clones_the_source_and_sets_the_pixels():
     doc = Doc()
 
     output = bytes([1, 2, 3, 255])
-    layer = controller._add_match_layer(wrapper, doc, source, Bounds(0, 0, 1, 1), output)
+    layer = controller._replace_layer(
+        wrapper, doc, source, Bounds(0, 0, 1, 1), output, f"{MATCH_LAYER_PREFIX}ink"
+    )
 
-    # Inserted directly above the source, named after it, carrying the new pixels.
-    assert parent.children == [source, layer]
-    assert layer.name() == "ink" + MATCH_LAYER_SUFFIX
+    assert parent.children == [layer]
+    assert layer.name() == f"{MATCH_LAYER_PREFIX}ink"
     assert layer.data == output
-    # The source is untouched, which is what makes Ctrl+Z a pure layer removal.
+    assert doc.active is layer
     assert source.data == bytes([20, 30, 40, 255])
+
+    restored = controller._replace_layer(
+        wrapper, doc, layer, Bounds(0, 0, 1, 1), source.data, "ink"
+    )
+
+    assert parent.children == [restored]
+    assert restored.name() == "ink"
+    assert restored.data == source.data
+    assert doc.active is restored

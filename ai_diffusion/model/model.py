@@ -49,6 +49,10 @@ from ..backend.nai_focused import (
     resolve_geometry,
 )
 from ..backend.nai_workflow import (
+    NAI_FREE_PIXELS,
+    compute_auto_crop_bounds,
+    compute_nai_tile_layout,
+    feather_tile_edges,
     nai_auto_resolution,
     nai_edit_resolution,
     nai_free_resolution,
@@ -64,7 +68,7 @@ from ..document import (
     SelectionModifiers,
 )
 from ..files import FileLibrary
-from ..image import BlendMode, Bounds, DummyImage, Extent, Image, Mask
+from ..image import BlendMode, Bounds, DummyImage, Extent, Image, ImageCollection, Mask
 from ..layer import Layer, LayerType, RestoreActiveLayer
 from ..localization import translate as _
 from ..pose import Pose
@@ -166,6 +170,7 @@ class DocumentModel(QObject, ObservableProperties):
     nai_target_height = Property(1024, persist=True, setter="set_nai_target_height")
     nai_focused_inpaint = Property(False, persist=True, setter="set_nai_focused_inpaint")
     nai_cropped_inpaint = Property(False, persist=True, setter="set_nai_cropped_inpaint")
+    nai_auto_crop_inpaint = Property(True, persist=True, setter="set_nai_auto_crop_inpaint")
     nai_min_context = Property(MIN_CONTEXT_DEFAULT, persist=True, setter="set_nai_min_context")
     # [x, y, width, height] in document pixels, empty when there is no box. Stored
     # as a list because the persistence layer round-trips plain JSON types only.
@@ -190,6 +195,8 @@ class DocumentModel(QObject, ObservableProperties):
     nai_target_height_changed = pyqtSignal(int)
     nai_focused_inpaint_changed = pyqtSignal(bool)
     nai_cropped_inpaint_changed = pyqtSignal(bool)
+    nai_auto_crop_inpaint_changed = pyqtSignal(bool)
+    nai_auto_crop_bounds_changed = pyqtSignal(object)
     nai_min_context_changed = pyqtSignal(int)
     nai_focus_box_value_changed = pyqtSignal(list)
     nai_focus_geometry_changed = pyqtSignal(object)  # FocusedGeometry | None
@@ -223,6 +230,12 @@ class DocumentModel(QObject, ObservableProperties):
         self._nai_focus_timer = QTimer(self)
         self._nai_focus_timer.setInterval(200)
         self._nai_focus_timer.timeout.connect(self._poll_nai_focus_box)
+
+        self._auto_crop_bounds: Bounds | None = None
+        self._nai_auto_crop_timer = QTimer(self)
+        self._nai_auto_crop_timer.setInterval(300)
+        self._nai_auto_crop_timer.timeout.connect(self.sync_auto_crop_box)
+        self._nai_auto_crop_timer.start()
 
         self.jobs.selection_changed.connect(self.update_preview)
         self._nai_extent_connection: QMetaObject.Connection | None = None
@@ -277,6 +290,17 @@ class DocumentModel(QObject, ObservableProperties):
             None,
         )
 
+    def _nai_tiled_control(self):
+        """The tiled img2img control layer, if one is active."""
+        return next(
+            (
+                c
+                for c in self.active_regions.control
+                if c.is_active and c.mode is ControlMode.nai_tiled_img2img
+            ),
+            None,
+        )
+
     def _nai_source_extent(self):
         # Whatever is actually sent decides the target's shape. Normally that is
         # the canvas -- tying it to the selection would stretch the canvas into
@@ -287,6 +311,8 @@ class DocumentModel(QObject, ObservableProperties):
         if self.nai_cropped_inpaint:
             crop = self.nai_crop_bounds
             return crop.extent if crop is not None else Extent(0, 0)
+        if self.is_auto_crop_active and self._auto_crop_bounds is not None:
+            return self._auto_crop_bounds.extent
         if control := self._nai_base_control():
             return control.source_extent
         return self._doc.extent
@@ -349,9 +375,74 @@ class DocumentModel(QObject, ObservableProperties):
         Free means total pixels <= 1024*1024 (with <= 28 steps) — not a per-side
         limit, so 1920x512 qualifies just as 1024x1024 does.
         """
-        source = self._nai_source_extent() if self.nai_cropped_inpaint else self.nai_target_extent
+        use_source = self.nai_cropped_inpaint or (
+            self.is_auto_crop_active and self._auto_crop_bounds is not None
+        )
+        source = self._nai_source_extent() if use_source else self.nai_target_extent
         if min(source) > 0:
             self.set_nai_target_extent(nai_free_resolution(source))
+
+    @property
+    def is_auto_crop_eligible(self) -> bool:
+        """True when painting an inpaint mask on a >1MP NAI canvas without manual crop/selection/img2img."""
+        return (
+            self.arch is Arch.nai
+            and self._doc.is_valid
+            and self._doc.extent.pixel_count > NAI_FREE_PIXELS
+            and not self.nai_cropped_inpaint
+            and not self.nai_focused_inpaint
+            and self._doc.selection_paint_layer is not None
+            and self._doc.selection_bounds is None
+            and self._nai_base_control() is None
+            and self._nai_tiled_control() is None
+        )
+
+    @property
+    def is_auto_crop_active(self) -> bool:
+        return self.is_auto_crop_eligible and self.nai_auto_crop_inpaint
+
+    @property
+    def nai_auto_crop_bounds(self) -> Bounds | None:
+        return self._auto_crop_bounds
+
+    def set_nai_auto_crop_inpaint(self, enabled: bool):
+        if enabled == self._nai_auto_crop_inpaint:
+            return
+        self._nai_auto_crop_inpaint = enabled
+        self.nai_auto_crop_inpaint_changed.emit(enabled)
+        self.modified.emit(self, "nai_auto_crop_inpaint")
+        self.sync_auto_crop_box(force=True)
+
+    def sync_auto_crop_box(self, force: bool = False):
+        if not self._doc.is_valid:
+            return
+        if not self.is_auto_crop_active:
+            if self._auto_crop_bounds is not None:
+                self._auto_crop_bounds = None
+                if not self.nai_cropped_inpaint and not self.nai_focused_inpaint:
+                    self._doc.stop_focus_box()
+                self.reset_nai_target_resolution()
+                self.nai_auto_crop_bounds_changed.emit(None)
+            return
+
+        if not force and QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            return
+
+        paint_bounds = self._doc.selection_paint_bounds()
+        if paint_bounds is None:
+            if self._auto_crop_bounds is not None:
+                self._auto_crop_bounds = None
+                self._doc.stop_focus_box()
+                self.reset_nai_target_resolution()
+                self.nai_auto_crop_bounds_changed.emit(None)
+            return
+
+        target_box = compute_auto_crop_bounds(self._doc.extent, paint_bounds)
+        if target_box != self._auto_crop_bounds or self._doc.focus_box_layer is None:
+            self._doc.start_focus_box(target_box, CROP_BOX_LAYER_NAME, activate=False)
+            self._auto_crop_bounds = target_box
+            self.reset_nai_target_resolution()
+            self.nai_auto_crop_bounds_changed.emit(target_box)
 
     def set_nai_focused_inpaint(self, enabled: bool):
         """Turning this on creates the box layer; turning it off deletes it."""
@@ -523,20 +614,85 @@ class DocumentModel(QObject, ObservableProperties):
             self.report_error(util.log_error(e))
             return
         self.clear_error()
-        jobs = self.enqueue_jobs(
-            input, JobKind.diffusion, job_params, cond_orig, self.batch_count, queue_mode
+        tiled_ctrl = (
+            next(
+                (
+                    c
+                    for c in input.conditioning.control
+                    if c.mode is ControlMode.nai_tiled_img2img and c.image is not None
+                ),
+                None,
+            )
+            if input.conditioning is not None
+            else None
         )
+        if tiled_ctrl is not None:
+            jobs = self._enqueue_tiled_jobs(input, tiled_ctrl, job_params, cond_orig, queue_mode)
+        else:
+            jobs = self.enqueue_jobs(
+                input, JobKind.diffusion, job_params, cond_orig, self.batch_count, queue_mode
+            )
         # The overlays have done their job for this run: get them out of the way,
         # but keep them, so the mask and the box still apply to the next one.
         self._doc.stop_selection_painting()
         self._doc.hide_focus_box()
         eventloop.run(_report_errors(self, jobs))
 
+    async def _enqueue_tiled_jobs(
+        self,
+        input: WorkflowInput,
+        tiled_ctrl: ControlInput,
+        job_params: JobParams,
+        cond_orig: ConditioningInput,
+        queue_mode: QueueMode,
+    ):
+        cond = ensure(input.conditioning)
+        source_image = ensure(tiled_ctrl.image)
+        tiles = compute_nai_tile_layout(source_image.extent)
+        tiled_group = str(uuid.uuid4())
+        for idx, tile in enumerate(tiles):
+            tile_crop = Image.crop(source_image, tile.bounds)
+            new_controls = [
+                ControlInput(
+                    ControlMode.nai_base,
+                    tile_crop,
+                    tiled_ctrl.strength,
+                    (0.0, 1.0),
+                    tiled_ctrl.param2,
+                    tile.target_extent,
+                )
+                if c is tiled_ctrl
+                else c
+                for c in cond.control
+            ]
+            tile_input = replace(
+                input,
+                conditioning=replace(cond, control=new_controls),
+                nai_target_extent=tile.target_extent,
+            )
+            tile_params = copy(job_params)
+            tile_params.bounds = tile.bounds
+            tile_params.metadata = job_params.metadata | {
+                "tiled_group": tiled_group,
+                "tile_index": idx,
+                "tile_count": len(tiles),
+                "tile_overlap": (tile.overlap_left, tile.overlap_top),
+            }
+            await self.enqueue_jobs(
+                tile_input,
+                JobKind.diffusion,
+                tile_params,
+                cond_orig,
+                self.batch_count,
+                queue_mode if idx == 0 else QueueMode.back,
+            )
+
     def _prepare_workflow(self, dryrun=False):
         arch = self.arch
         regions = self.active_regions
         is_nai = arch is Arch.nai
         nai_base = None
+        nai_tiled = None
         if is_nai:
             nai_base = next(
                 (
@@ -548,6 +704,27 @@ class DocumentModel(QObject, ObservableProperties):
                 ),
                 None,
             )
+            nai_tiled = next(
+                (
+                    control
+                    for control in regions.control
+                    if control.is_active
+                    and control.is_supported
+                    and control.mode is ControlMode.nai_tiled_img2img
+                ),
+                None,
+            )
+
+        if nai_tiled is not None:
+            if nai_base is not None:
+                raise PluginError("分块图生图与图生图控制层冲突，请先关闭图生图控制层")
+            if self.nai_cropped_inpaint or self.nai_focused_inpaint:
+                raise PluginError("分块图生图与裁切/聚焦重绘冲突，请先关闭裁切重绘")
+            if self._doc.selection_bounds is not None or self._doc.has_selection_paint_mask:
+                raise PluginError("分块图生图与局部重绘冲突，请先取消选区或重绘涂抹")
+            active_reg = regions.get_active_region_layer(use_parent=not self.region_only)
+            if self.region_only and not active_reg.is_root:
+                raise PluginError("分块图生图与区域重绘冲突，请先取消仅生成当前区域")
 
         workflow_kind = WorkflowKind.generate
         crop_bounds = None
@@ -557,15 +734,18 @@ class DocumentModel(QObject, ObservableProperties):
             crop_bounds = self.nai_crop_bounds
             if crop_bounds is None:
                 raise PluginError("请将裁切框放在画布内")
+        elif is_nai and self.is_auto_crop_active and not dryrun:
+            self.sync_auto_crop_box(force=True)
+            crop_bounds = self._auto_crop_bounds
         strength = self.strength
         if arch is Arch.qwen_l:
             strength = 1.0
-        if nai_base is None and self._doc.has_selection_paint_mask:
+        if nai_base is None and nai_tiled is None and self._doc.has_selection_paint_mask:
             # A painted mask always means "redraw this area", never "generate from
             # scratch": at full strength the existing pixels are discarded and the
             # strokes lose their meaning, so cap it just below.
             strength = min(strength, 0.99)
-        if nai_base is None and (strength < 1.0 or self.is_editing):
+        if nai_base is None and nai_tiled is None and (strength < 1.0 or self.is_editing):
             workflow_kind = WorkflowKind.refine
         client = self._connection.client
         image = None
@@ -1125,7 +1305,13 @@ class DocumentModel(QObject, ObservableProperties):
             if message.error:  # successful jobs may have encountered some warnings
                 self.report_error(Error.from_string(message.error, ErrorKind.warning))
             if message.images:
-                self.jobs.set_results(job, message.images)
+                if ov := job.params.metadata.get("tile_overlap"):
+                    images = ImageCollection([
+                        feather_tile_edges(img, ov[0], ov[1]) for img in message.images
+                    ])
+                else:
+                    images = message.images
+                self.jobs.set_results(job, images)
             if job.kind is JobKind.control_layer:
                 assert job.control is not None
                 job.control.layer_id = self.add_control_layer(job, message.result).id
@@ -1313,6 +1499,73 @@ class DocumentModel(QObject, ObservableProperties):
         self.remove_preview()
         self.jobs.selection = []
         self.jobs.notify_used(job_id, index)
+
+    def apply_tiled_group(self, tiled_group: str, color_match: bool = False):
+        """Merge all finished tiles in a tiled_group onto the canvas as one layer."""
+        tiled_jobs = [
+            j
+            for j in self.jobs
+            if j.state is JobState.finished
+            and j.params.metadata.get("tiled_group") == tiled_group
+            and len(j.results) > 0
+        ]
+        if not tiled_jobs:
+            return
+        tiled_jobs.sort(key=lambda j: j.params.metadata.get("tile_index", 0))
+        extent = self._doc.extent
+        full_params = copy(tiled_jobs[0].params)
+        full_params.bounds = Bounds(0, 0, *extent)
+
+        def _finish(result_img: Image, prefix: str):
+            self.apply_result(
+                result_img,
+                full_params,
+                settings.apply_behavior,
+                settings.apply_region_behavior,
+                prefix,
+            )
+            self.remove_preview()
+            self.jobs.selection = []
+            for job in tiled_jobs:
+                if job.id:
+                    self.jobs.notify_used(job.id, 0)
+
+        if not color_match:
+            merged = Image.create(extent)
+            for job in tiled_jobs:
+                merged.draw_image(job.results[0], job.params.bounds.offset)
+            _finish(merged, "[Tiled] ")
+            return
+
+        reference = self._get_current_image(Bounds(0, 0, *extent))
+
+        async def _match_and_apply():
+            from ..backend.local_color_match import match_nai_images
+
+            try:
+                sem = asyncio.Semaphore(4)
+
+                async def _match_one(job: Job) -> Image:
+                    tile_img = job.results[0]
+                    ref_crop = Image.crop(reference, job.params.bounds)
+                    async with sem:
+                        matched = await match_nai_images(
+                            ImageCollection([tile_img]),
+                            ref_crop.to_base64(),
+                        )
+                    if len(matched) == 1 and matched[0] is not tile_img:
+                        return matched[0]
+                    raise RuntimeError("分块颜色匹配失败，未生成匹配图层")
+
+                matched_tiles = await asyncio.gather(*(_match_one(j) for j in tiled_jobs))
+                merged = Image.create(extent)
+                for job, tile_img in zip(tiled_jobs, matched_tiles):
+                    merged.draw_image(tile_img, job.params.bounds.offset)
+                _finish(merged, "[Tiled+色彩匹配] ")
+            except Exception as e:
+                self.report_error(util.log_error(e))
+
+        eventloop.run(_match_and_apply())
 
     def apply_animation(self, job: Job):
         assert job.kind is JobKind.animation

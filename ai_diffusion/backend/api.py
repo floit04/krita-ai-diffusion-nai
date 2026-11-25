@@ -98,6 +98,8 @@ class ControlInput:
     # NAI img2img request size. The source image keeps its original extent so the
     # result can be stretched back to it before it enters generation history.
     target_extent: Extent | None = None
+    # NAI V5 precise-reference toggle for character / character&style.
+    prefer_same_outfit: bool | None = None
 
 
 @dataclass

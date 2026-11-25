@@ -477,7 +477,11 @@ def downscale_control_images(
         for control in control_layers:
             assert isinstance(control.image, Image)
             # Only scale if control image resolution matches canvas resolution
-            if control.image.extent == original and control.mode is not ControlMode.canny_edge:
+            if (
+                control.image.extent == original
+                and control.mode is not ControlMode.canny_edge
+                and not control.mode.is_nai
+            ):
                 if isinstance(control, ControlInput):
                     control.image = Image.scale(control.image, target)
                 elif control.image.image:

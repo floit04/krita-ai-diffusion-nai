@@ -244,18 +244,37 @@ def build_vibe_transfer_parameters(p: dict, params: NaiGenerationParams) -> None
 
 
 def build_precise_reference_parameters(p: dict, params: NaiGenerationParams) -> None:
-    refs = params.precise_references
-    if not refs or not capabilities_of(params.model).supports_precise_reference:
+    caps = capabilities_of(params.model)
+    if not params.precise_references or not caps.supports_precise_reference:
         return
+    if params.action == ACTION_INFILL and not caps.supports_precise_reference_inpainting:
+        return
+
+    supports_outfit = caps.supports_outfit_reference
+    refs = [r for r in params.precise_references if supports_outfit or r.type_caption != "costume"]
+    if not refs:
+        return
+
+    downgrade = {
+        "character_mainoutfit": "character",
+        "character&style_anyoutfit": "character&style",
+    }
+    captions = [
+        r.type_caption if supports_outfit else downgrade.get(r.type_caption, r.type_caption)
+        for r in refs
+    ]
+    strengths = [min(max(r.strength, 0.0), caps.precise_reference_strength_max) for r in refs]
+    fidelities = [r.fidelity if caps.supports_precise_reference_fidelity else 1.0 for r in refs]
+
     p["normalize_reference_strength_multiple"] = True
     p["director_reference_images"] = [r.image_b64 for r in refs]
     p["director_reference_descriptions"] = [
-        {"caption": {"base_caption": r.type_caption, "char_captions": []}, "legacy_uc": False}
-        for r in refs
+        {"caption": {"base_caption": caption, "char_captions": []}, "legacy_uc": False}
+        for caption in captions
     ]
     p["director_reference_information_extracted"] = [1 for _ in refs]
-    p["director_reference_strength_values"] = [r.strength for r in refs]
-    p["director_reference_secondary_strength_values"] = [1.0 - r.fidelity for r in refs]
+    p["director_reference_strength_values"] = strengths
+    p["director_reference_secondary_strength_values"] = [1.0 - f for f in fidelities]
 
 
 def map_sampler_for_model(sampler: str, model: str) -> str:

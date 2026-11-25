@@ -246,6 +246,12 @@ class ControlWidget(QWidget):
         self.param2_slider.setSingleStep(1)
         self.param2_label = QLabel("1.00", self.extended_widget)
 
+        self.prefer_same_outfit_checkbox = QCheckBox("优先沿用原服装", self.extended_widget)
+        self.prefer_same_outfit_checkbox.setToolTip(
+            "勾选时尽量沿用参考图中的角色原服装（Prefer same outfit）"
+        )
+        self.prefer_same_outfit_checkbox.setChecked(control.prefer_same_outfit)
+
         slider_layout = QGridLayout()
         slider_layout.setSpacing(8)
         slider_layout.addWidget(QLabel(_("Strength") + ":"), 0, 0)
@@ -258,6 +264,7 @@ class ControlWidget(QWidget):
         slider_layout.addWidget(self.param2_name_label, 2, 0)
         slider_layout.addWidget(self.param2_slider, 2, 2)
         slider_layout.addWidget(self.param2_label, 2, 3)
+        slider_layout.addWidget(self.prefer_same_outfit_checkbox, 3, 0, 1, 4)
         extended_layout.addLayout(slider_layout)
 
         self._update_visibility()
@@ -281,6 +288,7 @@ class ControlWidget(QWidget):
             bind(control, "preset_value", self.preset_slider, "value"),
             bind(control, "strength", self.strength_slider, "value"),
             bind(control, "param2", self.param2_slider, "value"),
+            bind_toggle(control, "prefer_same_outfit", self.prefer_same_outfit_checkbox),
             control.use_custom_strength_changed.connect(self._update_custom_values),
             control.strength_changed.connect(self._update_strength),
             control.start_changed.connect(self._update_range),
@@ -299,6 +307,8 @@ class ControlWidget(QWidget):
             self._model.nai_references.changed.connect(self._update_layers),
             self._model.style_changed.connect(self._update_visibility),
             self._model.style_changed.connect(self._update_modes),
+            self._model.style_changed.connect(self._update_custom_values),
+            self._model.style_changed.connect(self._update_strength),
         ]
 
     def disconnect_all(self):
@@ -313,9 +323,10 @@ class ControlWidget(QWidget):
         self.group_checkbox.setVisible(is_leader and not leader.group_id.isNull())
         self.mode_select.setVisible(is_leader)
         self.add_related_button.setVisible(is_leader)
-        self.add_related_button.setEnabled(leader.mode is not ControlMode.nai_base)
+        single_source = leader.mode in (ControlMode.nai_base, ControlMode.nai_tiled_img2img)
+        self.add_related_button.setEnabled(not single_source)
         self.add_related_button.setToolTip(
-            "图生图仅使用一个输入来源" if leader.mode is ControlMode.nai_base else "添加同类参考图"
+            "该模式仅使用整图/单一输入来源" if single_source else "添加同类参考图"
         )
         self.group_expand_button.setVisible(is_leader)
         self.group_expand_button.setEnabled(count > 1)
@@ -343,7 +354,11 @@ class ControlWidget(QWidget):
         is_nai = self._model.arch is Arch.nai
         modes = [m for m in ControlMode if not m.is_internal and m.is_nai == is_nai]
         if self._control_list and len(self._control_list.group_members(self._control)) > 1:
-            modes = [mode for mode in modes if mode is not ControlMode.nai_base]
+            modes = [
+                mode
+                for mode in modes
+                if mode not in (ControlMode.nai_base, ControlMode.nai_tiled_img2img)
+            ]
         if self._control.mode not in modes:
             modes.insert(0, self._control.mode)  # keep showing the stored mode
         with SignalBlocker(self.mode_select):
@@ -372,6 +387,8 @@ class ControlWidget(QWidget):
             return None
 
     def _layer_entries(self):
+        if self._control.mode is ControlMode.nai_tiled_img2img:
+            return [("canvas", "整张画布 (建议大画布)", QUuid())]
         layers = list(reversed(self._model.layers.images))
         is_nai_mode = self._control.mode.is_nai
         entries: list[tuple[str, str, QUuid]] = []
@@ -506,13 +523,22 @@ class ControlWidget(QWidget):
         is_pose = self._control.mode is ControlMode.pose
         is_edit = self._model.arch.supports_edit
         is_nai = self._control.mode.is_nai
-        # All NAI modes have per-layer knobs in the extended panel: img2img gets
-        # strength + noise, vibe gets strength + information extracted, precise
-        # references get strength + fidelity.
-        has_param2 = is_nai
+        nai_model = self._control.nai_model
+        is_precise = self._control.mode.is_nai_precise
+        show_fidelity = is_precise and (
+            nai_model is None or nai_model.supports_precise_reference_fidelity
+        )
+        # img2img gets strength + noise, vibe gets strength + information extracted,
+        # and V4.5 precise reference gets strength + fidelity (hidden on V5).
+        has_param2 = (is_nai and not is_precise) or show_fidelity
+        show_prefer_same_outfit = self._control.mode.supports_prefer_same_outfit and (
+            nai_model is not None and nai_model.supports_outfit_reference
+        )
 
         def controls():
-            self.reference_button.setVisible(is_nai)
+            self.reference_button.setVisible(
+                is_nai and self._control.mode is not ControlMode.nai_tiled_img2img
+            )
             self.layer_select.setVisible(self._control.is_supported)
             self.preset_slider.setVisible(self._control.is_supported and not is_edit and not is_nai)
             self.expand_button.setVisible(self._control.is_supported and not is_edit)
@@ -528,8 +554,9 @@ class ControlWidget(QWidget):
             self.param2_name_label.setVisible(has_param2)
             self.param2_slider.setVisible(has_param2)
             self.param2_label.setVisible(has_param2)
+            self.prefer_same_outfit_checkbox.setVisible(show_prefer_same_outfit)
             if has_param2:
-                if self._control.mode is ControlMode.nai_base:
+                if self._control.mode in (ControlMode.nai_base, ControlMode.nai_tiled_img2img):
                     self.param2_name_label.setText("噪声:")
                 elif self._control.mode is ControlMode.nai_vibe:
                     self.param2_name_label.setText("信息提取度:")
@@ -558,9 +585,8 @@ class ControlWidget(QWidget):
         self._control.end = high / 20
 
     def _update_strength(self):
-        self.strength_label.setText(
-            f"{self._control.strength / ControlLayer.strength_multiplier:.2f}"
-        )
+        displayed = min(self._control.strength, self.strength_slider.maximum())
+        self.strength_label.setText(f"{displayed / ControlLayer.strength_multiplier:.2f}")
 
     def _update_job_active(self):
         enabled = self._control.is_active and not self._control.has_active_job
@@ -591,10 +617,23 @@ class ControlWidget(QWidget):
         )
         self.strength_slider.setEnabled(self._control.use_custom_strength or is_nai)
         self.range_slider.setEnabled(self._control.use_custom_strength)
-        # NAI strength is 0..1 (img2img effectively 0.01..0.99); ControlNet allows 1.5.
-        max_strength = ControlLayer.strength_multiplier if is_nai else 75
+        # NAI precise reference allows up to 5.0 on V5 (1.0 on V4.5); ControlNet allows 1.5.
+        if is_nai:
+            if (
+                self._control.mode.is_nai_precise
+                and (nai_model := self._control.nai_model) is not None
+            ):
+                max_strength = int(
+                    nai_model.precise_reference_strength_max * ControlLayer.strength_multiplier
+                )
+            else:
+                max_strength = ControlLayer.strength_multiplier
+        else:
+            max_strength = 75
         if self.strength_slider.maximum() != max_strength:
-            self.strength_slider.setMaximum(max_strength)
+            with SignalBlocker(self.strength_slider):
+                self.strength_slider.setMaximum(max_strength)
+                self.strength_slider.setValue(min(self._control.strength, max_strength))
 
     def _update_pose_utils(self):
         for button in (self.add_pose_button, self.add_pose_tool_button):

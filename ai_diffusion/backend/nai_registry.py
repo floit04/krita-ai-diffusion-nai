@@ -101,6 +101,11 @@ class ModelCapabilities:
     supports_vibe_transfer: bool = False
     supports_encoded_vibe_transfer: bool = False
     supports_precise_reference: bool = False
+    supports_precise_reference_inpainting: bool = False
+    supports_precise_reference_fidelity: bool = False
+    supports_outfit_reference: bool = False
+    bucket_precise_reference: bool = False
+    precise_reference_strength_max: float = 1.0
     has_inpainting_variant: bool = True
     supports_img2img_inpainting: bool = False
     supports_transparent_background: bool = False
@@ -152,6 +157,8 @@ _V45_CURATED = ModelCapabilities(
     default_scale=5.0,
     cfg_delay_sigma=58.0,
     supports_precise_reference=True,
+    supports_precise_reference_inpainting=True,
+    supports_precise_reference_fidelity=True,
     **_V4_COMMON,
 )
 _V45_FULL = ModelCapabilities(
@@ -159,6 +166,8 @@ _V45_FULL = ModelCapabilities(
     default_scale=5.0,
     cfg_delay_sigma=58.0,
     supports_precise_reference=True,
+    supports_precise_reference_inpainting=True,
+    supports_precise_reference_fidelity=True,
     supports_enhance_prompt_add=True,
     **_V4_COMMON,
 )
@@ -168,6 +177,12 @@ _V5_COMMON: dict = dict(  # noqa: C408
     default_scale=4.0,
     default_steps=28,
     max_characters=22,
+    supports_precise_reference=True,
+    supports_precise_reference_inpainting=False,
+    supports_precise_reference_fidelity=False,
+    supports_outfit_reference=True,
+    bucket_precise_reference=True,
+    precise_reference_strength_max=5.0,
     supports_img2img_inpainting=True,
     supports_transparent_background=True,
     supports_enhance_prompt_add=True,
